@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+
+# Conda / environment
+*.egg-info/
+
+# Stimulus data - do not put large data in GitHub
+*.mat
+stringer_natimg2800*_png/
+*_png/
+
+# Experiment outputs
+stim_logs/
+logs/
+output/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Temporary files
+*.tmp
+*.bak
