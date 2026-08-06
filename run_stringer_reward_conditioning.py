@@ -27,7 +27,9 @@ from __future__ import print_function
 import argparse
 import csv
 import json
+import math
 import os
+import statistics
 import subprocess
 import sys
 import time
@@ -63,6 +65,8 @@ DEFAULT_ITI_MAX_SEC = 4.5
 DEFAULT_PRE_BACKGROUND_MIN = 5.0
 DEFAULT_POST_BACKGROUND_MIN = 5.0
 BACKGROUND_POLL_SEC = 0.10
+REWARD_VERIFICATION_MARGIN_SEC = 0.25
+QC_SCHEMA_VERSION = 1
 
 PLANNED_SEQUENCE_FIELDS = [
     "trial_index",
@@ -145,12 +149,18 @@ TRIAL_SUMMARY_FIELDS = [
     "reward_eligible",
     "reward_scheduled",
     "reward_omission_scheduled",
+    "trial_executed",
+    "stim_presented",
+    "trial_completed",
     "planned_iti_duration_sec",
     "stim_request_unix_ns",
+    "stim_request_monotonic_ns",
     "stim_segment1_return_unix_ns",
     "stim_segment2_request_unix_ns",
     "stim_offset_request_unix_ns",
+    "stim_offset_monotonic_ns",
     "segment_boundary_gap_sec",
+    "reward_command_id",
     "first_reward_valve_on_unix_ns",
     "actual_reward_delay_from_software_stim_request_sec",
     "lick_count_pre_0p5_sec",
@@ -186,6 +196,8 @@ def parse_args(argv=None):
 def prompt_float_or_default(prompt, default_value, minimum=None, maximum=None):
     raw = base.prompt_text("%s [%s]: " % (prompt, default_value)).strip()
     value = float(default_value) if not raw else float(raw)
+    if not math.isfinite(value):
+        raise ValueError("%s must be a finite number" % prompt)
     if minimum is not None and value < minimum:
         raise ValueError("%s must be at least %s" % (prompt, minimum))
     if maximum is not None and value > maximum:
@@ -291,9 +303,15 @@ def load_hardware_config(path, simulate_gpio=False):
 
     config["reward_pin_bcm"] = int(config["reward_pin_bcm"])
     config["lick_pin_bcm"] = int(config["lick_pin_bcm"])
+    if config["reward_pin_bcm"] < 0 or config["lick_pin_bcm"] < 0:
+        raise RuntimeError("Reward and lick GPIO pins must be nonnegative integers.")
     config["reward_pulse_on_sec"] = float(config["reward_pulse_on_sec"])
     config["reward_pulse_off_sec"] = float(config["reward_pulse_off_sec"])
     config["reward_num_pulses"] = int(config["reward_num_pulses"])
+    if not math.isfinite(config["reward_pulse_on_sec"]):
+        raise RuntimeError("reward_pulse_on_sec must be finite.")
+    if not math.isfinite(config["reward_pulse_off_sec"]):
+        raise RuntimeError("reward_pulse_off_sec must be finite.")
     if config["reward_pin_bcm"] == config["lick_pin_bcm"]:
         raise RuntimeError("Reward and lick GPIO pins cannot be identical.")
     if config["reward_pulse_on_sec"] <= 0:
@@ -305,7 +323,8 @@ def load_hardware_config(path, simulate_gpio=False):
     return config
 
 
-def get_git_commit():
+def get_git_commit(
+):
     try:
         result = subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -407,6 +426,7 @@ def hold_background(
     gpio_client,
     event_log_path,
     all_gpio_events,
+    pending_reward_checks=None,
 ):
     gpio_client.set_context(background_context(phase))
     start = exact_timestamp_event(
@@ -417,8 +437,21 @@ def hold_background(
     )
     append_event(event_log_path, start)
     start_monotonic = time.monotonic()
+    overall_deadline = start_monotonic + float(duration_sec)
+    for check in pending_reward_checks or []:
+        remaining = overall_deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        verify_reward_command(
+            gpio_client,
+            check["command_id"],
+            int(check["expected_num_pulses"]),
+            event_log_path,
+            all_gpio_events,
+            timeout_sec=min(float(check.get("timeout_sec", remaining)), remaining),
+        )
     wait_until(
-        start_monotonic + float(duration_sec),
+        overall_deadline,
         gpio_client,
         event_log_path,
         all_gpio_events,
@@ -434,6 +467,76 @@ def hold_background(
     return actual
 
 
+def _reward_command_state(all_gpio_events, command_id, expected_num_pulses):
+    relevant = [
+        event
+        for event in all_gpio_events
+        if event.get("command_id") == command_id
+        and event.get("event_type") in {
+            "reward_command_received",
+            "reward_valve_on",
+            "reward_valve_off",
+            "reward_complete",
+        }
+    ]
+    received = [event for event in relevant if event.get("event_type") == "reward_command_received"]
+    valve_on = [event for event in relevant if event.get("event_type") == "reward_valve_on"]
+    valve_off = [event for event in relevant if event.get("event_type") == "reward_valve_off"]
+    complete = [event for event in relevant if event.get("event_type") == "reward_complete"]
+    return {
+        "command_id": command_id,
+        "expected_num_pulses": int(expected_num_pulses),
+        "reward_command_received_count": len(received),
+        "reward_valve_on_count": len(valve_on),
+        "reward_valve_off_count": len(valve_off),
+        "reward_complete_count": len(complete),
+        "complete": (
+            len(received) == 1
+            and len(complete) == 1
+            and len(valve_on) == int(expected_num_pulses)
+            and len(valve_off) == int(expected_num_pulses)
+        ),
+    }
+
+
+def verify_reward_command(
+    gpio_client,
+    command_id,
+    expected_num_pulses,
+    event_log_path,
+    all_gpio_events,
+    timeout_sec,
+):
+    deadline = time.monotonic() + float(timeout_sec)
+    while True:
+        log_drained_gpio_events(gpio_client, event_log_path, all_gpio_events)
+        state = _reward_command_state(all_gpio_events, command_id, expected_num_pulses)
+        if state["reward_command_received_count"] > 1:
+            raise RuntimeError("Reward command %s was received more than once." % command_id)
+        if state["reward_complete_count"] > 1:
+            raise RuntimeError("Reward command %s completed more than once." % command_id)
+        if state["reward_valve_on_count"] > int(expected_num_pulses):
+            raise RuntimeError("Reward command %s produced too many valve-on events." % command_id)
+        if state["reward_valve_off_count"] > int(expected_num_pulses):
+            raise RuntimeError("Reward command %s produced too many valve-off events." % command_id)
+        if state["complete"]:
+            state.update({"reward_command_verified": True})
+            return state
+        if not gpio_client.is_alive():
+            raise RuntimeError("GPIO worker died before reward command %s was verified." % command_id)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(BACKGROUND_POLL_SEC, remaining))
+
+    log_drained_gpio_events(gpio_client, event_log_path, all_gpio_events)
+    state = _reward_command_state(all_gpio_events, command_id, expected_num_pulses)
+    raise RuntimeError(
+        "Reward command %s did not reach the expected event pattern before the deadline: %s"
+        % (command_id, json.dumps(state, sort_keys=True))
+    )
+
+
 def run_trials(
     screen,
     trials,
@@ -444,12 +547,32 @@ def run_trials(
     gpio_client,
     event_log_path,
     all_gpio_events,
+    reward_num_pulses,
+    reward_verification_timeout_sec,
 ):
     runtime_by_trial = {}
+    pending_final_reward_checks = []
     task_start_monotonic = time.monotonic()
     total_trials = len(trials)
 
     for completed_count, trial in enumerate(trials, start=1):
+        trial_index = trial["trial_index"]
+        runtime = {
+            "trial_executed": False,
+            "stim_presented": False,
+            "trial_completed": False,
+            "reward_command_id": "",
+            "stim_request_unix_ns": "",
+            "stim_request_monotonic_ns": "",
+            "stim_segment1_return_unix_ns": "",
+            "stim_segment2_request_unix_ns": "",
+            "stim_offset_request_unix_ns": "",
+            "stim_offset_monotonic_ns": "",
+            "reward_boundary_monotonic_ns": "",
+            "segment_boundary_gap_sec": "",
+        }
+        runtime_by_trial[trial_index] = runtime
+
         context = trial_context(trial, "stimulus")
         gpio_client.set_context(context)
         log_drained_gpio_events(gpio_client, event_log_path, all_gpio_events)
@@ -457,18 +580,22 @@ def run_trials(
         image_raws = loaded_raws[trial["image_filename"]]
         image_paths = raw_paths[trial["image_filename"]]
 
+        runtime["trial_executed"] = True
+        runtime["stim_request_monotonic_ns"] = time.monotonic_ns()
+        stim_request_timestamp = base.capture_timestamp()
+        runtime["stim_request_unix_ns"] = stim_request_timestamp["unix_ns"]
+
         first_perf, first_timing = base.display_raw_with_timing(
             screen, image_raws["first"]
         )
 
-        # Do not write to disk at the 1.0 s boundary.  Send the precomputed
-        # open-loop command, if any, then immediately start the identical 0.5 s
-        # segment.  Lick state is never inspected here.
         boundary_timestamp = base.capture_timestamp()
         boundary_monotonic_ns = time.monotonic_ns()
+        runtime["reward_boundary_monotonic_ns"] = boundary_monotonic_ns
         reward_command_id = ""
         if trial["reward_scheduled"]:
             reward_command_id = gpio_client.trigger_reward(context)
+        runtime["reward_command_id"] = reward_command_id
 
         second_perf, second_timing = base.display_raw_with_timing(
             screen, image_raws["second"]
@@ -478,14 +605,14 @@ def run_trials(
             - first_timing["return_perf_counter_ns"]
         ) / 1_000_000_000.0
 
-        # Turn the image/photodiode patch off before CSV writes or context ACKs.
-        iti_start_monotonic = time.monotonic()
+        background_transition_monotonic_ns = time.monotonic_ns()
         background_perf, background_timing = base.display_raw_with_timing(
             screen, loaded_background_raw
         )
-        iti_deadline = iti_start_monotonic + float(trial["planned_iti_duration_sec"])
-
-        gpio_client.set_context(trial_context(trial, "iti"))
+        runtime["stim_presented"] = True
+        runtime["stim_offset_request_unix_ns"] = background_timing["request_unix_ns"]
+        runtime["stim_offset_monotonic_ns"] = background_transition_monotonic_ns
+        runtime["segment_boundary_gap_sec"] = segment_boundary_gap_sec
 
         first_row = make_display_event(
             "stimulus_segment_1",
@@ -541,6 +668,49 @@ def run_trials(
         second_row["segment_boundary_gap_sec"] = "%.9f" % segment_boundary_gap_sec
         append_event(event_log_path, second_row)
 
+        if trial["reward_scheduled"]:
+            reward_check = {
+                "command_id": reward_command_id,
+                "expected_num_pulses": reward_num_pulses,
+                "timeout_sec": reward_verification_timeout_sec,
+            }
+        else:
+            reward_check = None
+
+        if completed_count == total_trials:
+            runtime["trial_completed"] = True
+            runtime["stim_offset_request_unix_ns"] = background_timing["request_unix_ns"]
+            runtime["stim_offset_monotonic_ns"] = background_transition_monotonic_ns
+            final_offset_row = trial_context(trial, "stimulus")
+            final_offset_row.update(
+                {
+                    "utc_iso": background_timing["request_utc_iso"],
+                    "unix_time_utc_sec": background_timing["request_unix_sec"],
+                    "unix_time_ns": background_timing["request_unix_ns"],
+                    "monotonic_ns": background_timing["request_perf_counter_ns"],
+                    "event_type": "stimulus_offset",
+                    "segment_name": "gray_photodiode_off",
+                    "raw_path": str(background_raw_path),
+                    "planned_duration_sec": 0.0,
+                    "planned_iti_duration_sec": trial["planned_iti_duration_sec"],
+                    "display_request_unix_ns": background_timing["request_unix_ns"],
+                    "display_return_unix_ns": background_timing["return_unix_ns"],
+                    "display_request_perf_counter_ns": background_timing["request_perf_counter_ns"],
+                    "display_return_perf_counter_ns": background_timing["return_perf_counter_ns"],
+                    "display_call_duration_sec": "%.9f" % background_timing["duration_sec"],
+                    "start_time_unix": getattr(background_perf, "start_time", ""),
+                    "mean_interframe_us": getattr(background_perf, "mean_interframe", ""),
+                    "stddev_interframe_us": getattr(background_perf, "stddev_interframe", ""),
+                    "notes": "final_planned_iti_skipped; POST begins immediately",
+                }
+            )
+            append_event(event_log_path, final_offset_row)
+            if reward_check is not None:
+                pending_final_reward_checks.append(reward_check)
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            return runtime_by_trial, pending_final_reward_checks
+
         background_row = trial_context(trial, "iti")
         background_row.update(
             {
@@ -571,14 +741,21 @@ def run_trials(
         )
         append_event(event_log_path, background_row)
 
-        runtime_by_trial[trial["trial_index"]] = {
-            "stim_request_unix_ns": first_timing["request_unix_ns"],
-            "stim_segment1_return_unix_ns": first_timing["return_unix_ns"],
-            "stim_segment2_request_unix_ns": second_timing["request_unix_ns"],
-            "stim_offset_request_unix_ns": background_timing["request_unix_ns"],
-            "segment_boundary_gap_sec": segment_boundary_gap_sec,
-        }
+        runtime["stim_segment1_return_unix_ns"] = first_timing["return_unix_ns"]
+        runtime["stim_segment2_request_unix_ns"] = second_timing["request_unix_ns"]
 
+        if reward_check is not None:
+            verify_reward_command(
+                gpio_client,
+                reward_check["command_id"],
+                reward_check["expected_num_pulses"],
+                event_log_path,
+                all_gpio_events,
+                timeout_sec=reward_check["timeout_sec"],
+            )
+
+        iti_start_monotonic = time.monotonic()
+        iti_deadline = iti_start_monotonic + float(trial["planned_iti_duration_sec"])
         log_drained_gpio_events(gpio_client, event_log_path, all_gpio_events)
         wait_until(
             iti_deadline,
@@ -596,6 +773,7 @@ def run_trials(
                 notes="actual_iti_duration_sec=%.9f" % actual_iti,
             )
         )
+        runtime["trial_completed"] = True
 
         elapsed = time.monotonic() - task_start_monotonic
         average = elapsed / float(completed_count)
@@ -613,7 +791,8 @@ def run_trials(
 
     sys.stdout.write("\n")
     sys.stdout.flush()
-    return runtime_by_trial
+    return runtime_by_trial, pending_final_reward_checks
+
 
 
 def _count_events_in_window(event_ns, onset_ns, start_sec, stop_sec):
@@ -622,92 +801,119 @@ def _count_events_in_window(event_ns, onset_ns, start_sec, stop_sec):
     return sum(1 for value in event_ns if start_ns <= value < stop_ns)
 
 
+def _blank_trial_summary(trial):
+    return {
+        "trial_index": trial["trial_index"],
+        "trial_number": trial["trial_number"],
+        "block_number": trial["block_number"],
+        "image_role": trial["image_role"],
+        "image_category": trial["image_category"],
+        "image_id": trial["image_id"],
+        "image_filename": trial["image_filename"],
+        "reward_eligible": trial["reward_eligible"],
+        "reward_scheduled": trial["reward_scheduled"],
+        "reward_omission_scheduled": trial["reward_omission_scheduled"],
+        "trial_executed": False,
+        "stim_presented": False,
+        "trial_completed": False,
+        "planned_iti_duration_sec": trial["planned_iti_duration_sec"],
+        "stim_request_unix_ns": "",
+        "stim_request_monotonic_ns": "",
+        "stim_segment1_return_unix_ns": "",
+        "stim_segment2_request_unix_ns": "",
+        "stim_offset_request_unix_ns": "",
+        "stim_offset_monotonic_ns": "",
+        "segment_boundary_gap_sec": "",
+        "reward_command_id": "",
+        "first_reward_valve_on_unix_ns": "",
+        "actual_reward_delay_from_software_stim_request_sec": "",
+        "lick_count_pre_0p5_sec": "",
+        "lick_count_0_to_0p5_sec": "",
+        "lick_count_0_to_1p0_sec": "",
+        "lick_count_0p5_to_1p0_sec": "",
+        "lick_count_1p0_to_1p5_sec": "",
+        "lick_count_1p5_to_2p0_sec": "",
+        "notes": "",
+    }
+
+
 def build_trial_summary(trials, runtime_by_trial, all_gpio_events):
-    lick_ns_by_trial = {}
-    reward_on_ns_by_trial = {}
+    all_lick_monotonic_ns = sorted(
+        int(event["monotonic_ns"])
+        for event in all_gpio_events
+        if event.get("event_type") == "lick_onset"
+        and event.get("monotonic_ns") not in (None, "")
+    )
+    reward_events_by_command_id = {}
     for event in all_gpio_events:
-        trial_index = event.get("trial_index", "")
-        if trial_index in ("", None):
+        command_id = event.get("command_id", "")
+        if not command_id:
             continue
-        try:
-            trial_index = int(trial_index)
-        except (TypeError, ValueError):
-            continue
-        if event.get("event_type") == "lick_onset":
-            lick_ns_by_trial.setdefault(trial_index, []).append(
-                int(event["unix_time_ns"])
-            )
-        elif event.get("event_type") == "reward_valve_on":
-            reward_on_ns_by_trial.setdefault(trial_index, []).append(
-                int(event["unix_time_ns"])
-            )
+        if event.get("event_type") in (
+            "reward_command_received",
+            "reward_valve_on",
+            "reward_valve_off",
+            "reward_complete",
+        ):
+            reward_events_by_command_id.setdefault(command_id, []).append(event)
 
     rows = []
     for trial in trials:
         trial_index = trial["trial_index"]
-        runtime = runtime_by_trial.get(trial_index, {})
-        onset_ns = runtime.get("stim_request_unix_ns")
-        lick_ns = sorted(lick_ns_by_trial.get(trial_index, []))
-        reward_ns = sorted(reward_on_ns_by_trial.get(trial_index, []))
-        first_reward_ns = reward_ns[0] if reward_ns else ""
-        if onset_ns is None:
-            counts = {name: "" for name in (
-                "pre", "early", "full", "late", "post", "after"
-            )}
-            actual_reward_delay = ""
+        runtime = runtime_by_trial.get(trial_index)
+        row = _blank_trial_summary(trial)
+        if not runtime:
+            rows.append(row)
+            continue
+
+        row["trial_executed"] = bool(runtime.get("trial_executed", False))
+        row["stim_presented"] = bool(runtime.get("stim_presented", False))
+        row["trial_completed"] = bool(runtime.get("trial_completed", False))
+        row["stim_request_unix_ns"] = runtime.get("stim_request_unix_ns", "")
+        row["stim_request_monotonic_ns"] = runtime.get("stim_request_monotonic_ns", "")
+        row["stim_segment1_return_unix_ns"] = runtime.get("stim_segment1_return_unix_ns", "")
+        row["stim_segment2_request_unix_ns"] = runtime.get("stim_segment2_request_unix_ns", "")
+        row["stim_offset_request_unix_ns"] = runtime.get("stim_offset_request_unix_ns", "")
+        row["stim_offset_monotonic_ns"] = runtime.get("stim_offset_monotonic_ns", "")
+        row["segment_boundary_gap_sec"] = runtime.get("segment_boundary_gap_sec", "")
+        row["reward_command_id"] = runtime.get("reward_command_id", "")
+
+        reward_command_id = row["reward_command_id"]
+        reward_events = reward_events_by_command_id.get(reward_command_id, []) if reward_command_id else []
+        reward_valve_on_events = [event for event in reward_events if event.get("event_type") == "reward_valve_on"]
+        if reward_valve_on_events:
+            first_reward_event = reward_valve_on_events[0]
+            row["first_reward_valve_on_unix_ns"] = first_reward_event.get("unix_time_ns", "")
+            stim_on_ns = runtime.get("stim_request_monotonic_ns")
+            reward_on_ns = first_reward_event.get("monotonic_ns")
+            if stim_on_ns not in (None, "") and reward_on_ns not in (None, ""):
+                row["actual_reward_delay_from_software_stim_request_sec"] = (
+                    (int(reward_on_ns) - int(stim_on_ns)) / 1_000_000_000.0
+                )
+
+        onset_ns = runtime.get("stim_request_monotonic_ns")
+        if onset_ns in (None, ""):
+            counts = {name: "" for name in ("pre", "early", "full", "late", "post", "after")}
         else:
+            onset_ns = int(onset_ns)
             counts = {
-                "pre": _count_events_in_window(lick_ns, onset_ns, -0.5, 0.0),
-                "early": _count_events_in_window(lick_ns, onset_ns, 0.0, 0.5),
-                "full": _count_events_in_window(lick_ns, onset_ns, 0.0, 1.0),
-                "late": _count_events_in_window(lick_ns, onset_ns, 0.5, 1.0),
-                "post": _count_events_in_window(lick_ns, onset_ns, 1.0, 1.5),
-                "after": _count_events_in_window(lick_ns, onset_ns, 1.5, 2.0),
+                "pre": _count_events_in_window(all_lick_monotonic_ns, onset_ns, -0.5, 0.0),
+                "early": _count_events_in_window(all_lick_monotonic_ns, onset_ns, 0.0, 0.5),
+                "full": _count_events_in_window(all_lick_monotonic_ns, onset_ns, 0.0, 1.0),
+                "late": _count_events_in_window(all_lick_monotonic_ns, onset_ns, 0.5, 1.0),
+                "post": _count_events_in_window(all_lick_monotonic_ns, onset_ns, 1.0, 1.5),
+                "after": _count_events_in_window(all_lick_monotonic_ns, onset_ns, 1.5, 2.0),
             }
-            actual_reward_delay = (
-                (int(first_reward_ns) - int(onset_ns)) / 1_000_000_000.0
-                if first_reward_ns != ""
-                else ""
-            )
-        rows.append(
-            {
-                "trial_index": trial_index,
-                "trial_number": trial["trial_number"],
-                "block_number": trial["block_number"],
-                "image_role": trial["image_role"],
-                "image_category": trial["image_category"],
-                "image_id": trial["image_id"],
-                "image_filename": trial["image_filename"],
-                "reward_eligible": trial["reward_eligible"],
-                "reward_scheduled": trial["reward_scheduled"],
-                "reward_omission_scheduled": trial["reward_omission_scheduled"],
-                "planned_iti_duration_sec": trial["planned_iti_duration_sec"],
-                "stim_request_unix_ns": runtime.get("stim_request_unix_ns", ""),
-                "stim_segment1_return_unix_ns": runtime.get(
-                    "stim_segment1_return_unix_ns", ""
-                ),
-                "stim_segment2_request_unix_ns": runtime.get(
-                    "stim_segment2_request_unix_ns", ""
-                ),
-                "stim_offset_request_unix_ns": runtime.get(
-                    "stim_offset_request_unix_ns", ""
-                ),
-                "segment_boundary_gap_sec": runtime.get(
-                    "segment_boundary_gap_sec", ""
-                ),
-                "first_reward_valve_on_unix_ns": first_reward_ns,
-                "actual_reward_delay_from_software_stim_request_sec": actual_reward_delay,
-                "lick_count_pre_0p5_sec": counts["pre"],
-                "lick_count_0_to_0p5_sec": counts["early"],
-                "lick_count_0_to_1p0_sec": counts["full"],
-                "lick_count_0p5_to_1p0_sec": counts["late"],
-                "lick_count_1p0_to_1p5_sec": counts["post"],
-                "lick_count_1p5_to_2p0_sec": counts["after"],
-                "notes": (
-                    "Software-aligned summary; use photodiode/DAQ timing for final neural analysis."
-                ),
-            }
+        row["lick_count_pre_0p5_sec"] = counts["pre"]
+        row["lick_count_0_to_0p5_sec"] = counts["early"]
+        row["lick_count_0_to_1p0_sec"] = counts["full"]
+        row["lick_count_0p5_to_1p0_sec"] = counts["late"]
+        row["lick_count_1p0_to_1p5_sec"] = counts["post"]
+        row["lick_count_1p5_to_2p0_sec"] = counts["after"]
+        row["notes"] = (
+            "Software-aligned summary; use photodiode/DAQ timing for final neural analysis."
         )
+        rows.append(row)
     return rows
 
 
@@ -716,10 +922,170 @@ def write_rows(path, rows, fields):
 
 
 def estimate_task_seconds(trials):
-    return sum(
-        STIM_DURATION_SEC + float(trial["planned_iti_duration_sec"])
-        for trial in trials
+    if not trials:
+        return 0.0
+    return (
+        len(trials) * STIM_DURATION_SEC
+        + sum(float(trial["planned_iti_duration_sec"]) for trial in trials[:-1])
     )
+
+
+def _series_stat(values, name, statistic_name):
+    if not values:
+        return None
+    ordered = sorted(float(value) for value in values)
+    if statistic_name == "median":
+        return float(statistics.median(ordered))
+    if statistic_name == "p95":
+        index = max(0, min(len(ordered) - 1, int(math.ceil(0.95 * len(ordered))) - 1))
+        return float(ordered[index])
+    if statistic_name == "max":
+        return float(ordered[-1])
+    raise ValueError("Unknown statistic: %s" % statistic_name)
+
+
+def build_session_qc(
+    session_id,
+    trials,
+    trial_summary_rows,
+    all_gpio_events,
+    reward_num_pulses,
+):
+    planned_trial_count = len(trials)
+    executed_trial_count = sum(1 for row in trial_summary_rows if row.get("trial_executed"))
+    completed_trial_count = sum(1 for row in trial_summary_rows if row.get("trial_completed"))
+    planned_reward_count = sum(1 for trial in trials if trial["reward_scheduled"])
+
+    reward_command_received_events = [
+        event for event in all_gpio_events if event.get("event_type") == "reward_command_received"
+    ]
+    reward_complete_events = [
+        event for event in all_gpio_events if event.get("event_type") == "reward_complete"
+    ]
+    reward_valve_on_events = [
+        event for event in all_gpio_events if event.get("event_type") == "reward_valve_on"
+    ]
+    reward_valve_off_events = [
+        event for event in all_gpio_events if event.get("event_type") == "reward_valve_off"
+    ]
+    lick_onset_events = [
+        event for event in all_gpio_events if event.get("event_type") == "lick_onset"
+    ]
+
+    scheduled_reward_rows = [
+        row for row in trial_summary_rows if row.get("reward_scheduled")
+    ]
+    scheduled_reward_ids = [
+        row.get("reward_command_id", "")
+        for row in scheduled_reward_rows
+        if row.get("reward_command_id")
+    ]
+    scheduled_reward_id_set = set(scheduled_reward_ids)
+    reward_received_ids = [event.get("command_id", "") for event in reward_command_received_events if event.get("command_id")]
+
+    missing_reward_command_ids = []
+    incomplete_reward_command_ids = []
+    duplicate_reward_command_ids = []
+    for row in scheduled_reward_rows:
+        trial_label = "trial_%s" % row.get("trial_index", "unknown")
+        command_id = row.get("reward_command_id", "")
+        if not command_id:
+            missing_reward_command_ids.append(trial_label)
+            continue
+        matching = [event for event in all_gpio_events if event.get("command_id") == command_id and event.get("event_type") in {"reward_command_received", "reward_valve_on", "reward_valve_off", "reward_complete"}]
+        received = sum(1 for event in matching if event.get("event_type") == "reward_command_received")
+        valve_on = sum(1 for event in matching if event.get("event_type") == "reward_valve_on")
+        valve_off = sum(1 for event in matching if event.get("event_type") == "reward_valve_off")
+        complete = sum(1 for event in matching if event.get("event_type") == "reward_complete")
+        if received == 0:
+            missing_reward_command_ids.append(command_id)
+            continue
+        if received > 1:
+            duplicate_reward_command_ids.append(command_id)
+        if (
+            received != 1
+            or complete != 1
+            or valve_on != int(reward_num_pulses)
+            or valve_off != int(reward_num_pulses)
+        ):
+            incomplete_reward_command_ids.append(command_id)
+
+    unexpected_reward_command_ids = sorted(set(reward_received_ids) - scheduled_reward_id_set)
+
+    segment_boundary_gap_values = [
+        float(row["segment_boundary_gap_sec"])
+        for row in trial_summary_rows
+        if row.get("segment_boundary_gap_sec") not in ("", None)
+    ]
+    software_reward_delay_values = [
+        float(row["actual_reward_delay_from_software_stim_request_sec"])
+        for row in trial_summary_rows
+        if row.get("actual_reward_delay_from_software_stim_request_sec") not in ("", None)
+    ]
+
+    qc_fail_reasons = []
+    if executed_trial_count != planned_trial_count:
+        qc_fail_reasons.append(
+            "executed_trial_count=%d planned_trial_count=%d" % (executed_trial_count, planned_trial_count)
+        )
+    if completed_trial_count != planned_trial_count:
+        qc_fail_reasons.append(
+            "completed_trial_count=%d planned_trial_count=%d" % (completed_trial_count, planned_trial_count)
+        )
+    if len(reward_command_received_events) != planned_reward_count:
+        qc_fail_reasons.append(
+            "reward_command_received_count=%d planned_reward_count=%d" % (len(reward_command_received_events), planned_reward_count)
+        )
+    if len(reward_complete_events) != planned_reward_count:
+        qc_fail_reasons.append(
+            "reward_complete_count=%d planned_reward_count=%d" % (len(reward_complete_events), planned_reward_count)
+        )
+    if len(reward_valve_on_events) != planned_reward_count * int(reward_num_pulses):
+        qc_fail_reasons.append(
+            "reward_valve_on_count=%d expected_valve_on_count=%d" % (len(reward_valve_on_events), planned_reward_count * int(reward_num_pulses))
+        )
+    if len(reward_valve_off_events) != planned_reward_count * int(reward_num_pulses):
+        qc_fail_reasons.append(
+            "reward_valve_off_count=%d expected_valve_off_count=%d" % (len(reward_valve_off_events), planned_reward_count * int(reward_num_pulses))
+        )
+    if missing_reward_command_ids:
+        qc_fail_reasons.append("missing_reward_command_ids=%s" % ",".join(missing_reward_command_ids))
+    if unexpected_reward_command_ids:
+        qc_fail_reasons.append("unexpected_reward_command_ids=%s" % ",".join(unexpected_reward_command_ids))
+    if incomplete_reward_command_ids:
+        qc_fail_reasons.append("incomplete_reward_command_ids=%s" % ",".join(incomplete_reward_command_ids))
+    if duplicate_reward_command_ids:
+        qc_fail_reasons.append("duplicate_reward_command_ids=%s" % ",".join(duplicate_reward_command_ids))
+
+    qc_pass = not qc_fail_reasons
+    return {
+        "schema_version": QC_SCHEMA_VERSION,
+        "session_id": session_id,
+        "generated_utc_iso": base.utc_iso_now(),
+        "planned_trial_count": planned_trial_count,
+        "executed_trial_count": executed_trial_count,
+        "completed_trial_count": completed_trial_count,
+        "planned_reward_count": planned_reward_count,
+        "reward_command_received_count": len(reward_command_received_events),
+        "reward_complete_count": len(reward_complete_events),
+        "reward_valve_on_count": len(reward_valve_on_events),
+        "reward_valve_off_count": len(reward_valve_off_events),
+        "expected_valve_on_count": planned_reward_count * int(reward_num_pulses),
+        "expected_valve_off_count": planned_reward_count * int(reward_num_pulses),
+        "missing_reward_command_ids": missing_reward_command_ids,
+        "unexpected_reward_command_ids": unexpected_reward_command_ids,
+        "incomplete_reward_command_ids": incomplete_reward_command_ids,
+        "duplicate_reward_command_ids": duplicate_reward_command_ids,
+        "lick_onset_count": len(lick_onset_events),
+        "segment_boundary_gap_sec_median": _series_stat(segment_boundary_gap_values, "segment_boundary_gap_sec", "median"),
+        "segment_boundary_gap_sec_p95": _series_stat(segment_boundary_gap_values, "segment_boundary_gap_sec", "p95"),
+        "segment_boundary_gap_sec_max": _series_stat(segment_boundary_gap_values, "segment_boundary_gap_sec", "max"),
+        "software_reward_delay_sec_median": _series_stat(software_reward_delay_values, "software_reward_delay_sec", "median"),
+        "software_reward_delay_sec_p95": _series_stat(software_reward_delay_values, "software_reward_delay_sec", "p95"),
+        "software_reward_delay_sec_max": _series_stat(software_reward_delay_values, "software_reward_delay_sec", "max"),
+        "qc_pass": qc_pass,
+        "qc_fail_reasons": qc_fail_reasons,
+    }
 
 
 def maybe_import_camera_support(no_camera):
@@ -754,6 +1120,13 @@ def main(argv=None):
         + max(0, hardware_config["reward_num_pulses"] - 1)
         * hardware_config["reward_pulse_off_sec"]
     )
+    reward_verification_timeout_sec = reward_train_duration_sec + REWARD_VERIFICATION_MARGIN_SEC
+    if reward_train_duration_sec > POST_REWARD_STIM_SEC:
+        raise RuntimeError(
+            "Configured reward train duration %.6f s exceeds the %.6f s "
+            "post-reward image segment."
+            % (reward_train_duration_sec, POST_REWARD_STIM_SEC)
+        )
     camera_support = maybe_import_camera_support(args.no_camera)
 
     mouse_id_raw = base.prompt_text("Mouse ID: ")
@@ -825,11 +1198,6 @@ def main(argv=None):
     print("  Reward pin: BCM%d" % hardware_config["reward_pin_bcm"])
     print("  Lick pin: BCM%d" % hardware_config["lick_pin_bcm"])
     print("  Reward pulse-train duration: %.3f s" % reward_train_duration_sec)
-    if reward_train_duration_sec > POST_REWARD_STIM_SEC:
-        print(
-            "  WARNING: reward train extends beyond the 0.5 s post-boundary "
-            "image segment and into the ITI."
-        )
     print("  GPIO simulation: %s" % hardware_config["simulate_gpio"])
     print("  Face camera: %s" % use_camera)
     print("  IMPORTANT: reward delivery is independent of licking.")
@@ -926,6 +1294,9 @@ def main(argv=None):
         "event_log_csv": str(event_log_path),
         "trial_summary_csv": str(trial_summary_path),
         "camera_event_log_csv": str(camera_event_log_path) if use_camera else "",
+        "session_qc_json": "",
+        "final_planned_iti_executed": False,
+        "post_started_immediately_after_final_stimulus": True,
         "plan_summary": plan_summary,
     }
     metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
@@ -933,11 +1304,17 @@ def main(argv=None):
     all_gpio_events = []
     runtime_by_trial = {}
     gpio_client = BehaviorGPIOClient(hardware_config)
+    task_completed = False
+    post_background_completed = False
     camera_started = False
-    camera_stopped = False
+    camera_stop_confirmed = False
     camera_fetch_completed = False
     camera_conversion_completed = False
+    camera_conversion_deferred = False
+    camera_cleanup_error = False
+    camera_cleanup_error_message = ""
     session_completed = False
+    pending_final_reward_checks = []
 
     try:
         print("Building one-frame gray background raw...")
@@ -1185,11 +1562,21 @@ def main(argv=None):
         )
         raise
     finally:
-        if camera_started and not camera_stopped and camera_support is not None:
+        if camera_started and not camera_stop_confirmed and camera_support is not None:
             try:
-                camera_support.stop_camera_recording()
-                camera_stopped = True
+                stop_state = camera_support.stop_camera_recording()
+                camera_stop_confirmed = bool(stop_state.get("camera_stop_confirmed", False))
+                append_event(
+                    event_log_path,
+                    exact_timestamp_event(
+                        "camera_stop_returned",
+                        phase="poststim_camera_cleanup_gray",
+                        notes=json.dumps(stop_state, sort_keys=True),
+                    ),
+                )
             except Exception as exc:
+                camera_cleanup_error = True
+                camera_cleanup_error_message = "%s: %s" % (type(exc).__name__, exc)
                 print("Emergency camera stop failed: %s" % exc, file=sys.stderr)
 
         if gpio_client is not None:
@@ -1220,6 +1607,7 @@ def main(argv=None):
             print("Session finished. Files are in: %s" % session_root)
         else:
             print("Session stopped early. Partial files are in: %s" % session_root)
+        print("Session QC: %s" % qc_path)
         print("Trial summary: %s" % trial_summary_path)
         print(
             "For neural alignment, use the recorded photodiode/DAQ signal as "

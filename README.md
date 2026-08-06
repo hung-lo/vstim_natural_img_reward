@@ -175,12 +175,14 @@ The main files there are:
 - `<session>_image_assignment.csv`
 - `<session>_plan_summary.csv`
 - `<session>_metadata.json`
+- `<session>_session_qc.json`
 - `raw_cache/` with the baked RPG raws
 
 Recommended test sequence:
 
 ```bash
 python3 test_reward_conditioning_protocol.py
+python3 test_reward_conditioning_runtime.py
 python3 smoke_test_reward_gpio.py
 ```
 

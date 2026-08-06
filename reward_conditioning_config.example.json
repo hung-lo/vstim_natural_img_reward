@@ -1,10 +1,12 @@
 {
-  "reward_pin_bcm": 19,
-  "lick_pin_bcm": 26,
   "lick_bounce_time_sec": null,
-  "reward_pulse_on_sec": null,
-  "reward_pulse_off_sec": 0.01,
+  "lick_pin_bcm": 26,
+  "maximum_session_reward_ul": null,
+  "notes": "Set reward_pulse_on_sec to the calibrated session_info['solenoid_blink_duration'] used by the working Go/NoGo box. Do not guess it. Reward is open-loop and never lick-contingent. Reward probability is fixed at 0.90 in reward_conditioning_protocol.py and is intentionally not configurable here.",
   "reward_num_pulses": 6,
-  "simulate_gpio": false,
-  "notes": "Set reward_pulse_on_sec to the calibrated session_info['solenoid_blink_duration'] used by the working Go/NoGo box. Do not guess it. Reward is open-loop and never lick-contingent. Reward probability is fixed at 0.90 in reward_conditioning_protocol.py and is intentionally not configurable here."
+  "reward_pin_bcm": 19,
+  "reward_pulse_off_sec": 0.01,
+  "reward_pulse_on_sec": null,
+  "reward_volume_ul_per_train": null,
+  "simulate_gpio": false
 }
