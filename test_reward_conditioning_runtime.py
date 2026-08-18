@@ -100,6 +100,77 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
         self.assertEqual(rows[1]["trial_executed"], True)
         self.assertEqual(rows[1]["trial_completed"], True)
 
+    def test_zero_post_services_final_rewarded_suction(self):
+        gpio_client = FakeGPIOClient()
+        gpio_client.trigger_suction = mock.Mock(return_value="suction_1")
+        pending = [{
+            "command_id": "reward_1",
+            "expected_num_pulses": 6,
+            "timeout_sec": 0.5,
+        }, {
+            "suction_target": 0.0,
+            "duration_sec": 0.01,
+            "context": {"phase": "stimulus", "suction_scheduled": True},
+            "runtime": {},
+        }]
+        with tempfile.TemporaryDirectory(prefix="reward_post_zero_") as temp_dir:
+            with mock.patch.object(reward, "wait_until"), \
+                 mock.patch.object(reward, "verify_reward_command") as verify_reward, \
+                 mock.patch.object(reward, "verify_suction_command") as verify_suction:
+                reward.hold_background(
+                    "poststim_background", 0.0, gpio_client,
+                    Path(temp_dir) / "events.csv", [], pending_reward_checks=pending
+                )
+        verify_reward.assert_called_once()
+        verify_suction.assert_called_once()
+        gpio_client.trigger_suction.assert_called_once()
+
+    def test_zero_post_services_final_omission_suction(self):
+        gpio_client = FakeGPIOClient()
+        gpio_client.trigger_suction = mock.Mock(return_value="suction_omission_1")
+        pending = [{
+            "suction_target": 0.0,
+            "duration_sec": 0.01,
+            "context": {"phase": "stimulus", "reward_scheduled": False, "suction_scheduled": True},
+            "runtime": {},
+        }]
+        with tempfile.TemporaryDirectory(prefix="reward_post_zero_omission_") as temp_dir:
+            with mock.patch.object(reward, "wait_until"), \
+                 mock.patch.object(reward, "verify_suction_command") as verify_suction:
+                reward.hold_background(
+                    "poststim_background", 0.0, gpio_client,
+                    Path(temp_dir) / "events.csv", [], pending_reward_checks=pending
+                )
+        verify_suction.assert_called_once()
+        gpio_client.trigger_suction.assert_called_once()
+
+    def test_qc_detects_rogue_commands_but_ignores_manual_commands(self):
+        trial = {
+            "trial_index": 0, "trial_number": 1, "block_number": 1,
+            "image_role": "low_01", "image_category": "low_probability_unrewarded",
+            "image_id": 1, "image_filename": "img.png",
+            "reward_eligible": False, "reward_scheduled": False,
+            "reward_omission_scheduled": False, "suction_scheduled": False,
+            "planned_iti_duration_sec": 3.0,
+        }
+        row = reward._blank_trial_summary(trial)
+        row.update({"trial_executed": True, "stim_presented": True, "trial_completed": True})
+        base_events = [
+            {"event_type": "manual_reward_command_received", "command_id": "manual_reward_1"},
+            {"event_type": "suction_command_received", "command_id": "manual_suction_1", "phase": "manual_suction"},
+        ]
+        valid = reward.build_session_qc("session", [trial], [row], base_events, 6)
+        self.assertTrue(valid["qc_pass"])
+
+        rogue = base_events + [
+            {"event_type": "reward_command_received", "command_id": "rogue_reward", "phase": "iti"},
+            {"event_type": "suction_command_received", "command_id": "rogue_suction", "phase": "iti"},
+        ]
+        invalid = reward.build_session_qc("session", [trial], [row], rogue, 6)
+        self.assertEqual(invalid["unexpected_reward_command_ids"], ["rogue_reward"])
+        self.assertEqual(invalid["unexpected_suction_command_ids"], ["rogue_suction"])
+        self.assertFalse(invalid["qc_pass"])
+
     def test_run_trials_skips_final_iti(self):
         trials = [
             {

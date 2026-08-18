@@ -490,16 +490,15 @@ def hold_background(
             verify_suction_command(gpio_client, command_id, event_log_path, all_gpio_events,
                                    max(0.01, suction_deadline - time.monotonic() + 1.0))
             continue
-        remaining = requested_deadline - time.monotonic()
-        if remaining <= 0:
-            break
+        # Required reward verification is independent of the requested POST
+        # duration. A zero/expired POST must not skip this operation.
         verify_reward_command(
             gpio_client,
             check["command_id"],
             int(check["expected_num_pulses"]),
             event_log_path,
             all_gpio_events,
-            timeout_sec=min(float(check.get("timeout_sec", remaining)), remaining),
+            timeout_sec=float(check.get("timeout_sec", 5.0)),
         )
     wait_until(
         max(requested_deadline, required_hardware_deadline),
@@ -1118,10 +1117,27 @@ def build_session_qc(
     suction_complete_events = [e for e in suction_events if e.get("event_type") == "suction_complete"]
     suction_on_events = [e for e in suction_events if e.get("event_type") == "suction_on"]
     suction_off_events = [e for e in suction_events if e.get("event_type") == "suction_off"]
-    received_suction_ids = {e.get("command_id", "") for e in suction_command_received_events}
+    all_experimental_suction_received_ids = {
+        event.get("command_id")
+        for event in all_gpio_events
+        if event.get("event_type") == "suction_command_received"
+        and event.get("phase") != "manual_suction"
+        and event.get("command_id")
+    }
     missing_suction_command_ids = sorted("trial_%s" % row.get("trial_index") for row in trial_summary_rows if row.get("suction_scheduled") and not row.get("suction_command_id"))
-    unexpected_suction_command_ids = sorted(received_suction_ids - scheduled_suction_ids - {""})
-    duplicate_suction_command_ids = sorted(command_id for command_id in received_suction_ids if command_id and sum(1 for e in suction_command_received_events if e.get("command_id") == command_id) > 1)
+    unexpected_suction_command_ids = sorted(
+        all_experimental_suction_received_ids - scheduled_suction_ids
+    )
+    scheduled_suction_received_ids = {
+        event.get("command_id")
+        for event in suction_command_received_events
+        if event.get("command_id")
+    }
+    duplicate_suction_command_ids = sorted(
+        command_id
+        for command_id in scheduled_suction_received_ids
+        if sum(1 for e in suction_command_received_events if e.get("command_id") == command_id) > 1
+    )
     incomplete_suction_command_ids = sorted(command_id for command_id in scheduled_suction_ids if command_id and sum(1 for e in suction_complete_events if e.get("command_id") == command_id) != 1)
 
     scheduled_reward_rows = [
@@ -1133,7 +1149,12 @@ def build_session_qc(
         if row.get("reward_command_id")
     ]
     scheduled_reward_id_set = set(scheduled_reward_ids)
-    reward_received_ids = [event.get("command_id", "") for event in reward_command_received_events if event.get("command_id")]
+    all_experimental_reward_received_ids = {
+        event.get("command_id")
+        for event in all_gpio_events
+        if event.get("event_type") == "reward_command_received"
+        and event.get("command_id")
+    }
 
     missing_reward_command_ids = []
     incomplete_reward_command_ids = []
@@ -1162,7 +1183,9 @@ def build_session_qc(
         ):
             incomplete_reward_command_ids.append(command_id)
 
-    unexpected_reward_command_ids = sorted(set(reward_received_ids) - scheduled_reward_id_set)
+    unexpected_reward_command_ids = sorted(
+        all_experimental_reward_received_ids - scheduled_reward_id_set
+    )
 
     segment_boundary_gap_values = [
         float(row["segment_boundary_gap_sec"])
@@ -1212,7 +1235,11 @@ def build_session_qc(
         qc_fail_reasons.append("suction_command_received_count=%d planned_suction_count=%d" % (len(suction_command_received_events), planned_suction_count))
     if len(suction_complete_events) != planned_suction_count:
         qc_fail_reasons.append("suction_complete_count=%d planned_suction_count=%d" % (len(suction_complete_events), planned_suction_count))
-    if missing_suction_command_ids or unexpected_suction_command_ids or duplicate_suction_command_ids or incomplete_suction_command_ids:
+    if unexpected_suction_command_ids:
+        qc_fail_reasons.append(
+            "unexpected_suction_command_ids=%s" % ",".join(unexpected_suction_command_ids)
+        )
+    if missing_suction_command_ids or duplicate_suction_command_ids or incomplete_suction_command_ids:
         qc_fail_reasons.append("suction_command_integrity_failure")
 
     qc_pass = not qc_fail_reasons
