@@ -383,13 +383,14 @@ def _assign_exact_rewards(trials, rng):
 def make_trial_plan(
     assignment_rows,
     n_blocks,
-    iti_min_sec=2.5,
+    iti_min_sec=3.0,
     iti_max_sec=4.5,
     sequence_seed=None,
     mouse_id="mouse",
     sequence_master_seed=DEFAULT_SEQUENCE_MASTER_SEED,
     stim_duration_sec=1.5,
     reward_delay_sec=1.0,
+    suction_delay_sec=3.5,
 ):
     """Build and validate the complete planned session before hardware starts."""
     validate_assignment_rows(assignment_rows)
@@ -399,6 +400,8 @@ def make_trial_plan(
         raise ValueError("Require 0 < iti_min_sec <= iti_max_sec")
     if not 0.0 < float(reward_delay_sec) < float(stim_duration_sec):
         raise ValueError("reward_delay_sec must be inside the stimulus interval")
+    if not math.isfinite(float(suction_delay_sec)) or float(suction_delay_sec) < float(stim_duration_sec):
+        raise ValueError("suction_delay_sec must be finite and at least stim_duration_sec")
 
     if sequence_seed is None:
         sequence_seed = stable_seed(
@@ -439,6 +442,8 @@ def make_trial_plan(
                     "planned_iti_duration_sec": round(
                         rng.uniform(float(iti_min_sec), float(iti_max_sec)), 6
                     ),
+                    "suction_scheduled": bool(image_row["reward_eligible"]),
+                    "planned_suction_delay_sec": float(suction_delay_sec),
                     "reward_scheduled": False,
                     "reward_omission_scheduled": False,
                 }
@@ -477,6 +482,8 @@ def validate_trial_plan(trials, n_blocks):
     for trial in trials:
         if not trial["reward_eligible"] and trial["reward_scheduled"]:
             raise RuntimeError("Reward scheduled on an ineligible trial.")
+        if bool(trial.get("suction_scheduled")) != bool(trial["reward_eligible"]):
+            raise RuntimeError("Suction must be scheduled exactly for reward-associated trials.")
 
     for role in REWARDED_HIGH_ROLES:
         role_trials = [trial for trial in trials if trial["image_role"] == role]

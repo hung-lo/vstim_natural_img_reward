@@ -10,7 +10,9 @@ def main():
     config = {
         "simulate_gpio": True,
         "reward_pin_bcm": 19,
+        "suction_pin_bcm": 25,
         "lick_pin_bcm": 26,
+        "suction_duration_sec": 0.01,
         "lick_bounce_time_sec": None,
         "reward_pulse_on_sec": 0.002,
         "reward_pulse_off_sec": 0.001,
@@ -26,12 +28,14 @@ def main():
         "image_role": "rewarded_high_1",
         "image_filename": "example.png",
         "reward_scheduled": True,
+        "suction_scheduled": True,
     }
     client.set_context(context)
 
     # No lick event is generated or supplied.  The precomputed reward command
     # alone must create the full valve pulse train.
     client.trigger_reward(context)
+    client.trigger_suction(context)
     time.sleep(0.05)
     events = client.drain_events()
     events.extend(client.shutdown())
@@ -42,6 +46,7 @@ def main():
     assert valve_on_count == config["reward_num_pulses"]
     assert "reward_complete" in event_types
     assert "lick_onset" not in event_types
+    assert event_types.index("suction_command_received") < event_types.index("suction_on") < event_types.index("suction_off") < event_types.index("suction_complete")
     print("PASS: reward pulse train completed with no lick event.")
 
 

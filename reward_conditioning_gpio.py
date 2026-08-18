@@ -85,8 +85,10 @@ def gpio_worker_main(connection, config):
         "image_role": "",
         "image_filename": "",
         "reward_scheduled": "",
+        "suction_scheduled": "",
     }
     reward_led = None
+    suction_led = None
     lick_button = None
 
     def safe_send(message):
@@ -123,11 +125,14 @@ def gpio_worker_main(connection, config):
         simulate = bool(config.get("simulate_gpio", False))
         if simulate:
             reward_led = _MockLED(config["reward_pin_bcm"])
+            suction_led = _MockLED(config["suction_pin_bcm"])
         else:
             from gpiozero import Button, LED
 
             reward_led = LED(config["reward_pin_bcm"])
             reward_led.off()
+            suction_led = LED(config["suction_pin_bcm"])
+            suction_led.off()
             lick_button = Button(
                 config["lick_pin_bcm"],
                 pull_up=None,
@@ -144,6 +149,7 @@ def gpio_worker_main(connection, config):
                 "simulate_gpio": simulate,
                 "reward_pin_bcm": config["reward_pin_bcm"],
                 "lick_pin_bcm": config["lick_pin_bcm"],
+                "suction_pin_bcm": config["suction_pin_bcm"],
             }
         )
         safe_send(_event("gpio_worker_ready", context_snapshot()))
@@ -218,6 +224,22 @@ def gpio_worker_main(connection, config):
                 )
             )
 
+        def deliver_suction(suction_context, command_id, trigger_source):
+            duration = float(config["suction_duration_sec"])
+            received = _event("suction_command_received", suction_context,
+                               command_id=command_id, suction_pin_bcm=config["suction_pin_bcm"],
+                               suction_duration_sec=duration, suction_trigger_source=trigger_source)
+            suction_led.on()
+            safe_send(received)
+            safe_send(_event("suction_on", suction_context, command_id=command_id,
+                             suction_pin_bcm=config["suction_pin_bcm"]))
+            time.sleep(duration)
+            suction_led.off()
+            safe_send(_event("suction_off", suction_context, command_id=command_id,
+                             suction_pin_bcm=config["suction_pin_bcm"]))
+            safe_send(_event("suction_complete", suction_context, command_id=command_id,
+                             suction_pin_bcm=config["suction_pin_bcm"], suction_duration_sec=duration))
+
         running = True
         while running:
             # Blocking recv wakes immediately on a parent command and releases
@@ -271,6 +293,18 @@ def gpio_worker_main(connection, config):
                     "operator_manual_test",
                 )
 
+            elif command_type == "trigger_suction":
+                suction_context = dict(command.get("context", context_snapshot()))
+                deliver_suction(suction_context, command_id, "precomputed_reward_associated_schedule")
+
+            elif command_type == "manual_suction":
+                manual_context = context_snapshot()
+                manual_context.update({"phase": "manual_suction", "trial_index": "",
+                                       "trial_number": "", "block_number": "",
+                                       "image_role": "", "image_filename": "",
+                                       "reward_scheduled": False, "suction_scheduled": False})
+                deliver_suction(manual_context, command_id, "operator_manual_test")
+
             elif command_type == "shutdown":
                 running = False
                 safe_send(
@@ -313,6 +347,12 @@ def gpio_worker_main(connection, config):
                 pass
             try:
                 reward_led.close()
+            except Exception:
+                pass
+        if suction_led is not None:
+            try:
+                suction_led.off()
+                suction_led.close()
             except Exception:
                 pass
         if lick_button is not None:
@@ -430,6 +470,17 @@ class BehaviorGPIOClient(object):
         )
         return command_id
 
+    def trigger_suction(self, trial_context):
+        command_id = self._next_command_id("suction")
+        self._connection.send({"command": "trigger_suction", "command_id": command_id,
+                               "context": dict(trial_context)})
+        return command_id
+
+    def manual_suction(self):
+        command_id = self._next_command_id("manual_suction")
+        self._connection.send({"command": "manual_suction", "command_id": command_id})
+        return command_id
+
     def manual_reward(self):
         command_id = self._next_command_id("manual_reward")
         self._connection.send(
@@ -499,7 +550,9 @@ if __name__ == "__main__":
     example_config = {
         "simulate_gpio": True,
         "reward_pin_bcm": 19,
+        "suction_pin_bcm": 25,
         "lick_pin_bcm": 26,
+        "suction_duration_sec": 0.01,
         "lick_bounce_time_sec": 0.003,
         "reward_pulse_on_sec": 0.002,
         "reward_pulse_off_sec": 0.001,
@@ -515,6 +568,7 @@ if __name__ == "__main__":
         "image_role": "rewarded_high_1",
         "image_filename": "example.png",
         "reward_scheduled": True,
+        "suction_scheduled": True,
     }
     client.set_context(context)
     print("COMMAND", client.trigger_reward(context))

@@ -33,7 +33,7 @@ What the runtime does:
 The current default stimulus timing is:
 
 - image on-screen time: `0.5` seconds
-- ITI time: `0.75` seconds
+- ITI time: uniform `3.0–4.5` seconds after image offset
 - initial gray screen: `3.0` seconds
 - final gray screen: `3.0` seconds
 
@@ -188,4 +188,10 @@ python3 smoke_test_reward_gpio.py
 
 After that, run one simulated session with `--simulate-gpio` before touching
 the valve or lick hardware. On the Pi, confirm the GPIO pins are wired as
-BCM19 for reward and BCM26 for lick detection.
+BCM19 for reward, BCM25 for suction, and BCM26 for lick detection.
+
+For conditioned-image trials, reward or omission occurs at 1.0 s after image
+onset, gray begins at 1.5 s, and suction begins at 3.5 s after onset on both
+rewarded and omitted conditioned-cue trials. Suction and reward are open-loop
+and never depend on licking. Lick onset and offset events remain in the main
+event log and are also exported to `<session>_lick_events.csv`.
