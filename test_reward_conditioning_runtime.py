@@ -178,6 +178,8 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
                     [],
                     reward_num_pulses=6,
                     reward_verification_timeout_sec=0.5,
+                    suction_delay_sec=3.5,
+                    suction_duration_sec=0.05,
                 )
 
         self.assertEqual(len(wait_calls), 1)

@@ -17,6 +17,7 @@ when deciding whether to open the valve.
 from __future__ import print_function
 
 import multiprocessing
+import signal
 import threading
 import time
 from datetime import datetime, timezone
@@ -75,6 +76,11 @@ class _MockLED(object):
 
 def gpio_worker_main(connection, config):
     """Own the reward valve and lick detector until a shutdown command arrives."""
+    # The parent owns terminal Ctrl-C and is responsible for orderly cleanup.
+    try:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    except Exception:
+        pass
     send_lock = threading.Lock()
     context_lock = threading.Lock()
     current_context = {
@@ -229,11 +235,14 @@ def gpio_worker_main(connection, config):
             received = _event("suction_command_received", suction_context,
                                command_id=command_id, suction_pin_bcm=config["suction_pin_bcm"],
                                suction_duration_sec=duration, suction_trigger_source=trigger_source)
+            suction_off_deadline = time.monotonic() + duration
             suction_led.on()
             safe_send(received)
             safe_send(_event("suction_on", suction_context, command_id=command_id,
                              suction_pin_bcm=config["suction_pin_bcm"]))
-            time.sleep(duration)
+            remaining = suction_off_deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(remaining)
             suction_led.off()
             safe_send(_event("suction_off", suction_context, command_id=command_id,
                              suction_pin_bcm=config["suction_pin_bcm"]))

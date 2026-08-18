@@ -62,7 +62,6 @@ POST_REWARD_STIM_SEC = STIM_DURATION_SEC - REWARD_DELAY_SEC
 DEFAULT_N_BLOCKS = 10
 DEFAULT_ITI_MIN_SEC = 3.0
 DEFAULT_ITI_MAX_SEC = 4.5
-SUCTION_DELAY_SEC = 3.5
 MINIMUM_CLEAN_POST_SUCTION_SEC = 0.75
 DEFAULT_PRE_BACKGROUND_MIN = 5.0
 DEFAULT_POST_BACKGROUND_MIN = 5.0
@@ -478,17 +477,20 @@ def hold_background(
     )
     append_event(event_log_path, start)
     start_monotonic = time.monotonic()
-    overall_deadline = start_monotonic + float(duration_sec)
+    requested_deadline = start_monotonic + float(duration_sec)
+    required_hardware_deadline = requested_deadline
     for check in pending_reward_checks or []:
         if "suction_target" in check:
             wait_until(check["suction_target"], gpio_client, event_log_path, all_gpio_events)
             command_id = gpio_client.trigger_suction(check["context"])
             if check.get("runtime") is not None:
                 check["runtime"]["suction_command_id"] = command_id
+            suction_deadline = time.monotonic() + float(check.get("duration_sec", 0.0))
+            required_hardware_deadline = max(required_hardware_deadline, suction_deadline)
             verify_suction_command(gpio_client, command_id, event_log_path, all_gpio_events,
-                                   max(0.01, overall_deadline - time.monotonic()))
+                                   max(0.01, suction_deadline - time.monotonic() + 1.0))
             continue
-        remaining = overall_deadline - time.monotonic()
+        remaining = requested_deadline - time.monotonic()
         if remaining <= 0:
             break
         verify_reward_command(
@@ -500,7 +502,7 @@ def hold_background(
             timeout_sec=min(float(check.get("timeout_sec", remaining)), remaining),
         )
     wait_until(
-        overall_deadline,
+        max(requested_deadline, required_hardware_deadline),
         gpio_client,
         event_log_path,
         all_gpio_events,
@@ -510,7 +512,8 @@ def hold_background(
         phase + "_end",
         phase=phase,
         planned_duration_sec=float(duration_sec),
-        notes="actual_duration_sec=%.9f" % actual,
+        notes=("requested_duration_sec=%.9f; actual_duration_sec=%.9f"
+               % (float(duration_sec), actual)),
     )
     append_event(event_log_path, end)
     return actual
@@ -616,6 +619,8 @@ def run_trials(
     all_gpio_events,
     reward_num_pulses,
     reward_verification_timeout_sec,
+    suction_delay_sec,
+    suction_duration_sec,
 ):
     runtime_by_trial = {}
     pending_final_reward_checks = []
@@ -747,7 +752,14 @@ def run_trials(
             reward_check = None
         suction_check = None
         if trial.get("suction_scheduled"):
-            suction_check = {"target": runtime["stim_request_monotonic_ns"] / 1e9 + SUCTION_DELAY_SEC}
+            suction_check = {
+                "target": runtime["stim_request_monotonic_ns"] / 1e9 + float(suction_delay_sec),
+                "duration_sec": float(suction_duration_sec),
+            }
+
+        # Populate final-trial segment timing before the early POST return.
+        runtime["stim_segment1_return_unix_ns"] = first_timing["return_unix_ns"]
+        runtime["stim_segment2_request_unix_ns"] = second_timing["request_unix_ns"]
 
         if completed_count == total_trials:
             runtime["trial_completed"] = True
@@ -780,11 +792,13 @@ def run_trials(
             if reward_check is not None:
                 pending_final_reward_checks.append(reward_check)
             if suction_check is not None:
-                pending_final_reward_checks.append({"suction_target": suction_check["target"], "context": context, "runtime": runtime})
+                pending_final_reward_checks.append({"suction_target": suction_check["target"], "duration_sec": suction_check["duration_sec"], "context": context, "runtime": runtime})
             sys.stdout.write("\n")
             sys.stdout.flush()
             return runtime_by_trial, pending_final_reward_checks
 
+        gpio_client.set_context(trial_context(trial, "iti"))
+        log_drained_gpio_events(gpio_client, event_log_path, all_gpio_events)
         background_row = trial_context(trial, "iti")
         background_row.update(
             {
@@ -814,9 +828,6 @@ def run_trials(
             }
         )
         append_event(event_log_path, background_row)
-
-        runtime["stim_segment1_return_unix_ns"] = first_timing["return_unix_ns"]
-        runtime["stim_segment2_request_unix_ns"] = second_timing["request_unix_ns"]
 
         # The ITI deadline is anchored to gray onset. Verification and suction
         # are serviced inside this interval and may not extend it.
@@ -1070,26 +1081,43 @@ def build_session_qc(
     planned_reward_count = sum(1 for trial in trials if trial["reward_scheduled"])
     planned_suction_count = sum(1 for trial in trials if trial.get("suction_scheduled"))
 
+    scheduled_reward_command_ids = {
+        row.get("reward_command_id")
+        for row in trial_summary_rows
+        if row.get("reward_command_id")
+    }
+    reward_events = [
+        event for event in all_gpio_events
+        if event.get("command_id") in scheduled_reward_command_ids
+    ]
     reward_command_received_events = [
-        event for event in all_gpio_events if event.get("event_type") == "reward_command_received"
+        event for event in reward_events if event.get("event_type") == "reward_command_received"
     ]
     reward_complete_events = [
-        event for event in all_gpio_events if event.get("event_type") == "reward_complete"
+        event for event in reward_events if event.get("event_type") == "reward_complete"
     ]
     reward_valve_on_events = [
-        event for event in all_gpio_events if event.get("event_type") == "reward_valve_on"
+        event for event in reward_events if event.get("event_type") == "reward_valve_on"
     ]
     reward_valve_off_events = [
-        event for event in all_gpio_events if event.get("event_type") == "reward_valve_off"
+        event for event in reward_events if event.get("event_type") == "reward_valve_off"
     ]
     lick_onset_events = [
         event for event in all_gpio_events if event.get("event_type") == "lick_onset"
     ]
-    suction_command_received_events = [e for e in all_gpio_events if e.get("event_type") == "suction_command_received" and e.get("phase") != "manual_suction"]
-    suction_complete_events = [e for e in all_gpio_events if e.get("event_type") == "suction_complete" and e.get("phase") != "manual_suction"]
-    suction_on_events = [e for e in all_gpio_events if e.get("event_type") == "suction_on" and e.get("phase") != "manual_suction"]
-    suction_off_events = [e for e in all_gpio_events if e.get("event_type") == "suction_off" and e.get("phase") != "manual_suction"]
-    scheduled_suction_ids = {row.get("suction_command_id", "") for row in trial_summary_rows if row.get("suction_scheduled")}
+    scheduled_suction_ids = {
+        row.get("suction_command_id")
+        for row in trial_summary_rows
+        if row.get("suction_command_id")
+    }
+    suction_events = [
+        event for event in all_gpio_events
+        if event.get("command_id") in scheduled_suction_ids
+    ]
+    suction_command_received_events = [e for e in suction_events if e.get("event_type") == "suction_command_received"]
+    suction_complete_events = [e for e in suction_events if e.get("event_type") == "suction_complete"]
+    suction_on_events = [e for e in suction_events if e.get("event_type") == "suction_on"]
+    suction_off_events = [e for e in suction_events if e.get("event_type") == "suction_off"]
     received_suction_ids = {e.get("command_id", "") for e in suction_command_received_events}
     missing_suction_command_ids = sorted("trial_%s" % row.get("trial_index") for row in trial_summary_rows if row.get("suction_scheduled") and not row.get("suction_command_id"))
     unexpected_suction_command_ids = sorted(received_suction_ids - scheduled_suction_ids - {""})
@@ -1256,6 +1284,7 @@ def main(argv=None):
     hardware_config = load_hardware_config(
         args.hardware_config, simulate_gpio=args.simulate_gpio
     )
+    suction_delay_sec = float(hardware_config["suction_delay_from_stim_onset_sec"])
     reward_train_duration_sec = (
         hardware_config["reward_num_pulses"]
         * hardware_config["reward_pulse_on_sec"]
@@ -1278,7 +1307,9 @@ def main(argv=None):
         "Number of 50-trial probability blocks", DEFAULT_N_BLOCKS
     )
     iti_min_sec = prompt_float_or_default(
-        "Minimum gray ITI in seconds", DEFAULT_ITI_MIN_SEC, minimum=0.1
+        "Minimum gray ITI in seconds",
+        DEFAULT_ITI_MIN_SEC,
+        minimum=0.1 if args.simulate_gpio else DEFAULT_ITI_MIN_SEC,
     )
     iti_max_sec = prompt_float_or_default(
         "Maximum gray ITI in seconds", DEFAULT_ITI_MAX_SEC, minimum=iti_min_sec
@@ -1314,6 +1345,7 @@ def main(argv=None):
         mouse_id=mouse_id,
         stim_duration_sec=STIM_DURATION_SEC,
         reward_delay_sec=REWARD_DELAY_SEC,
+        suction_delay_sec=hardware_config["suction_delay_from_stim_onset_sec"],
     )
     plan_summary = summarize_trial_plan(trials)
     estimated_task_sec = estimate_task_seconds(trials)
@@ -1343,7 +1375,7 @@ def main(argv=None):
     print("  Reward pin: BCM%d" % hardware_config["reward_pin_bcm"])
     print("  Lick pin: BCM%d" % hardware_config["lick_pin_bcm"])
     print("  Suction pin: BCM%d" % hardware_config["suction_pin_bcm"])
-    print("  Suction boundary: %.1f s after reward-associated image onset" % SUCTION_DELAY_SEC)
+    print("  Suction boundary: %.1f s after reward-associated image onset" % suction_delay_sec)
     print("  Reward pulse-train duration: %.3f s" % reward_train_duration_sec)
     print("  GPIO simulation: %s" % hardware_config["simulate_gpio"])
     print("  Face camera: %s" % use_camera)
@@ -1446,7 +1478,7 @@ def main(argv=None):
         "camera_event_log_csv": str(camera_event_log_path) if use_camera else "",
         "session_qc_json": "",
         "lick_events_csv": str(lick_events_path),
-        "suction_delay_from_stim_onset_sec": SUCTION_DELAY_SEC,
+        "suction_delay_from_stim_onset_sec": suction_delay_sec,
         "final_planned_iti_executed": False,
         "post_started_immediately_after_final_stimulus": True,
         "plan_summary": plan_summary,
@@ -1459,7 +1491,6 @@ def main(argv=None):
     task_completed = False
     post_background_completed = False
     camera_started = False
-    camera_stopped = False
     camera_stop_confirmed = False
     camera_fetch_completed = False
     camera_conversion_completed = False
@@ -1638,7 +1669,10 @@ def main(argv=None):
                 all_gpio_events,
                 hardware_config["reward_num_pulses"],
                 reward_verification_timeout_sec,
+                hardware_config["suction_delay_from_stim_onset_sec"],
+                hardware_config["suction_duration_sec"],
             )
+            task_completed = True
             append_event(
                 event_log_path,
                 exact_timestamp_event(
@@ -1657,15 +1691,17 @@ def main(argv=None):
                 pending_reward_checks=pending_final_reward_checks,
             )
             metadata["post_background_actual_sec"] = post_actual
-            session_completed = True
+            post_background_completed = True
 
             # Keep exactly the same gray background on screen during remote
             # camera cleanup.  The current natural-stim camera runner switches
             # to black; this task intentionally does not.
             if use_camera and camera_started:
                 try:
-                    camera_support.stop_camera_recording()
-                    camera_stopped = True
+                    stop_state = camera_support.stop_camera_recording()
+                    camera_stop_confirmed = bool(stop_state.get("camera_stop_confirmed", False))
+                    if not camera_stop_confirmed:
+                        raise RuntimeError("Camera stop was not confirmed: %s" % json.dumps(stop_state, sort_keys=True))
                     append_event(
                         event_log_path,
                         exact_timestamp_event(
@@ -1676,7 +1712,7 @@ def main(argv=None):
                     )
                     fetch_state = camera_support.fetch_camera_recording()
                     camera_fetch_completed = bool(
-                        fetch_state.get("camera_fetch_completed", True)
+                        fetch_state.get("camera_fetch_completed", False)
                     )
                     append_event(
                         event_log_path,
@@ -1686,19 +1722,36 @@ def main(argv=None):
                             notes=json.dumps(fetch_state, sort_keys=True),
                         ),
                     )
-                    convert_state = camera_support.convert_camera_recording()
                     camera_conversion_completed = bool(
-                        convert_state.get("camera_conversion_completed", True)
+                        fetch_state.get("camera_conversion_completed", False)
+                    )
+                    camera_conversion_deferred = bool(
+                        fetch_state.get("camera_conversion_deferred", False)
                     )
                     append_event(
                         event_log_path,
                         exact_timestamp_event(
                             "camera_conversion_returned",
                             phase="poststim_camera_cleanup_gray",
-                            notes=json.dumps(convert_state, sort_keys=True),
+                            notes=json.dumps(fetch_state, sort_keys=True),
                         ),
                     )
+                    if camera_fetch_completed and not camera_conversion_completed:
+                        convert_state = camera_support.convert_camera_recording()
+                        camera_conversion_completed = bool(
+                            convert_state.get("camera_conversion_completed", False)
+                        )
+                        append_event(
+                            event_log_path,
+                            exact_timestamp_event(
+                                "camera_conversion_retry_returned",
+                                phase="poststim_camera_cleanup_gray",
+                                notes=json.dumps(convert_state, sort_keys=True),
+                            ),
+                        )
                 except Exception as exc:
+                    camera_cleanup_error = True
+                    camera_cleanup_error_message = "%s: %s" % (type(exc).__name__, exc)
                     append_event(
                         event_log_path,
                         exact_timestamp_event(
@@ -1718,7 +1771,7 @@ def main(argv=None):
                 notes="KeyboardInterrupt",
             ),
         )
-        raise
+        print("Session interrupted by Ctrl-C; cleaning up hardware.", file=sys.stderr)
     except Exception as exc:
         append_event(
             event_log_path,
@@ -1772,11 +1825,24 @@ def main(argv=None):
         metadata["session_qc_json"] = str(qc_path)
 
         metadata["utc_iso_end"] = base.utc_iso_now()
+        camera_cleanup_required = bool(use_camera and camera_started)
+        camera_data_secured = (
+            not camera_cleanup_required
+            or (camera_stop_confirmed and camera_fetch_completed and camera_conversion_completed)
+        )
+        session_completed = bool(
+            task_completed and post_background_completed and camera_data_secured and not camera_cleanup_error
+        )
+        metadata["task_completed"] = task_completed
+        metadata["post_background_completed"] = post_background_completed
         metadata["session_completed"] = session_completed
         metadata["camera_started"] = camera_started
-        metadata["camera_stopped"] = camera_stopped
+        metadata["camera_stop_confirmed"] = camera_stop_confirmed
         metadata["camera_fetch_completed"] = camera_fetch_completed
         metadata["camera_conversion_completed"] = camera_conversion_completed
+        metadata["camera_conversion_deferred"] = camera_conversion_deferred
+        metadata["camera_cleanup_error"] = camera_cleanup_error
+        metadata["camera_cleanup_error_message"] = camera_cleanup_error_message
         metadata["n_gpio_events_logged"] = len(all_gpio_events)
         metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
 
@@ -1797,6 +1863,9 @@ def main(argv=None):
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
+    except KeyboardInterrupt:
+        print("Interrupted.", file=sys.stderr)
+        raise SystemExit(130)
     except Exception as exc:
         print("ERROR: %s" % exc, file=sys.stderr)
         raise

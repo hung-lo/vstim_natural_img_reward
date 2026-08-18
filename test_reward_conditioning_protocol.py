@@ -92,6 +92,13 @@ class RewardConditioningProtocolTests(unittest.TestCase):
             self.assertEqual(len(role_trials), 10)
             self.assertEqual(sum(t["reward_scheduled"] for t in role_trials), 9)
             self.assertEqual(sum(t["reward_omission_scheduled"] for t in role_trials), 1)
+        conditioned_trials = [trial for trial in trials if trial["reward_eligible"]]
+        self.assertEqual(len(conditioned_trials), 20)
+        self.assertEqual(sum(trial["suction_scheduled"] for trial in conditioned_trials), 20)
+        self.assertEqual(sum(trial["reward_scheduled"] for trial in conditioned_trials), 18)
+        self.assertEqual(sum(trial["reward_omission_scheduled"] for trial in conditioned_trials), 2)
+        self.assertTrue(all(not trial["suction_scheduled"] for trial in trials if not trial["reward_eligible"]))
+        self.assertTrue(all(trial["planned_suction_delay_sec"] == 3.5 for trial in trials))
 
     def test_no_reward_can_appear_on_ineligible_trial(self):
         assignment, _, _, _ = protocol.create_or_load_assignment(

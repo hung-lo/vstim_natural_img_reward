@@ -45,6 +45,10 @@ def main():
     assert "reward_command_received" in event_types
     assert valve_on_count == config["reward_num_pulses"]
     assert "reward_complete" in event_types
+    assert event_types.count("suction_command_received") == 1
+    assert event_types.count("suction_on") == 1
+    assert event_types.count("suction_off") == 1
+    assert event_types.count("suction_complete") == 1
     assert "lick_onset" not in event_types
     assert event_types.index("suction_command_received") < event_types.index("suction_on") < event_types.index("suction_off") < event_types.index("suction_complete")
     print("PASS: reward pulse train completed with no lick event.")
