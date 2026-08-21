@@ -541,15 +541,19 @@ def maybe_cleanup_remote_raw(args, state, camera_host, local_video_dir):
     """Freshly verify raw and MP4 data immediately before remote deletion."""
     state["remote_raw_cleanup_attempted"] = False
     manifest = state.get("remote_raw_manifest") or []
+    state["camera_raw_files_verified"] = False
+    state["camera_raw_hash_verified"] = False
+    state["camera_mp4_verified"] = False
+    state["remote_raw_cleanup_completed"] = False
     if not (state.get("camera_stop_confirmed") and manifest):
         state["remote_raw_retained"] = True
         return state
     try:
         verify_local_camera_raw_manifest(local_video_dir, manifest)
-        for item in manifest:
-            probe_mp4(Path(local_video_dir) / Path(item["filename"]).with_suffix(".mp4"))
         state["camera_raw_files_verified"] = True
         state["camera_raw_hash_verified"] = True
+        for item in manifest:
+            probe_mp4(Path(local_video_dir) / Path(item["filename"]).with_suffix(".mp4"))
         state["camera_mp4_verified"] = True
         state["remote_raw_cleanup_attempted"] = True
         run_ssh(camera_host, build_remote_cleanup_command(manifest, state["remote_video_dir"]),
@@ -558,6 +562,8 @@ def maybe_cleanup_remote_raw(args, state, camera_host, local_video_dir):
         state["remote_raw_retained"] = False
         state["remote_raw_cleanup_error"] = ""
     except Exception as exc:
+        # Raw verification leaves all current verification fields false; MP4
+        # verification happens only after a current raw hash succeeds.
         state["remote_raw_cleanup_completed"] = False
         state["remote_raw_retained"] = True
         state["remote_raw_cleanup_error"] = str(exc)
@@ -1350,6 +1356,9 @@ def convert_camera(args, state=None):
         except Exception as exc:
             state["camera_raw_files_verified"] = False
             state["camera_raw_hash_verified"] = False
+            state["camera_conversion_completed"] = False
+            state["camera_mp4_verified"] = False
+            state["camera_conversion_failed"] = True
             state["remote_raw_retained"] = True
             state["camera_conversion_error"] = "Current local raw verification failed: %s" % exc
             save_state(state)
@@ -1378,6 +1387,7 @@ def convert_camera(args, state=None):
         state["camera_conversion_failed_utc"] = utc_iso_now()
         state["camera_conversion_error"] = str(exc)
         state["camera_conversion_completed"] = False
+        state["camera_mp4_verified"] = False
         state["camera_conversion_deferred"] = False
         append_event(
             local_video_dir,
@@ -1394,8 +1404,8 @@ def convert_camera(args, state=None):
 
     state.update(conversion_state)
     state["camera_conversion_completed_utc"] = utc_iso_now() if conversion_state.get("camera_conversion_completed") else ""
-    state["camera_conversion_failed"] = False
-    state["camera_conversion_failed_utc"] = ""
+    state["camera_conversion_failed"] = bool(conversion_state.get("camera_conversion_error"))
+    state["camera_conversion_failed_utc"] = utc_iso_now() if state["camera_conversion_failed"] else ""
     state["camera_mp4_verified"] = bool(conversion_state.get("camera_conversion_completed"))
     maybe_cleanup_remote_raw(args, state, camera_host, local_video_dir)
     save_state(state)

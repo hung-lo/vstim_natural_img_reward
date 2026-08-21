@@ -4,6 +4,7 @@
 import hashlib
 import json
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -109,6 +110,27 @@ class CameraControlSafetyTests(unittest.TestCase):
         run_ssh.assert_not_called()
         self.assertFalse(state["remote_raw_cleanup_completed"])
         self.assertTrue(state["remote_raw_retained"])
+        self.assertFalse(state["camera_raw_files_verified"])
+        self.assertFalse(state["camera_raw_hash_verified"])
+        self.assertFalse(state["camera_mp4_verified"])
+
+    def test_mp4_failure_blocks_cleanup_after_current_raw_verification(self):
+        video_dir = Path(self.temp_dir.name) / "video"
+        video_dir.mkdir()
+        raw = video_dir / "a.h264"
+        raw.write_bytes(b"camera")
+        state = self._state()
+        state.update({"camera_stop_confirmed": True, "remote_raw_manifest": [{
+            "remote_path": "/remote/mouse_session/video/a.h264", "filename": "a.h264",
+            "size_bytes": raw.stat().st_size, "sha256": hashlib.sha256(raw.read_bytes()).hexdigest(),
+        }]})
+        with mock.patch.object(camera, "probe_mp4", side_effect=RuntimeError("bad mp4")), mock.patch.object(camera, "run_ssh") as run_ssh:
+            camera.maybe_cleanup_remote_raw(mock.Mock(dry_run=False), state, "pi@test", video_dir)
+        run_ssh.assert_not_called()
+        self.assertTrue(state["camera_raw_files_verified"])
+        self.assertTrue(state["camera_raw_hash_verified"])
+        self.assertFalse(state["camera_mp4_verified"])
+        self.assertTrue(state["remote_raw_retained"])
 
     def test_fetch_dry_run_requires_no_remote_manifest_or_rsync(self):
         state = self._state()
@@ -119,6 +141,26 @@ class CameraControlSafetyTests(unittest.TestCase):
         manifest.assert_not_called()
         rsync.assert_not_called()
         self.assertEqual(result["camera_fetch_status"], "dry_run")
+
+    def test_standalone_convert_clears_stale_success_after_raw_mismatch(self):
+        video_dir = Path(self.temp_dir.name) / "video"
+        video_dir.mkdir()
+        (video_dir / "a.h264").write_bytes(b"changed")
+        state = self._state()
+        state.update({"camera_stop_confirmed": True, "camera_raw_files_verified": True,
+                      "camera_raw_hash_verified": True, "camera_conversion_completed": True,
+                      "camera_mp4_verified": True, "remote_raw_manifest": [{
+                          "remote_path": "/remote/mouse_session/video/a.h264", "filename": "a.h264",
+                          "size_bytes": 7, "sha256": "0" * 64,
+                      }]})
+        args = types.SimpleNamespace(dry_run=False, ffmpeg_timeout_sec=1, camera_host=None)
+        with mock.patch.object(camera, "run_ssh") as run_ssh:
+            result = camera.convert_camera(args, state=state)
+        run_ssh.assert_not_called()
+        self.assertFalse(result["camera_raw_hash_verified"])
+        self.assertFalse(result["camera_conversion_completed"])
+        self.assertFalse(result["camera_mp4_verified"])
+        self.assertTrue(result["camera_conversion_failed"])
 
 
 if __name__ == "__main__":
