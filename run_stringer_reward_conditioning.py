@@ -67,6 +67,8 @@ MINIMUM_CLEAN_POST_SUCTION_SEC = 0.75
 DEFAULT_PRE_BACKGROUND_MIN = 5.0
 DEFAULT_POST_BACKGROUND_MIN = 5.0
 BACKGROUND_POLL_SEC = 0.10
+STATUS_TTY_INTERVAL_SEC = 1.0
+STATUS_NON_TTY_INTERVAL_SEC = 30.0
 REWARD_VERIFICATION_MARGIN_SEC = 0.25
 QC_SCHEMA_VERSION = 1
 SESSION_OUTPUT_SCHEMA_VERSION = 2
@@ -258,12 +260,53 @@ def format_operator_status(phase, camera_elapsed_sec=None, remaining_sec=None, t
     return "%s | %s %s remaining" % (prefix, phase, base.format_seconds(remaining_sec or 0))
 
 
-def wait_for_two_photon_gate(status_callback=None, poll_sec=0.25):
+class StatusReporter(object):
+    """Rate-limited terminal-only operational status; never writes event rows."""
+    def __init__(self, stream=None, monotonic_fn=None):
+        self.stream = stream or sys.stdout
+        self.monotonic_fn = monotonic_fn or time.monotonic
+        self.last_print = None
+
+    def report(self, text, force=False):
+        now = self.monotonic_fn()
+        interval = STATUS_TTY_INTERVAL_SEC if self.stream.isatty() else STATUS_NON_TTY_INTERVAL_SEC
+        if not force and self.last_print is not None and now - self.last_print < interval:
+            return False
+        self.stream.write(("\r" if self.stream.isatty() else "") + text + ("" if self.stream.isatty() else "\n"))
+        self.stream.flush()
+        self.last_print = now
+        return True
+
+    def finalize(self, text=None):
+        if text: self.report(text, force=True)
+        if self.stream.isatty(): self.stream.write("\n"); self.stream.flush()
+
+
+def derive_session_status(task_completed, post_completed, interrupted=False, primary_error=None,
+                          camera_enabled=False, camera_state=None, cleanup_errors=None,
+                          finalization_errors=None):
+    camera_state = camera_state or {}
+    if interrupted: return "interrupted"
+    if primary_error is not None: return "failed"
+    if not (task_completed and post_completed): return "incomplete"
+    if cleanup_errors or finalization_errors: return "cleanup_failed"
+    if not camera_enabled: return "complete"
+    if not camera_state.get("camera_stop_confirmed") or camera_state.get("camera_cleanup_error"):
+        return "protocol_complete_camera_cleanup_failed"
+    if not camera_state.get("camera_mp4_verified"):
+        return "protocol_complete_video_pending"
+    if not camera_state.get("camera_raw_files_verified"):
+        return "protocol_complete_camera_cleanup_failed"
+    return "complete"
+
+
+def wait_for_two_photon_gate(status_callback=None, service_callback=None, poll_sec=0.25):
     """Wait for an explicit Enter; EOF never releases the experimental gate."""
     if not sys.stdin.isatty():
         raise RuntimeError("2P operator gate requires interactive stdin; refusing to auto-bypass.")
     started = time.monotonic()
     while True:
+        if service_callback: service_callback()
         if status_callback: status_callback()
         ready, _, _ = select.select([sys.stdin], [], [], poll_sec)
         if not ready: continue
@@ -559,13 +602,14 @@ def log_drained_gpio_events(gpio_client, event_log_path, all_gpio_events):
     return events
 
 
-def wait_until(deadline_monotonic, gpio_client, event_log_path, all_gpio_events):
+def wait_until(deadline_monotonic, gpio_client, event_log_path, all_gpio_events, status_callback=None):
     while True:
         remaining = deadline_monotonic - time.monotonic()
         if remaining <= 0:
             break
         time.sleep(min(BACKGROUND_POLL_SEC, remaining))
         log_drained_gpio_events(gpio_client, event_log_path, all_gpio_events)
+        if status_callback: status_callback(max(0.0, deadline_monotonic - time.monotonic()))
 
 
 def hold_background(
@@ -575,6 +619,7 @@ def hold_background(
     event_log_path,
     all_gpio_events,
     pending_reward_checks=None,
+    status_callback=None,
 ):
     gpio_client.set_context(background_context(phase))
     start = exact_timestamp_event(
@@ -613,6 +658,7 @@ def hold_background(
         gpio_client,
         event_log_path,
         all_gpio_events,
+        status_callback=status_callback,
     )
     actual = time.monotonic() - start_monotonic
     end = exact_timestamp_event(
@@ -728,6 +774,7 @@ def run_trials(
     reward_verification_timeout_sec,
     suction_delay_sec,
     suction_duration_sec,
+    status_callback=None,
 ):
     runtime_by_trial = {}
     pending_final_reward_checks = []
@@ -975,16 +1022,12 @@ def run_trials(
         runtime["trial_completed"] = True
 
         remaining = planned_task_remaining_seconds(trials, completed_count)
-        sys.stdout.write(
-            "\rTASK %d/%d (%.1f%%), planned task remaining %s   "
-            % (
-                completed_count,
-                total_trials,
-                100.0 * completed_count / float(total_trials),
-                base.format_seconds(remaining),
-            )
-        )
-        sys.stdout.flush()
+        if status_callback:
+            status_callback(completed_count, total_trials, remaining)
+        else:
+            sys.stdout.write("\rTASK %d/%d (%.1f%%), planned task remaining %s   " %
+                             (completed_count, total_trials, 100.0 * completed_count / float(total_trials), base.format_seconds(remaining)))
+            sys.stdout.flush()
 
     sys.stdout.write("\n")
     sys.stdout.flush()
@@ -1505,6 +1548,7 @@ def main(argv=None):
     print()
     print("Session setup summary:")
     print("  Mouse: %s" % mouse_id)
+    print("  Session notes: %s" % (session_notes or "(none)"))
     print("  Shared 14-image panel: %s" % global_panel_path(ASSIGNMENT_DIR))
     print("  Fixed per-mouse role assignment: %s" % assignment_path)
     print("  Assignment newly created: %s" % assignment_created)
@@ -1528,6 +1572,7 @@ def main(argv=None):
     print("  Reward pulse-train duration: %.3f s" % reward_train_duration_sec)
     print("  GPIO simulation: %s" % hardware_config["simulate_gpio"])
     print("  Face camera: %s" % use_camera)
+    print("  Output destination: %s/<session_id>" % OUTPUT_ROOT)
     print("  IMPORTANT: reward delivery is independent of licking.")
     print("  Suction is applied to rewarded and omission conditioned-cue trials, independent of licking.")
     print()
@@ -1669,6 +1714,7 @@ def main(argv=None):
     cleanup_errors = []
     finalization_errors = []
     latest_camera_state = {}
+    status_reporter = StatusReporter()
 
     try:
         print("Building one-frame gray background raw...")
@@ -1806,9 +1852,11 @@ def main(argv=None):
             append_event(event_log_path, exact_timestamp_event("two_photon_operator_gate_entered", phase="preparation_gray"))
             gate_camera_anchor = metadata.get("camera_recording_request_monotonic_ns")
             gate_wait_sec = wait_for_two_photon_gate(
-                lambda: print(format_operator_status("WAITING_FOR_2P",
+                lambda: status_reporter.report(format_operator_status("WAITING_FOR_2P",
                     (time.monotonic_ns() - gate_camera_anchor) / 1e9 if gate_camera_anchor else None,
-                    planned_total_sec), end="\r", flush=True))
+                    planned_total_sec)),
+                service_callback=lambda: log_drained_gpio_events(gpio_client, event_log_path, all_gpio_events))
+            status_reporter.finalize()
             metadata["operator_gate_release_monotonic_ns"] = time.monotonic_ns()
             metadata["operator_gate_wait_sec"] = gate_wait_sec
             append_event(
@@ -1820,13 +1868,18 @@ def main(argv=None):
                 ),
             )
 
+            metadata["pre_start_monotonic_ns"] = time.monotonic_ns()
             pre_actual = hold_background(
                 "prestim_background",
                 pre_background_min * 60.0,
                 gpio_client,
                 event_log_path,
                 all_gpio_events,
+                status_callback=lambda remaining: status_reporter.report(format_operator_status("PRE",
+                    (time.monotonic_ns() - gate_camera_anchor) / 1e9 if gate_camera_anchor else None, remaining)),
             )
+            metadata["pre_end_monotonic_ns"] = time.monotonic_ns()
+            metadata["pre_elapsed_sec"] = pre_actual
             metadata["pre_background_actual_sec"] = pre_actual
 
             append_event(
@@ -1837,6 +1890,7 @@ def main(argv=None):
                     notes="first stimulus follows; reward is open-loop",
                 ),
             )
+            metadata["task_start_monotonic_ns"] = time.monotonic_ns()
             runtime_by_trial, pending_final_reward_checks = run_trials(
                 screen,
                 trials,
@@ -1851,7 +1905,12 @@ def main(argv=None):
                 reward_verification_timeout_sec,
                 hardware_config["suction_delay_from_stim_onset_sec"],
                 hardware_config["suction_duration_sec"],
+                status_callback=lambda done, total, remaining: status_reporter.report(format_operator_status("TASK",
+                    (time.monotonic_ns() - gate_camera_anchor) / 1e9 if gate_camera_anchor else None,
+                    remaining, done, total, post_background_min * 60.0)),
             )
+            metadata["task_end_monotonic_ns"] = time.monotonic_ns()
+            metadata["task_elapsed_sec"] = (metadata["task_end_monotonic_ns"] - metadata["task_start_monotonic_ns"]) / 1e9
             task_completed = True
             append_event(
                 event_log_path,
@@ -1862,6 +1921,7 @@ def main(argv=None):
                 ),
             )
 
+            metadata["post_start_monotonic_ns"] = time.monotonic_ns()
             post_actual = hold_background(
                 "poststim_background",
                 post_background_min * 60.0,
@@ -1869,7 +1929,11 @@ def main(argv=None):
                 event_log_path,
                 all_gpio_events,
                 pending_reward_checks=pending_final_reward_checks,
+                status_callback=lambda remaining: status_reporter.report(format_operator_status("POST",
+                    (time.monotonic_ns() - gate_camera_anchor) / 1e9 if gate_camera_anchor else None, remaining)),
             )
+            metadata["post_end_monotonic_ns"] = time.monotonic_ns()
+            metadata["post_elapsed_sec"] = post_actual
             metadata["post_background_actual_sec"] = post_actual
             post_background_completed = True
 
@@ -1883,6 +1947,10 @@ def main(argv=None):
                     latest_camera_state = dict(stop_state)
                     if not camera_stop_confirmed:
                         raise RuntimeError("Camera stop was not confirmed: %s" % json.dumps(stop_state, sort_keys=True))
+                    metadata["camera_stop_confirmed_monotonic_ns"] = time.monotonic_ns()
+                    anchor_ns = metadata.get("camera_recording_request_monotonic_ns")
+                    metadata["camera_recording_elapsed_local_sec"] = ((metadata["camera_stop_confirmed_monotonic_ns"] - anchor_ns) / 1e9 if anchor_ns else None)
+                    status_reporter.finalize("REC stopped %s | camera stop confirmed" % base.format_seconds(metadata["camera_recording_elapsed_local_sec"] or 0))
                     append_event(
                         event_log_path,
                         exact_timestamp_event(
@@ -1891,6 +1959,7 @@ def main(argv=None):
                             notes="screen_remained_gray",
                         ),
                     )
+                    print("VIDEO | verifying/fetching raw recording...")
                     fetch_state = camera_support.fetch_camera_recording()
                     metadata["camera_fetch_result"] = fetch_state
                     latest_camera_state = dict(fetch_state)
@@ -1968,6 +2037,10 @@ def main(argv=None):
                 stop_state = camera_support.stop_camera_recording()
                 camera_stop_confirmed = bool(stop_state.get("camera_stop_confirmed", False))
                 latest_camera_state = dict(stop_state)
+                if camera_stop_confirmed and "camera_stop_confirmed_monotonic_ns" not in metadata:
+                    metadata["camera_stop_confirmed_monotonic_ns"] = time.monotonic_ns()
+                    anchor_ns = metadata.get("camera_recording_request_monotonic_ns")
+                    metadata["camera_recording_elapsed_local_sec"] = ((metadata["camera_stop_confirmed_monotonic_ns"] - anchor_ns) / 1e9 if anchor_ns else None)
                 append_event(
                     event_log_path,
                     exact_timestamp_event(
@@ -2016,7 +2089,9 @@ def main(argv=None):
         metadata["task_completed"] = task_completed
         metadata["post_background_completed"] = post_background_completed
         metadata["session_completed"] = session_completed
-        metadata["session_status"] = ("complete" if session_completed else ("interrupted" if interrupted else ("failed" if primary_error is not None else "cleanup_failed")))
+        metadata["session_status"] = derive_session_status(
+            task_completed, post_background_completed, interrupted, primary_error,
+            use_camera, latest_camera_state, cleanup_errors, finalization_errors)
         metadata.update(final_camera_metadata(
             latest_camera_state, use_camera, camera_started, camera_stop_confirmed,
             camera_fetch_completed, camera_conversion_completed))

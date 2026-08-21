@@ -2,6 +2,7 @@
 """Runtime regression tests for reward-conditioning behavior."""
 
 import tempfile
+import io
 import sys
 import types
 import unittest
@@ -40,6 +41,26 @@ class FakeGPIOClient:
 
 
 class RewardConditioningRuntimeTests(unittest.TestCase):
+    def test_status_reporter_throttles_and_session_status_table(self):
+        class Stream(io.StringIO):
+            def isatty(self): return True
+        times = iter([0.0, 0.2, 1.0, 2.0])
+        stream = Stream()
+        reporter = reward.StatusReporter(stream=stream, monotonic_fn=lambda: next(times))
+        self.assertTrue(reporter.report("a"))
+        self.assertFalse(reporter.report("b"))
+        self.assertTrue(reporter.report("c"))
+        self.assertTrue(reporter.report("d"))
+        cases = [
+            ({"task_completed": True, "post_completed": True}, "complete"),
+            ({"task_completed": False, "post_completed": False, "interrupted": True}, "interrupted"),
+            ({"task_completed": False, "post_completed": False, "primary_error": RuntimeError("x")}, "failed"),
+            ({"task_completed": True, "post_completed": True, "camera_enabled": True, "camera_state": {"camera_stop_confirmed": True, "camera_raw_files_verified": True}}, "protocol_complete_video_pending"),
+            ({"task_completed": True, "post_completed": True, "cleanup_errors": ["x"]}, "cleanup_failed"),
+        ]
+        for kwargs, expected in cases:
+            self.assertEqual(reward.derive_session_status(**kwargs), expected)
+
     def test_planned_task_remaining_uses_realized_itis_and_skips_final(self):
         trials = [{"planned_iti_duration_sec": 2.0}, {"planned_iti_duration_sec": 7.0}, {"planned_iti_duration_sec": 99.0}]
         self.assertEqual(reward.estimate_task_seconds(trials), 13.5)
