@@ -229,6 +229,37 @@ def make_session_name(mouse_id, session_stamp):
     return "%s_%s_%s" % (mouse_id, session_stamp, SESSION_SUFFIX)
 
 
+def final_camera_metadata(latest_state, use_camera, camera_started=False,
+                          camera_stop_confirmed=False, camera_fetch_completed=False,
+                          camera_conversion_completed=False):
+    """Summarize the most recent camera controller state for session metadata."""
+    latest_state = dict(latest_state or {})
+    return {
+        "camera_started": bool(latest_state.get("camera_output_growing_confirmed", camera_started)),
+        "camera_stop_confirmed": bool(latest_state.get("camera_stop_confirmed", camera_stop_confirmed)),
+        "camera_fetch_completed": bool(latest_state.get("camera_fetch_completed", camera_fetch_completed)),
+        "camera_conversion_completed": bool(latest_state.get("camera_conversion_completed", camera_conversion_completed)),
+        "camera_transfer_completed": bool(latest_state.get("camera_transfer_completed", latest_state.get("camera_fetch_completed", camera_fetch_completed))),
+        "camera_raw_files_verified": bool(latest_state.get("camera_raw_files_verified", False)),
+        "camera_raw_hash_verified": bool(latest_state.get("camera_raw_hash_verified", False)),
+        "camera_mp4_verified": bool(latest_state.get("camera_mp4_verified", False)),
+        "remote_raw_cleanup_completed": bool(latest_state.get("remote_raw_cleanup_completed", False)),
+        "remote_raw_retained": bool(latest_state.get("remote_raw_retained", use_camera)),
+        "remote_raw_cleanup_error": latest_state.get("remote_raw_cleanup_error", ""),
+    }
+
+
+def final_session_exit(primary_error, interrupted, cleanup_errors, finalization_errors):
+    """Return the final exit code or re-raise the authoritative failure."""
+    if primary_error is not None:
+        raise primary_error
+    if interrupted:
+        return 130
+    if cleanup_errors or finalization_errors:
+        raise RuntimeError("Session cleanup/finalization failed: %s" % "; ".join(cleanup_errors + finalization_errors))
+    return 0
+
+
 def exact_timestamp_event(event_type, **fields):
     captured = base.capture_timestamp()
     row = {
@@ -1870,21 +1901,13 @@ def main(argv=None):
         metadata["task_completed"] = task_completed
         metadata["post_background_completed"] = post_background_completed
         metadata["session_completed"] = session_completed
-        metadata["camera_started"] = bool(latest_camera_state.get("camera_output_growing_confirmed", camera_started))
-        metadata["camera_stop_confirmed"] = bool(latest_camera_state.get("camera_stop_confirmed", camera_stop_confirmed))
-        metadata["camera_fetch_completed"] = bool(latest_camera_state.get("camera_fetch_completed", camera_fetch_completed))
-        metadata["camera_conversion_completed"] = bool(latest_camera_state.get("camera_conversion_completed", camera_conversion_completed))
+        metadata.update(final_camera_metadata(
+            latest_camera_state, use_camera, camera_started, camera_stop_confirmed,
+            camera_fetch_completed, camera_conversion_completed))
         metadata["camera_conversion_deferred"] = camera_conversion_deferred
         metadata["camera_cleanup_error"] = camera_cleanup_error
         metadata["camera_cleanup_error_message"] = camera_cleanup_error_message
         metadata["camera_requested"] = bool(use_camera)
-        metadata["camera_transfer_completed"] = bool(latest_camera_state.get("camera_transfer_completed", latest_camera_state.get("camera_fetch_completed", camera_fetch_completed)))
-        metadata["camera_raw_files_verified"] = bool(latest_camera_state.get("camera_raw_files_verified", False))
-        metadata["camera_raw_hash_verified"] = bool(latest_camera_state.get("camera_raw_hash_verified", False))
-        metadata["camera_mp4_verified"] = bool(latest_camera_state.get("camera_mp4_verified", False))
-        metadata["remote_raw_cleanup_completed"] = bool(latest_camera_state.get("remote_raw_cleanup_completed", False))
-        metadata["remote_raw_retained"] = bool(latest_camera_state.get("remote_raw_retained", use_camera))
-        metadata["remote_raw_cleanup_error"] = latest_camera_state.get("remote_raw_cleanup_error", "")
         metadata["cleanup_completed"] = not cleanup_errors
         metadata["interrupted"] = interrupted
         metadata["primary_error"] = "" if primary_error is None else "%s: %s" % (type(primary_error).__name__, primary_error)
@@ -1907,13 +1930,7 @@ def main(argv=None):
             "ground truth; software timestamps are retained for diagnostics."
         )
 
-    if primary_error is not None:
-        raise primary_error
-    if interrupted:
-        return 130
-    if cleanup_errors or finalization_errors:
-        raise RuntimeError("Session cleanup/finalization failed: %s" % "; ".join(cleanup_errors + finalization_errors))
-    return 0
+    return final_session_exit(primary_error, interrupted, cleanup_errors, finalization_errors)
 
 
 if __name__ == "__main__":

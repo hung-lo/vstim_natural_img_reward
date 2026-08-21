@@ -2,10 +2,22 @@
 """Runtime regression tests for reward-conditioning behavior."""
 
 import tempfile
+import sys
+import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
+
+try:
+    import PIL  # noqa: F401
+except ImportError:
+    # Runtime tests use fake screen objects and never render PIL images.
+    pil_stub = types.ModuleType("PIL")
+    pil_stub.Image = object
+    pil_stub.ImageDraw = object
+    pil_stub.ImageOps = object
+    sys.modules["PIL"] = pil_stub
 
 import run_stringer_reward_conditioning as reward
 
@@ -28,6 +40,30 @@ class FakeGPIOClient:
 
 
 class RewardConditioningRuntimeTests(unittest.TestCase):
+    def test_latest_camera_state_populates_final_metadata(self):
+        fetch_state = {
+            "camera_transfer_completed": True, "camera_raw_files_verified": True,
+            "camera_raw_hash_verified": True, "camera_conversion_completed": False,
+            "camera_mp4_verified": False, "remote_raw_cleanup_completed": False,
+            "remote_raw_retained": True,
+        }
+        convert_state = dict(fetch_state)
+        convert_state.update({"camera_conversion_completed": True, "camera_mp4_verified": True,
+                              "remote_raw_cleanup_completed": True, "remote_raw_retained": False})
+        self.assertFalse(reward.final_camera_metadata(fetch_state, True)["camera_mp4_verified"])
+        summary = reward.final_camera_metadata(convert_state, True)
+        self.assertTrue(summary["camera_conversion_completed"])
+        self.assertTrue(summary["camera_mp4_verified"])
+        self.assertTrue(summary["remote_raw_cleanup_completed"])
+        self.assertFalse(summary["remote_raw_retained"])
+
+    def test_final_session_exit_preserves_primary_and_interrupts(self):
+        self.assertEqual(reward.final_session_exit(None, True, ["cleanup"], []), 130)
+        with self.assertRaisesRegex(RuntimeError, "primary experiment failure"):
+            reward.final_session_exit(RuntimeError("primary experiment failure"), False, ["cleanup failure"], [])
+        with self.assertRaisesRegex(RuntimeError, "cleanup failure"):
+            reward.final_session_exit(None, False, ["cleanup failure"], [])
+
     def test_build_trial_summary_uses_monotonic_lick_timestamps(self):
         trials = [
             {

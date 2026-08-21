@@ -210,6 +210,23 @@ class CameraControlSafetyTests(unittest.TestCase):
                 camera.convert_camera(args)
             fallback.assert_not_called()
 
+    def test_stop_fetch_rejects_foreign_and_corrupt_state(self):
+        args = camera.build_parser().parse_args(["stop-fetch", "--mouse-id", "mouse", "--session-id", "session"])
+        foreign = self._state()
+        foreign["controller_repository"] = "vstim_natural"
+        self.state_file.write_text(json.dumps(foreign))
+        with mock.patch.object(camera, "build_state_from_args") as fallback, mock.patch.object(camera, "run_ssh") as ssh:
+            with self.assertRaises(camera.CameraStateOwnershipError):
+                args.func(args)
+            fallback.assert_not_called()
+            ssh.assert_not_called()
+        self.state_file.write_text("corrupt")
+        with mock.patch.object(camera, "build_state_from_args") as fallback, mock.patch.object(camera, "run_ssh") as ssh:
+            with self.assertRaises(camera.CameraStateCorruptError):
+                args.func(args)
+            fallback.assert_not_called()
+            ssh.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
