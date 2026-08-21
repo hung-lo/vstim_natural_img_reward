@@ -178,12 +178,27 @@ The main files there are:
 - `<session>_session_qc.json`
 - `raw_cache/` with the baked RPG raws
 
+### Camera recovery and integrity
+
+The reward-conditioning controller keeps its own camera state file and session
+namespace. Its safe workflow is: remote camera recording → confirmed stop →
+remote raw H.264 manifest (size + SHA-256) → resumable local copy without
+deleting the remote source → local size/hash verification → temporary MP4
+conversion → `ffprobe` validation → exact remote raw cleanup. Local `.h264`
+files are retained after conversion for recovery.
+
+If transfer or conversion fails, both local raw files and remote raw files are
+kept. Run `remote_camera_control.py fetch` or `convert` again to recover; a
+valid existing MP4 is reused only after `ffprobe` validation. Ctrl-C performs
+cleanup and exits with status 130.
+
 Recommended test sequence:
 
 ```bash
 python3 test_reward_conditioning_protocol.py
 python3 test_reward_conditioning_runtime.py
 python3 smoke_test_reward_gpio.py
+python3 test_remote_camera_control.py
 ```
 
 After that, run one simulated session with `--simulate-gpio` before touching

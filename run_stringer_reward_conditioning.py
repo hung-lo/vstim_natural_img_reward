@@ -1498,6 +1498,7 @@ def main(argv=None):
         "refresh_rate_hz": base.REFRESH_RATE_HZ,
         "photodiode_patch_enabled": base.ENABLE_PHOTODIODE_PATCH,
         "photodiode_size_px": base.PHOTODIODE_SIZE_PX,
+        "vstim_natural_img_reward_git_commit": get_git_commit(),
         "vstim_natural_git_commit": get_git_commit(),
         "planned_sequence_csv": str(planned_sequence_path),
         "event_log_csv": str(event_log_path),
@@ -1526,6 +1527,10 @@ def main(argv=None):
     camera_cleanup_error_message = ""
     session_completed = False
     pending_final_reward_checks = []
+    interrupted = False
+    primary_error = None
+    cleanup_errors = []
+    finalization_errors = []
 
     try:
         print("Building one-frame gray background raw...")
@@ -1738,6 +1743,7 @@ def main(argv=None):
                         ),
                     )
                     fetch_state = camera_support.fetch_camera_recording()
+                    metadata["camera_fetch_result"] = fetch_state
                     camera_fetch_completed = bool(
                         fetch_state.get("camera_fetch_completed", False)
                     )
@@ -1765,6 +1771,7 @@ def main(argv=None):
                     )
                     if camera_fetch_completed and not camera_conversion_completed:
                         convert_state = camera_support.convert_camera_recording()
+                        metadata["camera_convert_result"] = convert_state
                         camera_conversion_completed = bool(
                             convert_state.get("camera_conversion_completed", False)
                         )
@@ -1790,25 +1797,20 @@ def main(argv=None):
                     print("Camera cleanup error: %s" % exc, file=sys.stderr)
 
     except KeyboardInterrupt:
-        append_event(
-            event_log_path,
-            exact_timestamp_event(
-                "session_interrupted",
-                phase="unknown",
-                notes="KeyboardInterrupt",
-            ),
-        )
+        interrupted = True
+        try:
+            append_event(event_log_path, exact_timestamp_event(
+                "session_interrupted", phase="unknown", notes="KeyboardInterrupt"))
+        except Exception as exc:
+            cleanup_errors.append("interrupt_log: %s: %s" % (type(exc).__name__, exc))
         print("Session interrupted by Ctrl-C; cleaning up hardware.", file=sys.stderr)
     except Exception as exc:
-        append_event(
-            event_log_path,
-            exact_timestamp_event(
-                "session_error",
-                phase="unknown",
-                notes="%s: %s" % (type(exc).__name__, exc),
-            ),
-        )
-        raise
+        primary_error = exc
+        try:
+            append_event(event_log_path, exact_timestamp_event(
+                "session_error", phase="unknown", notes="%s: %s" % (type(exc).__name__, exc)))
+        except Exception as log_exc:
+            cleanup_errors.append("error_log: %s: %s" % (type(log_exc).__name__, log_exc))
     finally:
         if camera_started and not camera_stop_confirmed and camera_support is not None:
             try:
@@ -1826,6 +1828,7 @@ def main(argv=None):
                 camera_cleanup_error = True
                 camera_cleanup_error_message = "%s: %s" % (type(exc).__name__, exc)
                 print("Emergency camera stop failed: %s" % exc, file=sys.stderr)
+                cleanup_errors.append("camera_stop: %s: %s" % (type(exc).__name__, exc))
 
         if gpio_client is not None:
             try:
@@ -1836,20 +1839,18 @@ def main(argv=None):
                         all_gpio_events.append(dict(event))
             except Exception as exc:
                 print("GPIO shutdown error: %s" % exc, file=sys.stderr)
+                cleanup_errors.append("gpio_shutdown: %s: %s" % (type(exc).__name__, exc))
 
-        trial_summary = build_trial_summary(
-            trials, runtime_by_trial, all_gpio_events
-        )
-        write_rows(trial_summary_path, trial_summary, TRIAL_SUMMARY_FIELDS)
-        lick_rows = [event for event in all_gpio_events if event.get("event_type") in ("lick_onset", "lick_offset")]
-        write_rows(lick_events_path, lick_rows, [
-            "unix_time_ns", "monotonic_ns", "event_type", "phase", "trial_index",
-            "trial_number", "block_number", "image_role", "image_filename",
-            "reward_scheduled", "suction_scheduled",
-        ])
-        qc = build_session_qc(session_id, trials, trial_summary, all_gpio_events, hardware_config["reward_num_pulses"])
-        qc_path.write_text(json.dumps(qc, indent=2, sort_keys=True) + "\n")
-        metadata["session_qc_json"] = str(qc_path)
+        try:
+            trial_summary = build_trial_summary(trials, runtime_by_trial, all_gpio_events)
+            write_rows(trial_summary_path, trial_summary, TRIAL_SUMMARY_FIELDS)
+            lick_rows = [event for event in all_gpio_events if event.get("event_type") in ("lick_onset", "lick_offset")]
+            write_rows(lick_events_path, lick_rows, ["unix_time_ns", "monotonic_ns", "event_type", "phase", "trial_index", "trial_number", "block_number", "image_role", "image_filename", "reward_scheduled", "suction_scheduled"])
+            qc = build_session_qc(session_id, trials, trial_summary, all_gpio_events, hardware_config["reward_num_pulses"])
+            qc_path.write_text(json.dumps(qc, indent=2, sort_keys=True) + "\n")
+            metadata["session_qc_json"] = str(qc_path)
+        except Exception as exc:
+            finalization_errors.append("session_artifacts: %s: %s" % (type(exc).__name__, exc))
 
         metadata["utc_iso_end"] = base.utc_iso_now()
         camera_cleanup_required = bool(use_camera and camera_started)
@@ -1870,8 +1871,23 @@ def main(argv=None):
         metadata["camera_conversion_deferred"] = camera_conversion_deferred
         metadata["camera_cleanup_error"] = camera_cleanup_error
         metadata["camera_cleanup_error_message"] = camera_cleanup_error_message
+        metadata["camera_requested"] = bool(use_camera)
+        metadata["camera_transfer_completed"] = camera_fetch_completed
+        metadata["camera_raw_files_verified"] = bool(metadata.get("camera_fetch_result", {}).get("camera_raw_files_verified", False))
+        metadata["camera_raw_hash_verified"] = bool(metadata.get("camera_fetch_result", {}).get("camera_raw_hash_verified", False))
+        metadata["camera_mp4_verified"] = bool(metadata.get("camera_fetch_result", {}).get("camera_mp4_verified", False))
+        metadata["remote_raw_cleanup_completed"] = bool(metadata.get("camera_fetch_result", {}).get("remote_raw_cleanup_completed", False))
+        metadata["remote_raw_retained"] = bool(metadata.get("camera_fetch_result", {}).get("remote_raw_retained", use_camera))
+        metadata["cleanup_completed"] = not cleanup_errors
+        metadata["interrupted"] = interrupted
+        metadata["primary_error"] = "" if primary_error is None else "%s: %s" % (type(primary_error).__name__, primary_error)
+        metadata["cleanup_errors"] = cleanup_errors
+        metadata["finalization_errors"] = finalization_errors
         metadata["n_gpio_events_logged"] = len(all_gpio_events)
-        metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
+        try:
+            metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
+        except Exception as exc:
+            finalization_errors.append("metadata: %s: %s" % (type(exc).__name__, exc))
 
         if session_completed:
             print("Session finished. Files are in: %s" % session_root)
@@ -1884,6 +1900,12 @@ def main(argv=None):
             "ground truth; software timestamps are retained for diagnostics."
         )
 
+    if primary_error is not None:
+        raise primary_error
+    if interrupted:
+        return 130
+    if cleanup_errors or finalization_errors:
+        raise RuntimeError("Session cleanup/finalization failed: %s" % "; ".join(cleanup_errors + finalization_errors))
     return 0
 
 
