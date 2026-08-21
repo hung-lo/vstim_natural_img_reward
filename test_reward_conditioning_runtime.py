@@ -61,11 +61,127 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
         for kwargs, expected in cases:
             self.assertEqual(reward.derive_session_status(**kwargs), expected)
 
+    def test_non_tty_status_reporter_uses_thirty_second_interval(self):
+        class Stream(io.StringIO):
+            def isatty(self): return False
+        times = iter([0.0, 29.9, 30.0])
+        stream = Stream()
+        reporter = reward.StatusReporter(stream=stream, monotonic_fn=lambda: next(times))
+        self.assertTrue(reporter.report("first"))
+        self.assertFalse(reporter.report("too soon"))
+        self.assertTrue(reporter.report("second"))
+        self.assertEqual(stream.getvalue(), "first\nsecond\n")
+
+    def test_phase_status_contains_live_eta_and_gate_has_no_finish(self):
+        waiting = reward.format_operator_status(
+            "WAITING_FOR_2P", 10.0, 100.0, wall_time_sec=1_000.0)
+        self.assertNotIn("finish", waiting.lower())
+
+        pre = reward.format_operator_status(
+            "PRE", 11.0, 20.0, protocol_remaining_sec=80.0,
+            wall_time_sec=1_000.0)
+        self.assertIn("PRE", pre)
+        self.assertIn("protocol remaining", pre)
+        self.assertIn("finish ~", pre)
+
+        task = reward.format_operator_status(
+            "TASK", 12.0, 40.0, 3, 10, 15.0, wall_time_sec=1_000.0)
+        self.assertIn("TASK 3/10 (30.0%)", task)
+        self.assertIn("+POST", task)
+        self.assertIn("finish ~", task)
+
+        post = reward.format_operator_status(
+            "POST", 13.0, 10.0, wall_time_sec=1_000.0)
+        self.assertIn("POST", post)
+        self.assertIn("finish ~", post)
+
+    def test_session_status_explicit_camera_cleanup_error_beats_video_pending(self):
+        state = {
+            "camera_stop_confirmed": True,
+            "camera_raw_files_verified": True,
+            "camera_mp4_verified": False,
+        }
+        self.assertEqual(
+            reward.derive_session_status(
+                True, True, camera_enabled=True, camera_state=state,
+                camera_cleanup_error=True),
+            "protocol_complete_camera_cleanup_failed",
+        )
+        self.assertEqual(
+            reward.derive_session_status(
+                True, True, camera_enabled=True, camera_state=state,
+                camera_cleanup_error=False),
+            "protocol_complete_video_pending",
+        )
+        unsafe_state = dict(state, camera_raw_files_verified=False)
+        self.assertEqual(
+            reward.derive_session_status(
+                True, True, camera_enabled=True, camera_state=unsafe_state),
+            "protocol_complete_camera_cleanup_failed",
+        )
+
+    def test_strict_prompt_helpers_reprompt_and_reject_eof(self):
+        with mock.patch("builtins.input", side_effect=["2.9", "abc", "0", "2"]):
+            self.assertEqual(reward.prompt_int_with_default("integer", 1, minimum=1), 2)
+        with mock.patch("builtins.input", side_effect=["nan", "inf", "-inf", "bad", "2.5"]):
+            self.assertEqual(reward.prompt_float_or_default("float", 1.0), 2.5)
+        with mock.patch("builtins.input", side_effect=["maybe", "yes"]):
+            self.assertTrue(reward.prompt_yes_no_strict("choice", default_yes=False))
+        with mock.patch("builtins.input", return_value=""):
+            self.assertFalse(reward.prompt_yes_no_strict("choice", default_yes=False))
+        with mock.patch("builtins.input", side_effect=EOFError):
+            with self.assertRaisesRegex(RuntimeError, "EOF"):
+                reward.prompt_int_with_default("integer", 1)
+
     def test_planned_task_remaining_uses_realized_itis_and_skips_final(self):
         trials = [{"planned_iti_duration_sec": 2.0}, {"planned_iti_duration_sec": 7.0}, {"planned_iti_duration_sec": 99.0}]
         self.assertEqual(reward.estimate_task_seconds(trials), 13.5)
         self.assertEqual(reward.planned_task_remaining_seconds(trials, 1), 10.0)
         self.assertEqual(reward.planned_task_remaining_seconds(trials, 3), 0.0)
+        self.assertEqual(
+            reward.planned_task_remaining_during_iti(
+                trials, 0, iti_deadline_monotonic=105.0,
+                now_monotonic=101.0),
+            14.0,
+        )
+
+    def test_wait_until_services_status_from_existing_poll_loop(self):
+        gpio_client = FakeGPIOClient()
+        remaining_values = []
+        monotonic_values = iter([0.0, 0.4, 0.4, 0.8, 1.0])
+        with mock.patch.object(reward.time, "monotonic", side_effect=lambda: next(monotonic_values)), \
+             mock.patch.object(reward.time, "sleep"):
+            reward.wait_until(
+                1.0, gpio_client, Path("unused.csv"), [],
+                status_callback=remaining_values.append)
+        self.assertEqual(gpio_client.drain_calls, 2)
+        self.assertEqual(len(remaining_values), 2)
+        self.assertAlmostEqual(remaining_values[0], 0.6)
+        self.assertAlmostEqual(remaining_values[1], 0.2)
+
+    def test_two_photon_gate_services_callbacks_and_rejects_eof(self):
+        class Stdin(io.StringIO):
+            def isatty(self): return True
+
+        status = mock.Mock()
+        service = mock.Mock()
+        stdin = Stdin("\n")
+        with mock.patch.object(reward.sys, "stdin", stdin), \
+             mock.patch.object(reward.select, "select", return_value=([stdin], [], [])), \
+             mock.patch.object(reward.time, "monotonic", side_effect=[10.0, 10.5]):
+            self.assertEqual(
+                reward.wait_for_two_photon_gate(status, service, poll_sec=0.0),
+                0.5,
+            )
+        status.assert_called_once()
+        service.assert_called_once()
+
+        eof_stdin = Stdin("")
+        with mock.patch.object(reward.sys, "stdin", eof_stdin), \
+             mock.patch.object(reward.select, "select", return_value=([eof_stdin], [], [])), \
+             mock.patch.object(reward.time, "monotonic", return_value=10.0):
+            with self.assertRaisesRegex(RuntimeError, "EOF"):
+                reward.wait_for_two_photon_gate(poll_sec=0.0)
 
     def test_cli_camera_options_are_exclusive(self):
         self.assertTrue(reward.parse_args(["--camera"]).camera)
@@ -297,8 +413,13 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
             }
             return perf, timing
 
-        def fake_wait_until(deadline_monotonic, gpio_client_arg, event_log_path, all_gpio_events):
+        status_updates = []
+
+        def fake_wait_until(deadline_monotonic, gpio_client_arg, event_log_path,
+                            all_gpio_events, status_callback=None):
             wait_calls.append(deadline_monotonic)
+            if status_callback:
+                status_callback(0.1)
 
         with tempfile.TemporaryDirectory(prefix="reward_runtime_test_") as temp_dir:
             event_log_path = Path(temp_dir) / "event_log.csv"
@@ -319,12 +440,17 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
                     reward_verification_timeout_sec=0.5,
                     suction_delay_sec=3.5,
                     suction_duration_sec=0.05,
+                    status_callback=lambda done, total, remaining: status_updates.append(
+                        (done, total, remaining)),
                 )
 
         self.assertEqual(len(wait_calls), 1)
         self.assertTrue(runtime_by_trial[0]["trial_completed"])
         self.assertTrue(runtime_by_trial[1]["trial_completed"])
         self.assertEqual(pending_final_reward_checks, [])
+        self.assertEqual(len(status_updates), 1)
+        self.assertEqual(status_updates[0][:2], (1, 2))
+        self.assertAlmostEqual(status_updates[0][2], 1.6)
 
 
 if __name__ == "__main__":

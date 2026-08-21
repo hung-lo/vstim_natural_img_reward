@@ -253,10 +253,33 @@ def prompt_yes_no_strict(prompt, default_yes=None):
         print("Please answer y/yes or n/no.")
 
 
-def format_operator_status(phase, camera_elapsed_sec=None, remaining_sec=None, trial_number=None, total_trials=None, post_sec=None):
+def _predicted_finish_text(remaining_sec, wall_time_sec=None):
+    finish_epoch = (time.time() if wall_time_sec is None else float(wall_time_sec)) + max(0.0, float(remaining_sec or 0.0))
+    return time.strftime("%H:%M:%S", time.localtime(finish_epoch))
+
+
+def format_operator_status(phase, camera_elapsed_sec=None, remaining_sec=None,
+                           trial_number=None, total_trials=None, post_sec=None,
+                           protocol_remaining_sec=None, wall_time_sec=None):
     prefix = "CAM OFF" if camera_elapsed_sec is None else "REC %s" % base.format_seconds(camera_elapsed_sec)
     if phase == "WAITING_FOR_2P": return "%s | WAITING FOR 2P | press Enter when acquisition is running | planned after Enter %s" % (prefix, base.format_seconds(remaining_sec or 0))
-    if phase == "TASK": return "%s | TASK %d/%d | planned task remaining %s | +POST %s" % (prefix, trial_number, total_trials, base.format_seconds(remaining_sec or 0), base.format_seconds(post_sec or 0))
+    if phase == "PRE":
+        protocol_remaining = remaining_sec if protocol_remaining_sec is None else protocol_remaining_sec
+        return "%s | PRE %s remaining | protocol remaining %s | finish ~%s" % (
+            prefix, base.format_seconds(remaining_sec or 0),
+            base.format_seconds(protocol_remaining or 0),
+            _predicted_finish_text(protocol_remaining, wall_time_sec))
+    if phase == "TASK":
+        percent = 0.0 if not total_trials else 100.0 * float(trial_number) / float(total_trials)
+        finish_remaining = float(remaining_sec or 0.0) + float(post_sec or 0.0)
+        return "%s | TASK %d/%d (%.1f%%) | planned task remaining %s | +POST %s | finish ~%s" % (
+            prefix, trial_number, total_trials, percent,
+            base.format_seconds(remaining_sec or 0), base.format_seconds(post_sec or 0),
+            _predicted_finish_text(finish_remaining, wall_time_sec))
+    if phase == "POST":
+        return "%s | POST %s remaining | finish ~%s" % (
+            prefix, base.format_seconds(remaining_sec or 0),
+            _predicted_finish_text(remaining_sec, wall_time_sec))
     return "%s | %s %s remaining" % (prefix, phase, base.format_seconds(remaining_sec or 0))
 
 
@@ -284,19 +307,21 @@ class StatusReporter(object):
 
 def derive_session_status(task_completed, post_completed, interrupted=False, primary_error=None,
                           camera_enabled=False, camera_state=None, cleanup_errors=None,
-                          finalization_errors=None):
+                          finalization_errors=None, camera_cleanup_error=False):
     camera_state = camera_state or {}
     if interrupted: return "interrupted"
     if primary_error is not None: return "failed"
     if not (task_completed and post_completed): return "incomplete"
+    if camera_cleanup_error or camera_state.get("camera_cleanup_error"):
+        return "protocol_complete_camera_cleanup_failed"
     if cleanup_errors or finalization_errors: return "cleanup_failed"
     if not camera_enabled: return "complete"
-    if not camera_state.get("camera_stop_confirmed") or camera_state.get("camera_cleanup_error"):
+    if not camera_state.get("camera_stop_confirmed"):
+        return "protocol_complete_camera_cleanup_failed"
+    if not camera_state.get("camera_raw_files_verified"):
         return "protocol_complete_camera_cleanup_failed"
     if not camera_state.get("camera_mp4_verified"):
         return "protocol_complete_video_pending"
-    if not camera_state.get("camera_raw_files_verified"):
-        return "protocol_complete_camera_cleanup_failed"
     return "complete"
 
 
@@ -331,6 +356,15 @@ def prompt_float_or_default(prompt, default_value, minimum=None, maximum=None):
 
 def planned_task_remaining_seconds(trials, next_trial_index):
     return estimate_task_seconds(trials[next_trial_index:]) if next_trial_index < len(trials) else 0.0
+
+
+def planned_task_remaining_during_iti(trials, current_trial_index, iti_deadline_monotonic,
+                                      now_monotonic=None):
+    """Exact task remainder while the current non-final trial is in its ITI."""
+    now = time.monotonic() if now_monotonic is None else float(now_monotonic)
+    current_iti_remaining = max(0.0, float(iti_deadline_monotonic) - now)
+    return current_iti_remaining + planned_task_remaining_seconds(
+        trials, int(current_trial_index) + 1)
 
 
 def atomic_write_json(path, payload):
@@ -1008,6 +1042,17 @@ def run_trials(
             gpio_client,
             event_log_path,
             all_gpio_events,
+            status_callback=(
+                (lambda _iti_remaining, completed_count=completed_count,
+                        current_trial_index=completed_count - 1,
+                        iti_deadline=iti_deadline: status_callback(
+                            completed_count,
+                            total_trials,
+                            planned_task_remaining_during_iti(
+                                trials, current_trial_index, iti_deadline,
+                                now_monotonic=iti_deadline - _iti_remaining)))
+                if status_callback else None
+            ),
         )
         actual_iti = time.monotonic() - iti_start_monotonic
         append_event(
@@ -1021,10 +1066,8 @@ def run_trials(
         )
         runtime["trial_completed"] = True
 
-        remaining = planned_task_remaining_seconds(trials, completed_count)
-        if status_callback:
-            status_callback(completed_count, total_trials, remaining)
-        else:
+        if not status_callback:
+            remaining = planned_task_remaining_seconds(trials, completed_count)
             sys.stdout.write("\rTASK %d/%d (%.1f%%), planned task remaining %s   " %
                              (completed_count, total_trials, 100.0 * completed_count / float(total_trials), base.format_seconds(remaining)))
             sys.stdout.flush()
@@ -1876,7 +1919,9 @@ def main(argv=None):
                 event_log_path,
                 all_gpio_events,
                 status_callback=lambda remaining: status_reporter.report(format_operator_status("PRE",
-                    (time.monotonic_ns() - gate_camera_anchor) / 1e9 if gate_camera_anchor else None, remaining)),
+                    (time.monotonic_ns() - gate_camera_anchor) / 1e9 if gate_camera_anchor else None,
+                    remaining,
+                    protocol_remaining_sec=(remaining + planned_task_sec + post_background_min * 60.0))),
             )
             metadata["pre_end_monotonic_ns"] = time.monotonic_ns()
             metadata["pre_elapsed_sec"] = pre_actual
@@ -1989,6 +2034,7 @@ def main(argv=None):
                         ),
                     )
                     if camera_fetch_completed and not camera_conversion_completed:
+                        print("VIDEO | converting/verifying MP4...")
                         convert_state = camera_support.convert_camera_recording()
                         metadata["camera_convert_result"] = convert_state
                         latest_camera_state = dict(convert_state)
@@ -2003,6 +2049,10 @@ def main(argv=None):
                                 notes=json.dumps(convert_state, sort_keys=True),
                             ),
                         )
+                    if (camera_stop_confirmed
+                            and latest_camera_state.get("camera_raw_files_verified")
+                            and latest_camera_state.get("camera_mp4_verified")):
+                        print("VIDEO | camera data secured")
                 except Exception as exc:
                     camera_cleanup_error = True
                     camera_cleanup_error_message = "%s: %s" % (type(exc).__name__, exc)
@@ -2091,7 +2141,8 @@ def main(argv=None):
         metadata["session_completed"] = session_completed
         metadata["session_status"] = derive_session_status(
             task_completed, post_background_completed, interrupted, primary_error,
-            use_camera, latest_camera_state, cleanup_errors, finalization_errors)
+            use_camera, latest_camera_state, cleanup_errors, finalization_errors,
+            camera_cleanup_error=camera_cleanup_error)
         metadata.update(final_camera_metadata(
             latest_camera_state, use_camera, camera_started, camera_stop_confirmed,
             camera_fetch_completed, camera_conversion_completed))
