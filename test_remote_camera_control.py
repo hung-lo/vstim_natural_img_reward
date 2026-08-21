@@ -162,6 +162,54 @@ class CameraControlSafetyTests(unittest.TestCase):
         self.assertFalse(result["camera_mp4_verified"])
         self.assertTrue(result["camera_conversion_failed"])
 
+    def test_second_fetch_after_cleanup_is_already_secured(self):
+        video_dir = Path(self.temp_dir.name) / "video"
+        video_dir.mkdir()
+        raw = video_dir / "a.h264"
+        raw.write_bytes(b"camera")
+        state = self._state()
+        state.update({"camera_stop_confirmed": True, "remote_raw_cleanup_completed": True,
+                      "remote_raw_retained": False, "remote_raw_manifest": [{
+                          "remote_path": "/remote/mouse_session/video/a.h264", "filename": "a.h264",
+                          "size_bytes": raw.stat().st_size, "sha256": hashlib.sha256(raw.read_bytes()).hexdigest(),
+                      }]})
+        args = types.SimpleNamespace(dry_run=False, rsync_timeout_sec=1, ffmpeg_timeout_sec=1, camera_host=None)
+        with mock.patch.object(camera, "probe_mp4", return_value={"duration_sec": 1}), mock.patch.object(camera, "collect_remote_raw_manifest") as manifest, mock.patch.object(camera, "run_rsync") as rsync, mock.patch.object(camera, "run_ssh") as ssh:
+            result = camera.fetch_camera(args, state=state)
+        self.assertEqual(result["camera_fetch_status"], "already_secured")
+        manifest.assert_not_called()
+        rsync.assert_not_called()
+        ssh.assert_not_called()
+
+    def test_invalid_state_never_falls_back_for_recovery_commands(self):
+        foreign = self._state()
+        foreign["controller_repository"] = "vstim_natural"
+        self.state_file.write_text(json.dumps(foreign))
+        args = types.SimpleNamespace(dry_run=False, rsync_timeout_sec=1, ffmpeg_timeout_sec=1,
+                                     camera_host=None, mouse_id="mouse", session_id="session")
+        for command in (camera.fetch_camera, camera.convert_camera):
+            with self.subTest(command=command.__name__), mock.patch.object(camera, "build_state_from_args") as fallback, mock.patch.object(camera, "run_ssh") as ssh:
+                with self.assertRaises(camera.CameraStateOwnershipError):
+                    command(args)
+                fallback.assert_not_called()
+                ssh.assert_not_called()
+
+    def test_corrupt_and_schema_state_never_fall_back(self):
+        args = types.SimpleNamespace(dry_run=False, rsync_timeout_sec=1, ffmpeg_timeout_sec=1,
+                                     camera_host=None, mouse_id="mouse", session_id="session")
+        self.state_file.write_text("not json")
+        with mock.patch.object(camera, "build_state_from_args") as fallback:
+            with self.assertRaises(camera.CameraStateCorruptError):
+                camera.fetch_camera(args)
+            fallback.assert_not_called()
+        invalid = self._state()
+        invalid["state_schema_version"] = 999
+        self.state_file.write_text(json.dumps(invalid))
+        with mock.patch.object(camera, "build_state_from_args") as fallback:
+            with self.assertRaises(camera.CameraStateSchemaError):
+                camera.convert_camera(args)
+            fallback.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

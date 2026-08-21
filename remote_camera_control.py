@@ -10,7 +10,7 @@ Camera Pi is hard-coded here:
 
 Typical use on the behavior Pi:
 
-    cd /home/pi/vstim_natural
+    cd /home/pi/vstim_natural_img_reward
     source .venv/bin/activate
 
     python3 remote_camera_control.py start --mouse-id testmouse
@@ -1612,7 +1612,7 @@ def print_last_state(args):
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description="Standalone second-Pi camera controller for vstim_natural.")
+    parser = argparse.ArgumentParser(description="Standalone second-Pi camera controller for vstim_natural_img_reward.")
     sub = parser.add_subparsers(dest="command", required=True)
 
     common = argparse.ArgumentParser(add_help=False)
