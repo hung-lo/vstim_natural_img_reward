@@ -1531,6 +1531,7 @@ def main(argv=None):
     primary_error = None
     cleanup_errors = []
     finalization_errors = []
+    latest_camera_state = {}
 
     try:
         print("Building one-frame gray background raw...")
@@ -1651,6 +1652,7 @@ def main(argv=None):
                     )
                 camera_started = True
                 metadata["camera_start_result"] = camera_result
+                latest_camera_state = dict(camera_result.get("controller_state", {}))
                 append_event(
                     event_log_path,
                     exact_timestamp_event(
@@ -1732,6 +1734,7 @@ def main(argv=None):
                 try:
                     stop_state = camera_support.stop_camera_recording()
                     camera_stop_confirmed = bool(stop_state.get("camera_stop_confirmed", False))
+                    latest_camera_state = dict(stop_state)
                     if not camera_stop_confirmed:
                         raise RuntimeError("Camera stop was not confirmed: %s" % json.dumps(stop_state, sort_keys=True))
                     append_event(
@@ -1744,6 +1747,7 @@ def main(argv=None):
                     )
                     fetch_state = camera_support.fetch_camera_recording()
                     metadata["camera_fetch_result"] = fetch_state
+                    latest_camera_state = dict(fetch_state)
                     camera_fetch_completed = bool(
                         fetch_state.get("camera_fetch_completed", False)
                     )
@@ -1772,6 +1776,7 @@ def main(argv=None):
                     if camera_fetch_completed and not camera_conversion_completed:
                         convert_state = camera_support.convert_camera_recording()
                         metadata["camera_convert_result"] = convert_state
+                        latest_camera_state = dict(convert_state)
                         camera_conversion_completed = bool(
                             convert_state.get("camera_conversion_completed", False)
                         )
@@ -1816,6 +1821,7 @@ def main(argv=None):
             try:
                 stop_state = camera_support.stop_camera_recording()
                 camera_stop_confirmed = bool(stop_state.get("camera_stop_confirmed", False))
+                latest_camera_state = dict(stop_state)
                 append_event(
                     event_log_path,
                     exact_timestamp_event(
@@ -1864,20 +1870,21 @@ def main(argv=None):
         metadata["task_completed"] = task_completed
         metadata["post_background_completed"] = post_background_completed
         metadata["session_completed"] = session_completed
-        metadata["camera_started"] = camera_started
-        metadata["camera_stop_confirmed"] = camera_stop_confirmed
-        metadata["camera_fetch_completed"] = camera_fetch_completed
-        metadata["camera_conversion_completed"] = camera_conversion_completed
+        metadata["camera_started"] = bool(latest_camera_state.get("camera_output_growing_confirmed", camera_started))
+        metadata["camera_stop_confirmed"] = bool(latest_camera_state.get("camera_stop_confirmed", camera_stop_confirmed))
+        metadata["camera_fetch_completed"] = bool(latest_camera_state.get("camera_fetch_completed", camera_fetch_completed))
+        metadata["camera_conversion_completed"] = bool(latest_camera_state.get("camera_conversion_completed", camera_conversion_completed))
         metadata["camera_conversion_deferred"] = camera_conversion_deferred
         metadata["camera_cleanup_error"] = camera_cleanup_error
         metadata["camera_cleanup_error_message"] = camera_cleanup_error_message
         metadata["camera_requested"] = bool(use_camera)
-        metadata["camera_transfer_completed"] = camera_fetch_completed
-        metadata["camera_raw_files_verified"] = bool(metadata.get("camera_fetch_result", {}).get("camera_raw_files_verified", False))
-        metadata["camera_raw_hash_verified"] = bool(metadata.get("camera_fetch_result", {}).get("camera_raw_hash_verified", False))
-        metadata["camera_mp4_verified"] = bool(metadata.get("camera_fetch_result", {}).get("camera_mp4_verified", False))
-        metadata["remote_raw_cleanup_completed"] = bool(metadata.get("camera_fetch_result", {}).get("remote_raw_cleanup_completed", False))
-        metadata["remote_raw_retained"] = bool(metadata.get("camera_fetch_result", {}).get("remote_raw_retained", use_camera))
+        metadata["camera_transfer_completed"] = bool(latest_camera_state.get("camera_transfer_completed", latest_camera_state.get("camera_fetch_completed", camera_fetch_completed)))
+        metadata["camera_raw_files_verified"] = bool(latest_camera_state.get("camera_raw_files_verified", False))
+        metadata["camera_raw_hash_verified"] = bool(latest_camera_state.get("camera_raw_hash_verified", False))
+        metadata["camera_mp4_verified"] = bool(latest_camera_state.get("camera_mp4_verified", False))
+        metadata["remote_raw_cleanup_completed"] = bool(latest_camera_state.get("remote_raw_cleanup_completed", False))
+        metadata["remote_raw_retained"] = bool(latest_camera_state.get("remote_raw_retained", use_camera))
+        metadata["remote_raw_cleanup_error"] = latest_camera_state.get("remote_raw_cleanup_error", "")
         metadata["cleanup_completed"] = not cleanup_errors
         metadata["interrupted"] = interrupted
         metadata["primary_error"] = "" if primary_error is None else "%s: %s" % (type(primary_error).__name__, primary_error)

@@ -22,6 +22,7 @@ class CameraControlSafetyTests(unittest.TestCase):
 
     def _state(self):
         return {
+            "state_schema_version": camera.CAMERA_STATE_SCHEMA_VERSION,
             "controller_repository": camera.CONTROLLER_REPOSITORY,
             "protocol_name": camera.PROTOCOL_NAME,
             "session_id": "mouse_session",
@@ -51,6 +52,11 @@ class CameraControlSafetyTests(unittest.TestCase):
         command = run_cmd.call_args.args[0]
         self.assertNotIn("--remove-source-files", command)
         self.assertIn("--append-verify", command)
+
+    def test_manifest_uses_long_hash_timeout(self):
+        with mock.patch.object(camera, "run_ssh", return_value=mock.Mock(stdout="/remote/video/a.h264\t1\t" + "a" * 64)) as run_ssh:
+            camera.collect_remote_raw_manifest("pi@test", "/remote/video")
+        self.assertEqual(run_ssh.call_args.kwargs["timeout"], camera.CAMERA_MANIFEST_TIMEOUT_SEC)
 
     def test_manifest_verification_rejects_wrong_size_or_hash(self):
         video_dir = Path(self.temp_dir.name) / "video"
@@ -87,6 +93,32 @@ class CameraControlSafetyTests(unittest.TestCase):
         with mock.patch.object(camera.shutil, "which", return_value="ffprobe"), mock.patch.object(camera, "run_cmd", return_value=mock.Mock(stdout=json.dumps(valid))):
             with self.assertRaises(RuntimeError):
                 camera.probe_mp4("video.mp4")
+
+    def test_hash_mismatch_blocks_remote_cleanup(self):
+        video_dir = Path(self.temp_dir.name) / "video"
+        video_dir.mkdir()
+        (video_dir / "a.h264").write_bytes(b"changed")
+        state = self._state()
+        state.update({"camera_stop_confirmed": True, "camera_raw_hash_verified": True,
+                      "camera_mp4_verified": True, "remote_raw_manifest": [
+                          {"remote_path": "/remote/mouse_session/video/a.h264", "filename": "a.h264", "size_bytes": 5, "sha256": "0" * 64}
+                      ]})
+        args = mock.Mock(dry_run=False)
+        with mock.patch.object(camera, "run_ssh") as run_ssh:
+            camera.maybe_cleanup_remote_raw(args, state, "pi@test", video_dir)
+        run_ssh.assert_not_called()
+        self.assertFalse(state["remote_raw_cleanup_completed"])
+        self.assertTrue(state["remote_raw_retained"])
+
+    def test_fetch_dry_run_requires_no_remote_manifest_or_rsync(self):
+        state = self._state()
+        state["camera_stop_confirmed"] = True
+        args = mock.Mock(dry_run=True, rsync_timeout_sec=1, ffmpeg_timeout_sec=1)
+        with mock.patch.object(camera, "collect_remote_raw_manifest") as manifest, mock.patch.object(camera, "run_rsync") as rsync:
+            result = camera.fetch_camera(args, state=state)
+        manifest.assert_not_called()
+        rsync.assert_not_called()
+        self.assertEqual(result["camera_fetch_status"], "dry_run")
 
 
 if __name__ == "__main__":
