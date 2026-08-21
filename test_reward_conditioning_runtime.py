@@ -40,6 +40,17 @@ class FakeGPIOClient:
 
 
 class RewardConditioningRuntimeTests(unittest.TestCase):
+    def test_planned_task_remaining_uses_realized_itis_and_skips_final(self):
+        trials = [{"planned_iti_duration_sec": 2.0}, {"planned_iti_duration_sec": 7.0}, {"planned_iti_duration_sec": 99.0}]
+        self.assertEqual(reward.estimate_task_seconds(trials), 13.5)
+        self.assertEqual(reward.planned_task_remaining_seconds(trials, 1), 10.0)
+        self.assertEqual(reward.planned_task_remaining_seconds(trials, 3), 0.0)
+
+    def test_cli_camera_options_are_exclusive(self):
+        self.assertTrue(reward.parse_args(["--camera"]).camera)
+        with self.assertRaises(SystemExit):
+            reward.parse_args(["--camera", "--no-camera"])
+
     def test_latest_camera_state_populates_final_metadata(self):
         fetch_state = {
             "camera_transfer_completed": True, "camera_raw_files_verified": True,

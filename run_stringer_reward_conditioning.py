@@ -68,6 +68,9 @@ DEFAULT_POST_BACKGROUND_MIN = 5.0
 BACKGROUND_POLL_SEC = 0.10
 REWARD_VERIFICATION_MARGIN_SEC = 0.25
 QC_SCHEMA_VERSION = 1
+SESSION_OUTPUT_SCHEMA_VERSION = 2
+EVENT_LOG_SCHEMA_VERSION = 1
+TRIAL_SUMMARY_SCHEMA_VERSION = 1
 
 PLANNED_SEQUENCE_FIELDS = [
     "trial_index",
@@ -205,24 +208,54 @@ def parse_args(argv=None):
         action="store_true",
         help="Run the GPIO child with a mock valve and no lick input.",
     )
-    parser.add_argument(
-        "--no-camera",
-        action="store_true",
-        help="Do not offer remote face-camera recording.",
-    )
+    parser.add_argument("--mouse-id")
+    parser.add_argument("--session-notes")
+    parser.add_argument("--blocks", type=int)
+    parser.add_argument("--iti-min-sec", type=float)
+    parser.add_argument("--iti-max-sec", type=float)
+    parser.add_argument("--pre-background-min", type=float)
+    parser.add_argument("--post-background-min", type=float)
+    camera = parser.add_mutually_exclusive_group()
+    camera.add_argument("--camera", action="store_true")
+    camera.add_argument("--no-camera", action="store_true")
     return parser.parse_args(argv)
 
 
+def _strict_prompt(prompt):
+    try:
+        value = input(prompt)
+    except EOFError as exc:
+        raise RuntimeError("Unexpected EOF while waiting for operator input.") from exc
+    return value.strip()
+
+
 def prompt_float_or_default(prompt, default_value, minimum=None, maximum=None):
-    raw = base.prompt_text("%s [%s]: " % (prompt, default_value)).strip()
-    value = float(default_value) if not raw else float(raw)
-    if not math.isfinite(value):
-        raise ValueError("%s must be a finite number" % prompt)
-    if minimum is not None and value < minimum:
-        raise ValueError("%s must be at least %s" % (prompt, minimum))
-    if maximum is not None and value > maximum:
-        raise ValueError("%s must be at most %s" % (prompt, maximum))
-    return value
+    while True:
+        raw = _strict_prompt("%s [%s]: " % (prompt, default_value))
+        try:
+            value = float(default_value) if not raw else float(raw)
+            if not math.isfinite(value): raise ValueError("finite")
+            if minimum is not None and value < minimum: raise ValueError("at least %s" % minimum)
+            if maximum is not None and value > maximum: raise ValueError("at most %s" % maximum)
+            return value
+        except ValueError as exc:
+            print("Invalid value (%s); try again." % exc)
+
+
+def planned_task_remaining_seconds(trials, next_trial_index):
+    return estimate_task_seconds(trials[next_trial_index:]) if next_trial_index < len(trials) else 0.0
+
+
+def atomic_write_json(path, payload):
+    path = Path(path)
+    temporary = path.with_name(".%s.tmp" % path.name)
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n"); handle.flush(); os.fsync(handle.fileno())
+        os.replace(str(temporary), str(path))
+    finally:
+        if temporary.exists(): temporary.unlink()
 
 
 def make_session_name(mouse_id, session_stamp):
@@ -897,11 +930,9 @@ def run_trials(
         )
         runtime["trial_completed"] = True
 
-        elapsed = time.monotonic() - task_start_monotonic
-        average = elapsed / float(completed_count)
-        remaining = average * (total_trials - completed_count)
+        remaining = planned_task_remaining_seconds(trials, completed_count)
         sys.stdout.write(
-            "\rProgress: %d/%d (%.1f%%), estimated task remaining %s   "
+            "\rTASK %d/%d (%.1f%%), planned task remaining %s   "
             % (
                 completed_count,
                 total_trials,
@@ -1357,34 +1388,48 @@ def main(argv=None):
             % (reward_train_duration_sec, POST_REWARD_STIM_SEC)
         )
     camera_support = maybe_import_camera_support(args.no_camera)
+    if args.camera and camera_support is None:
+        raise RuntimeError("--camera was requested but camera support is unavailable.")
 
-    mouse_id_raw = base.prompt_text("Mouse ID: ")
-    mouse_id = base.sanitize_text(mouse_id_raw) or "mouse"
-    session_notes = base.prompt_text("Session notes, optional: ").strip()
-    n_blocks = base.prompt_int_or_default(
-        "Number of 50-trial probability blocks", DEFAULT_N_BLOCKS
-    )
-    iti_min_sec = prompt_float_or_default(
+    if args.mouse_id is not None:
+        mouse_id_raw = args.mouse_id
+        mouse_id = base.sanitize_text(mouse_id_raw)
+        if not mouse_id: raise ValueError("Mouse ID is required after sanitization.")
+    else:
+        while True:
+            mouse_id_raw = _strict_prompt("Mouse ID: ")
+            mouse_id = base.sanitize_text(mouse_id_raw)
+            if mouse_id: break
+            print("Mouse ID is required; try again.")
+    session_notes = args.session_notes if args.session_notes is not None else _strict_prompt("Session notes, optional: ")
+    n_blocks = args.blocks if args.blocks is not None else int(prompt_float_or_default("Number of 50-trial probability blocks", DEFAULT_N_BLOCKS, minimum=1))
+    if int(n_blocks) < 1: raise ValueError("blocks must be at least 1")
+    iti_min_sec = args.iti_min_sec if args.iti_min_sec is not None else prompt_float_or_default(
         "Minimum gray ITI in seconds",
         DEFAULT_ITI_MIN_SEC,
         minimum=0.1 if args.simulate_gpio else DEFAULT_ITI_MIN_SEC,
     )
-    iti_max_sec = prompt_float_or_default(
+    iti_max_sec = args.iti_max_sec if args.iti_max_sec is not None else prompt_float_or_default(
         "Maximum gray ITI in seconds", DEFAULT_ITI_MAX_SEC, minimum=iti_min_sec
     )
-    pre_background_min = prompt_float_or_default(
+    pre_background_min = args.pre_background_min if args.pre_background_min is not None else prompt_float_or_default(
         "PRE gray-background duration in minutes",
         DEFAULT_PRE_BACKGROUND_MIN,
         minimum=0.0,
     )
-    post_background_min = prompt_float_or_default(
+    post_background_min = args.post_background_min if args.post_background_min is not None else prompt_float_or_default(
         "POST gray-background duration in minutes",
         DEFAULT_POST_BACKGROUND_MIN,
         minimum=0.0,
     )
+    for label, value, minimum in (("iti_min_sec", iti_min_sec, 0.1), ("iti_max_sec", iti_max_sec, iti_min_sec),
+                                  ("pre_background_min", pre_background_min, 0.0), ("post_background_min", post_background_min, 0.0)):
+        if not math.isfinite(float(value)) or float(value) < minimum:
+            raise ValueError("%s is invalid" % label)
     use_camera = False
-    if camera_support is not None:
-        use_camera = base.prompt_yes_no("Record the remote face camera", default_yes=True)
+    if args.camera: use_camera = True
+    elif camera_support is not None and not args.no_camera:
+        use_camera = True
 
     image_dir = base.resolve_image_dir()
     all_pngs = base.list_png_files(image_dir)
@@ -1406,10 +1451,10 @@ def main(argv=None):
         suction_delay_sec=hardware_config["suction_delay_from_stim_onset_sec"],
     )
     plan_summary = summarize_trial_plan(trials)
-    estimated_task_sec = estimate_task_seconds(trials)
-    estimated_total_sec = (
+    planned_task_sec = estimate_task_seconds(trials)
+    planned_total_sec = (
         pre_background_min * 60.0
-        + estimated_task_sec
+        + planned_task_sec
         + post_background_min * 60.0
     )
 
@@ -1429,7 +1474,9 @@ def main(argv=None):
     print("  ITI: uniform %.3f-%.3f s" % (iti_min_sec, iti_max_sec))
     print("  PRE gray background: %s" % base.format_seconds(pre_background_min * 60.0))
     print("  POST gray background: %s" % base.format_seconds(post_background_min * 60.0))
-    print("  Estimated PRE + task + POST: %s" % base.format_seconds(estimated_total_sec))
+    print("  Planned task duration: %s" % base.format_seconds(planned_task_sec))
+    print("  Planned PRE + task + POST: %s" % base.format_seconds(planned_total_sec))
+    print("  Camera/video cleanup not included.")
     print("  Reward pin: BCM%d" % hardware_config["reward_pin_bcm"])
     print("  Lick pin: BCM%d" % hardware_config["lick_pin_bcm"])
     print("  Suction pin: BCM%d" % hardware_config["suction_pin_bcm"])
@@ -1468,6 +1515,7 @@ def main(argv=None):
     lick_events_path = session_root / (session_id + "_lick_events.csv")
     qc_path = session_root / (session_id + "_session_qc.json")
     metadata_path = session_root / (session_id + "_metadata.json")
+    manifest_path = session_root / "session_manifest.json"
 
     write_rows(selected_images_path, assignment_rows, [
         "image_role",
@@ -1511,6 +1559,14 @@ def main(argv=None):
         "iti_max_sec": iti_max_sec,
         "pre_background_requested_sec": pre_background_min * 60.0,
         "post_background_requested_sec": post_background_min * 60.0,
+        "session_output_schema_version": SESSION_OUTPUT_SCHEMA_VERSION,
+        "event_log_schema_version": EVENT_LOG_SCHEMA_VERSION,
+        "trial_summary_schema_version": TRIAL_SUMMARY_SCHEMA_VERSION,
+        "qc_schema_version": QC_SCHEMA_VERSION,
+        "planned_task_duration_sec": planned_task_sec,
+        "planned_pre_duration_sec": pre_background_min * 60.0,
+        "planned_post_duration_sec": post_background_min * 60.0,
+        "planned_protocol_duration_sec": planned_total_sec,
         "background_visual_condition": "gray_127_with_black_photodiode_patch",
         "global_image_panel_path": str(global_panel_path(ASSIGNMENT_DIR)),
         "assignment_path": str(assignment_path),
@@ -1542,7 +1598,13 @@ def main(argv=None):
         "post_started_immediately_after_final_stimulus": True,
         "plan_summary": plan_summary,
     }
-    metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
+    atomic_write_json(metadata_path, metadata)
+    atomic_write_json(manifest_path, {"session_id": session_id, "mouse_id": mouse_id,
+        "protocol": metadata["protocol"], "session_output_schema_version": SESSION_OUTPUT_SCHEMA_VERSION,
+        "status": "preparing", "files": {"metadata": metadata_path.name, "planned_sequence": planned_sequence_path.name,
+        "image_assignment": selected_images_path.name, "plan_summary": plan_summary_path.name, "event_log": event_log_path.name,
+        "trial_summary": trial_summary_path.name, "lick_events": lick_events_path.name, "session_qc": qc_path.name,
+        "camera_event_log": camera_event_log_path.name if use_camera else ""}})
 
     all_gpio_events = []
     runtime_by_trial = {}
@@ -1884,7 +1946,7 @@ def main(argv=None):
             lick_rows = [event for event in all_gpio_events if event.get("event_type") in ("lick_onset", "lick_offset")]
             write_rows(lick_events_path, lick_rows, ["unix_time_ns", "monotonic_ns", "event_type", "phase", "trial_index", "trial_number", "block_number", "image_role", "image_filename", "reward_scheduled", "suction_scheduled"])
             qc = build_session_qc(session_id, trials, trial_summary, all_gpio_events, hardware_config["reward_num_pulses"])
-            qc_path.write_text(json.dumps(qc, indent=2, sort_keys=True) + "\n")
+            atomic_write_json(qc_path, qc)
             metadata["session_qc_json"] = str(qc_path)
         except Exception as exc:
             finalization_errors.append("session_artifacts: %s: %s" % (type(exc).__name__, exc))
@@ -1901,6 +1963,7 @@ def main(argv=None):
         metadata["task_completed"] = task_completed
         metadata["post_background_completed"] = post_background_completed
         metadata["session_completed"] = session_completed
+        metadata["session_status"] = ("complete" if session_completed else ("interrupted" if interrupted else ("failed" if primary_error is not None else "cleanup_failed")))
         metadata.update(final_camera_metadata(
             latest_camera_state, use_camera, camera_started, camera_stop_confirmed,
             camera_fetch_completed, camera_conversion_completed))
@@ -1915,7 +1978,10 @@ def main(argv=None):
         metadata["finalization_errors"] = finalization_errors
         metadata["n_gpio_events_logged"] = len(all_gpio_events)
         try:
-            metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
+            atomic_write_json(metadata_path, metadata)
+            manifest = json.loads(manifest_path.read_text())
+            manifest["status"] = metadata["session_status"]
+            atomic_write_json(manifest_path, manifest)
         except Exception as exc:
             finalization_errors.append("metadata: %s: %s" % (type(exc).__name__, exc))
 
