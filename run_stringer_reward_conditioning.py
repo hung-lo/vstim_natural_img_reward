@@ -33,6 +33,7 @@ import statistics
 import subprocess
 import sys
 import time
+import select
 from pathlib import Path
 
 import run_stringer_vstim as base
@@ -227,6 +228,49 @@ def _strict_prompt(prompt):
     except EOFError as exc:
         raise RuntimeError("Unexpected EOF while waiting for operator input.") from exc
     return value.strip()
+
+
+def prompt_int_with_default(prompt, default_value, minimum=None):
+    while True:
+        raw = _strict_prompt("%s [%s]: " % (prompt, default_value))
+        try:
+            value = int(default_value) if not raw else int(raw)
+            if minimum is not None and value < minimum: raise ValueError("at least %s" % minimum)
+            return value
+        except ValueError as exc:
+            print("Invalid integer (%s); try again." % exc)
+
+
+def prompt_yes_no_strict(prompt, default_yes=None):
+    suffix = " [Y/n]" if default_yes is True else " [y/N]" if default_yes is False else " [y/n]"
+    while True:
+        raw = _strict_prompt(prompt + suffix + ": ").lower()
+        if not raw and default_yes is not None: return bool(default_yes)
+        if raw in ("y", "yes"): return True
+        if raw in ("n", "no"): return False
+        print("Please answer y/yes or n/no.")
+
+
+def format_operator_status(phase, camera_elapsed_sec=None, remaining_sec=None, trial_number=None, total_trials=None, post_sec=None):
+    prefix = "CAM OFF" if camera_elapsed_sec is None else "REC %s" % base.format_seconds(camera_elapsed_sec)
+    if phase == "WAITING_FOR_2P": return "%s | WAITING FOR 2P | press Enter when acquisition is running | planned after Enter %s" % (prefix, base.format_seconds(remaining_sec or 0))
+    if phase == "TASK": return "%s | TASK %d/%d | planned task remaining %s | +POST %s" % (prefix, trial_number, total_trials, base.format_seconds(remaining_sec or 0), base.format_seconds(post_sec or 0))
+    return "%s | %s %s remaining" % (prefix, phase, base.format_seconds(remaining_sec or 0))
+
+
+def wait_for_two_photon_gate(status_callback=None, poll_sec=0.25):
+    """Wait for an explicit Enter; EOF never releases the experimental gate."""
+    if not sys.stdin.isatty():
+        raise RuntimeError("2P operator gate requires interactive stdin; refusing to auto-bypass.")
+    started = time.monotonic()
+    while True:
+        if status_callback: status_callback()
+        ready, _, _ = select.select([sys.stdin], [], [], poll_sec)
+        if not ready: continue
+        line = sys.stdin.readline()
+        if line == "": raise RuntimeError("EOF received while waiting for 2P operator gate.")
+        if line.rstrip("\r\n") == "": return time.monotonic() - started
+        print("Press Enter to begin PRE.")
 
 
 def prompt_float_or_default(prompt, default_value, minimum=None, maximum=None):
@@ -1402,7 +1446,7 @@ def main(argv=None):
             if mouse_id: break
             print("Mouse ID is required; try again.")
     session_notes = args.session_notes if args.session_notes is not None else _strict_prompt("Session notes, optional: ")
-    n_blocks = args.blocks if args.blocks is not None else int(prompt_float_or_default("Number of 50-trial probability blocks", DEFAULT_N_BLOCKS, minimum=1))
+    n_blocks = args.blocks if args.blocks is not None else prompt_int_with_default("Number of 50-trial probability blocks", DEFAULT_N_BLOCKS, minimum=1)
     if int(n_blocks) < 1: raise ValueError("blocks must be at least 1")
     iti_min_sec = args.iti_min_sec if args.iti_min_sec is not None else prompt_float_or_default(
         "Minimum gray ITI in seconds",
@@ -1428,8 +1472,8 @@ def main(argv=None):
             raise ValueError("%s is invalid" % label)
     use_camera = False
     if args.camera: use_camera = True
-    elif camera_support is not None and not args.no_camera:
-        use_camera = True
+    elif args.no_camera: use_camera = False
+    elif camera_support is not None: use_camera = prompt_yes_no_strict("Record face camera", default_yes=True)
 
     image_dir = base.resolve_image_dir()
     all_pngs = base.list_png_files(image_dir)
@@ -1498,7 +1542,7 @@ def main(argv=None):
                 row["image_filename"],
             )
         )
-    if not base.prompt_yes_no("Create files and prepare this session", default_yes=True):
+    if not prompt_yes_no_strict("Create files and prepare this session", default_yes=True):
         print("Session aborted before hardware start.")
         return 0
 
@@ -1684,7 +1728,7 @@ def main(argv=None):
                 ),
             )
 
-            if base.prompt_yes_no(
+            if prompt_yes_no_strict(
                 "Deliver one manual test reward before starting baselines",
                 default_yes=False,
             ):
@@ -1712,7 +1756,7 @@ def main(argv=None):
                     all_gpio_events,
                 )
 
-            if base.prompt_yes_no(
+            if prompt_yes_no_strict(
                 "Activate one manual suction pulse before starting baselines",
                 default_yes=False,
             ):
@@ -1725,6 +1769,8 @@ def main(argv=None):
                            gpio_client, event_log_path, all_gpio_events)
 
             if use_camera:
+                metadata["camera_timer_anchor"] = "local_monotonic_at_camera_start_request"
+                metadata["camera_recording_request_monotonic_ns"] = time.monotonic_ns()
                 append_event(
                     event_log_path,
                     exact_timestamp_event(
@@ -1744,6 +1790,7 @@ def main(argv=None):
                         % camera_result.get("error", "unknown error")
                     )
                 camera_started = True
+                metadata["camera_recording_confirmed_monotonic_ns"] = time.monotonic_ns()
                 metadata["camera_start_result"] = camera_result
                 latest_camera_state = dict(camera_result.get("controller_state", {}))
                 append_event(
@@ -1755,9 +1802,15 @@ def main(argv=None):
                     ),
                 )
 
-            base.prompt_text(
-                "Start the 2P acquisition now, then press Enter to begin the PRE gray background: "
-            )
+            metadata["operator_gate_enter_monotonic_ns"] = time.monotonic_ns()
+            append_event(event_log_path, exact_timestamp_event("two_photon_operator_gate_entered", phase="preparation_gray"))
+            gate_camera_anchor = metadata.get("camera_recording_request_monotonic_ns")
+            gate_wait_sec = wait_for_two_photon_gate(
+                lambda: print(format_operator_status("WAITING_FOR_2P",
+                    (time.monotonic_ns() - gate_camera_anchor) / 1e9 if gate_camera_anchor else None,
+                    planned_total_sec), end="\r", flush=True))
+            metadata["operator_gate_release_monotonic_ns"] = time.monotonic_ns()
+            metadata["operator_gate_wait_sec"] = gate_wait_sec
             append_event(
                 event_log_path,
                 exact_timestamp_event(
