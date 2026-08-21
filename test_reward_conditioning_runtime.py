@@ -39,6 +39,12 @@ class FakeGPIOClient:
     def is_alive(self):
         return True
 
+    def trigger_reward(self, context):
+        return "reward_1"
+
+    def trigger_suction(self, context):
+        return "suction_1"
+
 
 class RewardConditioningRuntimeTests(unittest.TestCase):
     def test_status_reporter_throttles_and_session_status_table(self):
@@ -129,9 +135,21 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
             self.assertTrue(reward.prompt_yes_no_strict("choice", default_yes=False))
         with mock.patch("builtins.input", return_value=""):
             self.assertFalse(reward.prompt_yes_no_strict("choice", default_yes=False))
+        for raw, expected in (("y", True), ("yes", True), ("n", False), ("no", False)):
+            with mock.patch("builtins.input", return_value=raw):
+                self.assertEqual(
+                    reward.prompt_yes_no_strict("choice", default_yes=None),
+                    expected,
+                )
         with mock.patch("builtins.input", side_effect=EOFError):
             with self.assertRaisesRegex(RuntimeError, "EOF"):
                 reward.prompt_int_with_default("integer", 1)
+        with mock.patch("builtins.input", side_effect=EOFError):
+            with self.assertRaisesRegex(RuntimeError, "EOF"):
+                reward.prompt_float_or_default("float", 1.0)
+        with mock.patch("builtins.input", side_effect=EOFError):
+            with self.assertRaisesRegex(RuntimeError, "EOF"):
+                reward.prompt_yes_no_strict("choice", default_yes=False)
 
     def test_planned_task_remaining_uses_realized_itis_and_skips_final(self):
         trials = [{"planned_iti_duration_sec": 2.0}, {"planned_iti_duration_sec": 7.0}, {"planned_iti_duration_sec": 99.0}]
@@ -144,6 +162,13 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
                 now_monotonic=101.0),
             14.0,
         )
+        repeated = [
+            reward.planned_task_remaining_during_iti(
+                trials, 0, iti_deadline_monotonic=100.0,
+                now_monotonic=100.0 - current_iti_remaining)
+            for current_iti_remaining in (3.0, 2.0, 1.0)
+        ]
+        self.assertEqual(repeated, [13.0, 12.0, 11.0])
 
     def test_wait_until_services_status_from_existing_poll_loop(self):
         gpio_client = FakeGPIOClient()
@@ -207,10 +232,97 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
 
     def test_final_session_exit_preserves_primary_and_interrupts(self):
         self.assertEqual(reward.final_session_exit(None, True, ["cleanup"], []), 130)
+        self.assertEqual(
+            reward.final_session_exit(
+                None, True, [], [], camera_cleanup_error=True),
+            130,
+        )
         with self.assertRaisesRegex(RuntimeError, "primary experiment failure"):
             reward.final_session_exit(RuntimeError("primary experiment failure"), False, ["cleanup failure"], [])
+        with self.assertRaisesRegex(RuntimeError, "Camera cleanup failed"):
+            reward.final_session_exit(
+                None, False, [], [], camera_cleanup_error=True,
+                camera_cleanup_error_message="conversion exploded")
         with self.assertRaisesRegex(RuntimeError, "cleanup failure"):
             reward.final_session_exit(None, False, ["cleanup failure"], [])
+
+    def test_camera_choice_elapsed_and_manifest_status_helpers(self):
+        support = object()
+        prompt = mock.Mock(return_value=False)
+        self.assertTrue(reward.resolve_camera_choice(True, False, support, prompt))
+        prompt.assert_not_called()
+        with self.assertRaisesRegex(RuntimeError, "camera support is unavailable"):
+            reward.resolve_camera_choice(True, False, None, prompt)
+        self.assertFalse(reward.resolve_camera_choice(False, True, support, prompt))
+        prompt.assert_not_called()
+        self.assertFalse(reward.resolve_camera_choice(False, False, support, prompt))
+        prompt.assert_called_once()
+        prompt.reset_mock()
+        self.assertFalse(reward.resolve_camera_choice(False, False, None, prompt))
+        prompt.assert_not_called()
+
+        elapsed = reward.camera_elapsed_from_ns(100_000_000_000, 160_000_000_000)
+        self.assertEqual(elapsed, 60.0)
+        self.assertEqual(elapsed, reward.camera_elapsed_from_ns(
+            100_000_000_000, 160_000_000_000))
+
+        with tempfile.TemporaryDirectory(prefix="manifest_status_") as temp_dir:
+            path = Path(temp_dir) / "session_manifest.json"
+            reward.atomic_write_json(path, {"status": "preparing"})
+            for status in (
+                    "complete", "protocol_complete_video_pending",
+                    "protocol_complete_camera_cleanup_failed"):
+                manifest = reward.update_session_manifest_status(path, status)
+                metadata = {"session_status": status}
+                self.assertEqual(metadata["session_status"], manifest["status"])
+
+    def test_setup_summary_contains_operator_decisions(self):
+        trials = [
+            {"reward_scheduled": True, "reward_omission_scheduled": False,
+             "suction_scheduled": True},
+            {"reward_scheduled": False, "reward_omission_scheduled": True,
+             "suction_scheduled": True},
+        ]
+        summary = reward.format_setup_summary(
+            "mouse1", "notes", Path("assignment.json"), False, 1, trials,
+            3.0, 4.5, 300.0, 300.0, 12.0, 612.0,
+            {"reward_pin_bcm": 19, "lick_pin_bcm": 26,
+             "suction_pin_bcm": 25, "simulate_gpio": True},
+            True, 3.5, 0.3, output_root=Path("/output"))
+        for text in (
+                "Mouse:", "Session notes:", "Blocks:", "Total trials:",
+                "Scheduled rewards:", "Scheduled omissions:",
+                "Scheduled suction events:", "open-loop reward boundary: 1.0 s",
+                "ITI: uniform", "PRE gray background:", "POST gray background:",
+                "Planned task duration:", "Planned PRE + task + POST:",
+                "Camera/video cleanup not included.", "GPIO simulation:",
+                "Face camera:", "Output destination:"):
+            self.assertIn(text, summary)
+
+    def test_operational_timing_metadata_fields_and_order(self):
+        metadata = {
+            "operator_gate_enter_monotonic_ns": 100,
+            "operator_gate_release_monotonic_ns": 110,
+            "operator_gate_wait_sec": 10e-9,
+            "camera_recording_request_monotonic_ns": 90,
+            "camera_recording_confirmed_monotonic_ns": 95,
+            "camera_stop_confirmed_monotonic_ns": 180,
+            "camera_recording_elapsed_local_sec": 90e-9,
+            "pre_start_monotonic_ns": 120,
+            "pre_end_monotonic_ns": 130,
+            "pre_elapsed_sec": 10e-9,
+            "task_start_monotonic_ns": 140,
+            "task_end_monotonic_ns": 150,
+            "post_start_monotonic_ns": 160,
+            "post_end_monotonic_ns": 170,
+            "post_elapsed_sec": 10e-9,
+        }
+        self.assertTrue(reward.validate_operational_timing_metadata(
+            metadata, camera_required=True))
+        broken = dict(metadata, task_end_monotonic_ns=125)
+        with self.assertRaisesRegex(ValueError, "out of order"):
+            reward.validate_operational_timing_metadata(
+                broken, camera_required=True)
 
     def test_build_trial_summary_uses_monotonic_lick_timestamps(self):
         trials = [
@@ -419,7 +531,11 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
                             all_gpio_events, status_callback=None):
             wait_calls.append(deadline_monotonic)
             if status_callback:
-                status_callback(0.1)
+                for remaining in (0.2, 0.1, 0.0):
+                    with mock.patch.object(
+                            reward.time, "monotonic",
+                            return_value=deadline_monotonic - remaining):
+                        status_callback(remaining)
 
         with tempfile.TemporaryDirectory(prefix="reward_runtime_test_") as temp_dir:
             event_log_path = Path(temp_dir) / "event_log.csv"
@@ -448,9 +564,86 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
         self.assertTrue(runtime_by_trial[0]["trial_completed"])
         self.assertTrue(runtime_by_trial[1]["trial_completed"])
         self.assertEqual(pending_final_reward_checks, [])
-        self.assertEqual(len(status_updates), 1)
-        self.assertEqual(status_updates[0][:2], (1, 2))
-        self.assertAlmostEqual(status_updates[0][2], 1.6)
+        self.assertEqual(len(status_updates), 3)
+        self.assertTrue(all(update[:2] == (1, 2) for update in status_updates))
+        self.assertEqual(
+            [round(update[2], 6) for update in status_updates],
+            [1.7, 1.6, 1.5],
+        )
+
+    def test_reward_boundary_order_and_suction_waits_share_iti_status(self):
+        def trial(index, reward_scheduled=False, suction_scheduled=False):
+            return {
+                "trial_index": index, "trial_number": index + 1,
+                "block_number": 1, "image_role": "role_%d" % index,
+                "image_category": "conditioned", "image_id": index + 1,
+                "image_filename": "img_%d.png" % index,
+                "reward_eligible": reward_scheduled,
+                "reward_scheduled": reward_scheduled,
+                "reward_omission_scheduled": False,
+                "suction_scheduled": suction_scheduled,
+                "planned_iti_duration_sec": 4.0 if index == 0 else 9.0,
+            }
+
+        trials = [trial(0, True, True), trial(1)]
+        loaded_raws = {
+            item["image_filename"]: {"first": Path("first.raw"), "second": Path("second.raw")}
+            for item in trials
+        }
+        raw_paths = {
+            item["image_filename"]: {"first": Path("first.raw"), "second": Path("second.raw")}
+            for item in trials
+        }
+        calls = []
+        display_count = {"value": 0}
+
+        def fake_display(screen, raw_path):
+            labels = ("segment1", "segment2", "background")
+            label = labels[display_count["value"] % 3]
+            calls.append(label)
+            display_count["value"] += 1
+            base_ns = display_count["value"] * 1_000_000_000
+            return SimpleNamespace(start_time=0, mean_interframe=0, stddev_interframe=0), {
+                "request_utc_iso": "iso", "request_unix_sec": "1.0",
+                "request_unix_ns": base_ns,
+                "request_perf_counter_ns": base_ns,
+                "return_unix_ns": base_ns + 1,
+                "return_perf_counter_ns": base_ns + 1,
+                "duration_sec": 0.001,
+            }
+
+        gpio = FakeGPIOClient()
+        gpio.trigger_reward = mock.Mock(side_effect=lambda context: calls.append("reward") or "reward_1")
+        gpio.trigger_suction = mock.Mock(side_effect=lambda context: calls.append("suction") or "suction_1")
+
+        def fake_wait(deadline, gpio_client, event_path, events, status_callback=None):
+            calls.append("wait_with_status" if status_callback else "wait_without_status")
+            if status_callback:
+                with mock.patch.object(reward.time, "monotonic", return_value=deadline - 0.5):
+                    status_callback(0.5)
+
+        status_updates = []
+        with tempfile.TemporaryDirectory(prefix="reward_boundary_") as temp_dir, \
+             mock.patch.object(reward.base, "display_raw_with_timing", side_effect=fake_display), \
+             mock.patch.object(reward, "wait_until", side_effect=fake_wait), \
+             mock.patch.object(reward, "verify_reward_command", side_effect=lambda *args, **kwargs: calls.append("verify_reward")), \
+             mock.patch.object(reward, "verify_suction_command", side_effect=lambda *args, **kwargs: calls.append("verify_suction")):
+            reward.run_trials(
+                SimpleNamespace(), trials, loaded_raws, Path("gray.loaded"),
+                raw_paths, Path(temp_dir) / "gray.raw", gpio,
+                Path(temp_dir) / "events.csv", [], 6, 0.5, 3.5, 0.05,
+                status_callback=lambda done, total, remaining: (
+                    calls.append("status"),
+                    status_updates.append((done, total, remaining))),
+            )
+
+        self.assertEqual(calls[:4], ["segment1", "reward", "segment2", "background"])
+        self.assertNotIn("status", calls[:4])
+        self.assertEqual(calls.count("wait_with_status"), 2)
+        self.assertEqual(calls.count("status"), 2)
+        self.assertLess(calls.index("wait_with_status"), calls.index("suction"))
+        self.assertLess(calls.index("suction"), calls.index("verify_suction"))
+        self.assertTrue(all(update[:2] == (1, 2) for update in status_updates))
 
 
 if __name__ == "__main__":

@@ -75,6 +75,26 @@ SESSION_OUTPUT_SCHEMA_VERSION = 2
 EVENT_LOG_SCHEMA_VERSION = 1
 TRIAL_SUMMARY_SCHEMA_VERSION = 1
 
+CORE_OPERATIONAL_TIMING_FIELDS = (
+    "operator_gate_enter_monotonic_ns",
+    "operator_gate_release_monotonic_ns",
+    "operator_gate_wait_sec",
+    "pre_start_monotonic_ns",
+    "pre_end_monotonic_ns",
+    "pre_elapsed_sec",
+    "task_start_monotonic_ns",
+    "task_end_monotonic_ns",
+    "post_start_monotonic_ns",
+    "post_end_monotonic_ns",
+    "post_elapsed_sec",
+)
+CAMERA_OPERATIONAL_TIMING_FIELDS = (
+    "camera_recording_request_monotonic_ns",
+    "camera_recording_confirmed_monotonic_ns",
+    "camera_stop_confirmed_monotonic_ns",
+    "camera_recording_elapsed_local_sec",
+)
+
 PLANNED_SEQUENCE_FIELDS = [
     "trial_index",
     "trial_number",
@@ -403,15 +423,62 @@ def final_camera_metadata(latest_state, use_camera, camera_started=False,
     }
 
 
-def final_session_exit(primary_error, interrupted, cleanup_errors, finalization_errors):
+def final_session_exit(primary_error, interrupted, cleanup_errors, finalization_errors,
+                       camera_cleanup_error=False, camera_cleanup_error_message=""):
     """Return the final exit code or re-raise the authoritative failure."""
     if primary_error is not None:
         raise primary_error
     if interrupted:
         return 130
+    if camera_cleanup_error:
+        detail = camera_cleanup_error_message or "explicit camera cleanup exception"
+        raise RuntimeError("Camera cleanup failed: %s" % detail)
     if cleanup_errors or finalization_errors:
         raise RuntimeError("Session cleanup/finalization failed: %s" % "; ".join(cleanup_errors + finalization_errors))
     return 0
+
+
+def camera_elapsed_from_ns(recording_request_ns, stop_confirmed_ns):
+    if recording_request_ns is None or stop_confirmed_ns is None:
+        return None
+    return max(0.0, (int(stop_confirmed_ns) - int(recording_request_ns)) / 1e9)
+
+
+def resolve_camera_choice(camera_requested, no_camera_requested, camera_support,
+                          prompt_fn=prompt_yes_no_strict):
+    if camera_requested:
+        if camera_support is None:
+            raise RuntimeError("--camera was requested but camera support is unavailable.")
+        return True
+    if no_camera_requested or camera_support is None:
+        return False
+    return bool(prompt_fn("Record face camera", default_yes=True))
+
+
+def update_session_manifest_status(manifest_path, status):
+    manifest = json.loads(Path(manifest_path).read_text())
+    manifest["status"] = status
+    atomic_write_json(manifest_path, manifest)
+    return manifest
+
+
+def validate_operational_timing_metadata(metadata, camera_required=False):
+    required = list(CORE_OPERATIONAL_TIMING_FIELDS)
+    if camera_required:
+        required.extend(CAMERA_OPERATIONAL_TIMING_FIELDS)
+    missing = [field for field in required if metadata.get(field) is None]
+    if missing:
+        raise ValueError("Missing operational timing metadata: %s" % ", ".join(missing))
+    ordered = [
+        "operator_gate_enter_monotonic_ns", "operator_gate_release_monotonic_ns",
+        "pre_start_monotonic_ns", "pre_end_monotonic_ns",
+        "task_start_monotonic_ns", "task_end_monotonic_ns",
+        "post_start_monotonic_ns", "post_end_monotonic_ns",
+    ]
+    values = [int(metadata[field]) for field in ordered]
+    if values != sorted(values):
+        raise ValueError("Operational phase timestamps are out of order.")
+    return True
 
 
 def exact_timestamp_event(event_type, **fields):
@@ -1021,6 +1088,16 @@ def run_trials(
         # are serviced inside this interval and may not extend it.
         iti_start_monotonic = background_transition_monotonic_ns / 1e9
         iti_deadline = iti_start_monotonic + float(trial["planned_iti_duration_sec"])
+
+        def iti_status_callback(_wait_remaining):
+            if status_callback:
+                status_callback(
+                    completed_count,
+                    total_trials,
+                    planned_task_remaining_during_iti(
+                        trials, completed_count - 1, iti_deadline),
+                )
+
         if reward_check is not None:
             verify_reward_command(
                 gpio_client,
@@ -1031,7 +1108,11 @@ def run_trials(
                 timeout_sec=min(reward_check["timeout_sec"], max(0.01, iti_deadline - time.monotonic())),
             )
         if suction_check is not None:
-            wait_until(suction_check["target"], gpio_client, event_log_path, all_gpio_events)
+            wait_until(
+                suction_check["target"], gpio_client, event_log_path,
+                all_gpio_events,
+                status_callback=iti_status_callback if status_callback else None,
+            )
             suction_command_id = gpio_client.trigger_suction(context)
             runtime["suction_command_id"] = suction_command_id
             verify_suction_command(gpio_client, suction_command_id, event_log_path, all_gpio_events,
@@ -1042,17 +1123,7 @@ def run_trials(
             gpio_client,
             event_log_path,
             all_gpio_events,
-            status_callback=(
-                (lambda _iti_remaining, completed_count=completed_count,
-                        current_trial_index=completed_count - 1,
-                        iti_deadline=iti_deadline: status_callback(
-                            completed_count,
-                            total_trials,
-                            planned_task_remaining_during_iti(
-                                trials, current_trial_index, iti_deadline,
-                                now_monotonic=iti_deadline - _iti_remaining)))
-                if status_callback else None
-            ),
+            status_callback=iti_status_callback if status_callback else None,
         )
         actual_iti = time.monotonic() - iti_start_monotonic
         append_event(
@@ -1489,6 +1560,46 @@ def maybe_import_camera_support(no_camera):
         return None
 
 
+def format_setup_summary(mouse_id, session_notes, assignment_path,
+                         assignment_created, n_blocks, trials, iti_min_sec,
+                         iti_max_sec, pre_sec, post_sec, planned_task_sec,
+                         planned_total_sec, hardware_config, use_camera,
+                         suction_delay_sec, reward_train_duration_sec,
+                         output_root=OUTPUT_ROOT):
+    lines = [
+        "Session setup summary:",
+        "  Mouse: %s" % mouse_id,
+        "  Session notes: %s" % (session_notes or "(none)"),
+        "  Shared 14-image panel: %s" % global_panel_path(ASSIGNMENT_DIR),
+        "  Fixed per-mouse role assignment: %s" % assignment_path,
+        "  Assignment newly created: %s" % assignment_created,
+        "  Blocks: %d x %d trials" % (n_blocks, TRIALS_PER_BLOCK),
+        "  Total trials: %d" % len(trials),
+        "  Scheduled rewards: %d" % sum(1 for trial in trials if trial["reward_scheduled"]),
+        "  Scheduled omissions: %d" % sum(1 for trial in trials if trial["reward_omission_scheduled"]),
+        "  Scheduled suction events: %d" % sum(1 for trial in trials if trial.get("suction_scheduled")),
+        "  Stimulus: 1.5 s; open-loop reward boundary: 1.0 s",
+        "  Reward probability: %.3f (fixed)" % REWARD_PROBABILITY,
+        "  ITI: uniform %.3f-%.3f s" % (iti_min_sec, iti_max_sec),
+        "  PRE gray background: %s" % base.format_seconds(pre_sec),
+        "  POST gray background: %s" % base.format_seconds(post_sec),
+        "  Planned task duration: %s" % base.format_seconds(planned_task_sec),
+        "  Planned PRE + task + POST: %s" % base.format_seconds(planned_total_sec),
+        "  Camera/video cleanup not included.",
+        "  Reward pin: BCM%d" % hardware_config["reward_pin_bcm"],
+        "  Lick pin: BCM%d" % hardware_config["lick_pin_bcm"],
+        "  Suction pin: BCM%d" % hardware_config["suction_pin_bcm"],
+        "  Suction boundary: %.1f s after reward-associated image onset" % suction_delay_sec,
+        "  Reward pulse-train duration: %.3f s" % reward_train_duration_sec,
+        "  GPIO simulation: %s" % hardware_config["simulate_gpio"],
+        "  Face camera: %s" % use_camera,
+        "  Output destination: %s/<session_id>" % output_root,
+        "  IMPORTANT: reward delivery is independent of licking.",
+        "  Suction is applied to rewarded and omission conditioned-cue trials, independent of licking.",
+    ]
+    return "\n".join(lines)
+
+
 def main(argv=None):
     args = parse_args(argv)
     base.print_environment()
@@ -1556,10 +1667,9 @@ def main(argv=None):
                                   ("pre_background_min", pre_background_min, 0.0), ("post_background_min", post_background_min, 0.0)):
         if not math.isfinite(float(value)) or float(value) < minimum:
             raise ValueError("%s is invalid" % label)
-    use_camera = False
-    if args.camera: use_camera = True
-    elif args.no_camera: use_camera = False
-    elif camera_support is not None: use_camera = prompt_yes_no_strict("Record face camera", default_yes=True)
+    use_camera = resolve_camera_choice(
+        args.camera, args.no_camera, camera_support,
+        prompt_fn=prompt_yes_no_strict)
 
     image_dir = base.resolve_image_dir()
     all_pngs = base.list_png_files(image_dir)
@@ -1589,35 +1699,12 @@ def main(argv=None):
     )
 
     print()
-    print("Session setup summary:")
-    print("  Mouse: %s" % mouse_id)
-    print("  Session notes: %s" % (session_notes or "(none)"))
-    print("  Shared 14-image panel: %s" % global_panel_path(ASSIGNMENT_DIR))
-    print("  Fixed per-mouse role assignment: %s" % assignment_path)
-    print("  Assignment newly created: %s" % assignment_created)
-    print("  Blocks: %d x %d trials" % (n_blocks, TRIALS_PER_BLOCK))
-    print("  Total trials: %d" % len(trials))
-    print("  Scheduled rewards: %d" % sum(1 for trial in trials if trial["reward_scheduled"]))
-    print("  Scheduled omissions: %d" % sum(1 for trial in trials if trial["reward_omission_scheduled"]))
-    print("  Scheduled suction events: %d" % sum(1 for trial in trials if trial.get("suction_scheduled")))
-    print("  Stimulus: 1.5 s; open-loop reward boundary: 1.0 s")
-    print("  Reward probability: %.3f (fixed)" % REWARD_PROBABILITY)
-    print("  ITI: uniform %.3f-%.3f s" % (iti_min_sec, iti_max_sec))
-    print("  PRE gray background: %s" % base.format_seconds(pre_background_min * 60.0))
-    print("  POST gray background: %s" % base.format_seconds(post_background_min * 60.0))
-    print("  Planned task duration: %s" % base.format_seconds(planned_task_sec))
-    print("  Planned PRE + task + POST: %s" % base.format_seconds(planned_total_sec))
-    print("  Camera/video cleanup not included.")
-    print("  Reward pin: BCM%d" % hardware_config["reward_pin_bcm"])
-    print("  Lick pin: BCM%d" % hardware_config["lick_pin_bcm"])
-    print("  Suction pin: BCM%d" % hardware_config["suction_pin_bcm"])
-    print("  Suction boundary: %.1f s after reward-associated image onset" % suction_delay_sec)
-    print("  Reward pulse-train duration: %.3f s" % reward_train_duration_sec)
-    print("  GPIO simulation: %s" % hardware_config["simulate_gpio"])
-    print("  Face camera: %s" % use_camera)
-    print("  Output destination: %s/<session_id>" % OUTPUT_ROOT)
-    print("  IMPORTANT: reward delivery is independent of licking.")
-    print("  Suction is applied to rewarded and omission conditioned-cue trials, independent of licking.")
+    print(format_setup_summary(
+        mouse_id, session_notes, assignment_path, assignment_created,
+        n_blocks, trials, iti_min_sec, iti_max_sec,
+        pre_background_min * 60.0, post_background_min * 60.0,
+        planned_task_sec, planned_total_sec, hardware_config, use_camera,
+        suction_delay_sec, reward_train_duration_sec))
     print()
     for row in plan_summary:
         print(
@@ -1994,7 +2081,8 @@ def main(argv=None):
                         raise RuntimeError("Camera stop was not confirmed: %s" % json.dumps(stop_state, sort_keys=True))
                     metadata["camera_stop_confirmed_monotonic_ns"] = time.monotonic_ns()
                     anchor_ns = metadata.get("camera_recording_request_monotonic_ns")
-                    metadata["camera_recording_elapsed_local_sec"] = ((metadata["camera_stop_confirmed_monotonic_ns"] - anchor_ns) / 1e9 if anchor_ns else None)
+                    metadata["camera_recording_elapsed_local_sec"] = camera_elapsed_from_ns(
+                        anchor_ns, metadata["camera_stop_confirmed_monotonic_ns"])
                     status_reporter.finalize("REC stopped %s | camera stop confirmed" % base.format_seconds(metadata["camera_recording_elapsed_local_sec"] or 0))
                     append_event(
                         event_log_path,
@@ -2090,7 +2178,8 @@ def main(argv=None):
                 if camera_stop_confirmed and "camera_stop_confirmed_monotonic_ns" not in metadata:
                     metadata["camera_stop_confirmed_monotonic_ns"] = time.monotonic_ns()
                     anchor_ns = metadata.get("camera_recording_request_monotonic_ns")
-                    metadata["camera_recording_elapsed_local_sec"] = ((metadata["camera_stop_confirmed_monotonic_ns"] - anchor_ns) / 1e9 if anchor_ns else None)
+                    metadata["camera_recording_elapsed_local_sec"] = camera_elapsed_from_ns(
+                        anchor_ns, metadata["camera_stop_confirmed_monotonic_ns"])
                 append_event(
                     event_log_path,
                     exact_timestamp_event(
@@ -2139,6 +2228,17 @@ def main(argv=None):
         metadata["task_completed"] = task_completed
         metadata["post_background_completed"] = post_background_completed
         metadata["session_completed"] = session_completed
+        if task_completed and post_background_completed:
+            try:
+                validate_operational_timing_metadata(
+                    metadata,
+                    camera_required=bool(
+                        use_camera and camera_started and camera_stop_confirmed),
+                )
+            except Exception as exc:
+                finalization_errors.append(
+                    "operational_timing_metadata: %s: %s"
+                    % (type(exc).__name__, exc))
         metadata["session_status"] = derive_session_status(
             task_completed, post_background_completed, interrupted, primary_error,
             use_camera, latest_camera_state, cleanup_errors, finalization_errors,
@@ -2158,9 +2258,7 @@ def main(argv=None):
         metadata["n_gpio_events_logged"] = len(all_gpio_events)
         try:
             atomic_write_json(metadata_path, metadata)
-            manifest = json.loads(manifest_path.read_text())
-            manifest["status"] = metadata["session_status"]
-            atomic_write_json(manifest_path, manifest)
+            update_session_manifest_status(manifest_path, metadata["session_status"])
         except Exception as exc:
             finalization_errors.append("metadata: %s: %s" % (type(exc).__name__, exc))
 
@@ -2175,7 +2273,10 @@ def main(argv=None):
             "ground truth; software timestamps are retained for diagnostics."
         )
 
-    return final_session_exit(primary_error, interrupted, cleanup_errors, finalization_errors)
+    return final_session_exit(
+        primary_error, interrupted, cleanup_errors, finalization_errors,
+        camera_cleanup_error=camera_cleanup_error,
+        camera_cleanup_error_message=camera_cleanup_error_message)
 
 
 if __name__ == "__main__":

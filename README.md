@@ -169,6 +169,7 @@ Session output is written under:
 
 The main files there are:
 
+- `session_manifest.json`
 - `<session>_event_log.csv`
 - `<session>_planned_sequence.csv`
 - `<session>_trial_summary.csv`
@@ -177,6 +178,45 @@ The main files there are:
 - `<session>_metadata.json`
 - `<session>_session_qc.json`
 - `raw_cache/` with the baked RPG raws
+
+### Operator flow and live status
+
+The reward-conditioning runner resolves CLI or interactive session inputs,
+shows the final setup summary, and asks for preparation confirmation before it
+creates the session. The operator may then run manual reward and suction tests.
+If selected, the face camera is started and verified before the two-photon
+gate.
+
+The experimental sequence is:
+
+1. `WAITING FOR 2P`: start two-photon acquisition, then press Enter.
+2. `PRE`: live gray-background countdown.
+3. `TASK`: live trial progress and exact planned task ETA.
+4. `POST`: live gray-background countdown.
+5. Stop the camera and freeze the displayed REC elapsed time.
+6. Transfer and verify raw video, convert to MP4, and verify it with `ffprobe`.
+7. Report the final session status and output paths.
+
+Representative status lines are:
+
+```text
+REC 00:01:42 | WAITING FOR 2P | press Enter when acquisition is running | planned after Enter 00:52:18
+REC 00:03:10 | PRE 01:50 remaining | protocol remaining 00:48:31 | finish ~14:58:22
+REC 00:23:14 | TASK 221/500 (44.2%) | planned task remaining 00:24:08 | +POST 00:05:00 | finish ~15:32:11
+REC 00:49:23 | POST 03:17 remaining | finish ~15:27:04
+REC stopped 00:52:41 | camera stop confirmed
+```
+
+`WAITING FOR 2P` has no finish prediction. Planned ETA excludes the operator
+gate and video transfer/conversion; TASK ETA uses the exact realized ITI
+sequence and excludes the skipped final ITI. REC is a controller-side
+operational timer, not a measurement of remote physical camera frames.
+Photodiode/DAQ remains the ground truth for neural alignment.
+
+The metadata retains `session_completed` for compatibility. Its more detailed
+`session_status` is also copied to `session_manifest.json` and can be:
+`complete`, `interrupted`, `failed`, `protocol_complete_video_pending`,
+`protocol_complete_camera_cleanup_failed`, `cleanup_failed`, or `incomplete`.
 
 ### Camera recovery and integrity
 
@@ -190,7 +230,8 @@ files are retained after conversion for recovery.
 If transfer or conversion fails, both local raw files and remote raw files are
 kept. Run `remote_camera_control.py fetch` or `convert` again to recover; a
 valid existing MP4 is reused only after `ffprobe` validation. Ctrl-C performs
-cleanup and exits with status 130.
+cleanup and exits with status 130. An explicit camera-cleanup exception exits
+nonzero even when TASK and POST completed.
 
 Recommended test sequence:
 
