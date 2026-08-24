@@ -327,22 +327,30 @@ class StatusReporter(object):
 
 def derive_session_status(task_completed, post_completed, interrupted=False, primary_error=None,
                           camera_enabled=False, camera_state=None, cleanup_errors=None,
-                          finalization_errors=None, camera_cleanup_error=False):
+                          finalization_errors=None, camera_cleanup_error=False,
+                          camera_data_secured=None):
     camera_state = camera_state or {}
-    if interrupted: return "interrupted"
     if primary_error is not None: return "failed"
+    if interrupted: return "interrupted"
     if not (task_completed and post_completed): return "incomplete"
-    if camera_cleanup_error or camera_state.get("camera_cleanup_error"):
+    if (camera_cleanup_error
+            or camera_state.get("camera_cleanup_error")
+            or camera_state.get("remote_raw_cleanup_error")):
         return "protocol_complete_camera_cleanup_failed"
     if cleanup_errors or finalization_errors: return "cleanup_failed"
     if not camera_enabled: return "complete"
-    if not camera_state.get("camera_stop_confirmed"):
-        return "protocol_complete_camera_cleanup_failed"
-    if not camera_state.get("camera_raw_files_verified"):
-        return "protocol_complete_camera_cleanup_failed"
-    if not camera_state.get("camera_mp4_verified"):
+    if camera_data_secured is None:
+        camera_data_secured = derive_camera_data_secured(
+            camera_enabled, camera_state, camera_cleanup_error)
+    if camera_data_secured:
+        return "complete"
+    if (camera_state.get("camera_stop_confirmed")
+            and camera_state.get("camera_raw_files_verified")
+            and camera_state.get("camera_raw_hash_verified")
+            and not camera_state.get("remote_raw_cleanup_error")
+            and not camera_state.get("camera_cleanup_error")):
         return "protocol_complete_video_pending"
-    return "complete"
+    return "protocol_complete_camera_cleanup_failed"
 
 
 def wait_for_two_photon_gate(status_callback=None, service_callback=None, poll_sec=0.25):
@@ -423,6 +431,27 @@ def final_camera_metadata(latest_state, use_camera, camera_started=False,
     }
 
 
+def derive_camera_data_secured(camera_enabled, camera_state=None,
+                               camera_cleanup_error=False):
+    """Return the single archival-success decision used by session outputs."""
+    if not camera_enabled:
+        return True
+    state = dict(camera_state or {})
+    required = (
+        "camera_stop_confirmed",
+        "camera_raw_files_verified",
+        "camera_raw_hash_verified",
+        "camera_mp4_verified",
+        "remote_raw_cleanup_completed",
+    )
+    return bool(
+        not camera_cleanup_error
+        and not state.get("camera_cleanup_error")
+        and not state.get("remote_raw_cleanup_error")
+        and all(state.get(field) is True for field in required)
+    )
+
+
 def final_session_exit(primary_error, interrupted, cleanup_errors, finalization_errors,
                        camera_cleanup_error=False, camera_cleanup_error_message=""):
     """Return the final exit code or re-raise the authoritative failure."""
@@ -460,6 +489,32 @@ def update_session_manifest_status(manifest_path, status):
     manifest["status"] = status
     atomic_write_json(manifest_path, manifest)
     return manifest
+
+
+def _manifest_artifact_reference(session_root, path):
+    if path is None:
+        return {"path": None, "exists": False}
+    path = Path(path)
+    try:
+        relative = str(path.relative_to(Path(session_root)))
+    except ValueError:
+        relative = str(path)
+    return {"path": relative, "exists": bool(path.is_file())}
+
+
+def build_session_manifest(session_root, session_id, mouse_id, protocol,
+                           status, artifact_paths):
+    return {
+        "session_id": session_id,
+        "mouse_id": mouse_id,
+        "protocol": protocol,
+        "session_output_schema_version": SESSION_OUTPUT_SCHEMA_VERSION,
+        "status": status,
+        "files": {
+            name: _manifest_artifact_reference(session_root, path)
+            for name, path in artifact_paths.items()
+        },
+    }
 
 
 def validate_operational_timing_metadata(metadata, camera_required=False):
@@ -544,6 +599,134 @@ def background_context(phase):
     }
 
 
+def _optional_positive_finite_config_value(config, name):
+    value = config.get(name)
+    if value is None or value == "":
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("%s must be null or a finite positive number." % name) from exc
+    if not math.isfinite(value) or value <= 0:
+        raise RuntimeError("%s must be null or a finite positive number." % name)
+    return value
+
+
+def load_reward_volume_config(config):
+    per_train = _optional_positive_finite_config_value(
+        config, "reward_volume_ul_per_train")
+    maximum = _optional_positive_finite_config_value(
+        config, "maximum_session_reward_ul")
+    if maximum is not None and per_train is None:
+        raise RuntimeError(
+            "maximum_session_reward_ul requires reward_volume_ul_per_train.")
+    config["reward_volume_ul_per_train"] = per_train
+    config["maximum_session_reward_ul"] = maximum
+    config["reward_volume_cap_enabled"] = bool(
+        per_train is not None and maximum is not None)
+    return config
+
+
+class RewardVolumeCapExceeded(RuntimeError):
+    pass
+
+
+class RewardVolumeTracker(object):
+    """In-memory reward-volume accounting; no I/O occurs on the fast path."""
+
+    def __init__(self, reward_volume_ul_per_train=None,
+                 maximum_session_reward_ul=None,
+                 scheduled_reward_train_count=0):
+        self.reward_volume_ul_per_train = reward_volume_ul_per_train
+        self.maximum_session_reward_ul = maximum_session_reward_ul
+        self.reward_volume_cap_enabled = bool(
+            reward_volume_ul_per_train is not None
+            and maximum_session_reward_ul is not None)
+        self.scheduled_reward_train_count = int(scheduled_reward_train_count)
+        self.scheduled_reward_dispatched_count = 0
+        self.manual_reward_train_count = 0
+        self.delivered_reward_train_count = 0
+        self.reward_volume_cap_exceeded = False
+
+    @property
+    def planned_reward_volume_ul(self):
+        if self.reward_volume_ul_per_train is None:
+            return None
+        return self.scheduled_reward_train_count * self.reward_volume_ul_per_train
+
+    @property
+    def estimated_delivered_reward_ul(self):
+        if self.reward_volume_ul_per_train is None:
+            return None
+        return self.delivered_reward_train_count * self.reward_volume_ul_per_train
+
+    def preflight(self):
+        if (self.reward_volume_cap_enabled
+                and self.planned_reward_volume_ul > self.maximum_session_reward_ul):
+            self.reward_volume_cap_exceeded = True
+            raise RewardVolumeCapExceeded(
+                "Planned reward volume %.3f uL exceeds session cap %.3f uL."
+                % (self.planned_reward_volume_ul,
+                   self.maximum_session_reward_ul))
+        return self
+
+    def check_next_command(self, scheduled=False):
+        if not self.reward_volume_cap_enabled:
+            return
+        future_scheduled = (
+            self.scheduled_reward_train_count
+            - self.scheduled_reward_dispatched_count
+            - (1 if scheduled else 0))
+        projected_trains = (
+            self.delivered_reward_train_count + 1 + max(0, future_scheduled))
+        projected_volume = projected_trains * self.reward_volume_ul_per_train
+        if projected_volume > self.maximum_session_reward_ul:
+            self.reward_volume_cap_exceeded = True
+            kind = "scheduled" if scheduled else "manual"
+            raise RewardVolumeCapExceeded(
+                "The next %s reward train would raise estimated volume to %.3f uL, "
+                "above the %.3f uL session cap."
+                % (kind, projected_volume, self.maximum_session_reward_ul))
+
+    def record_dispatched(self, scheduled=False, manual=False):
+        if scheduled == manual:
+            raise ValueError("Record exactly one reward command kind.")
+        self.delivered_reward_train_count += 1
+        if scheduled:
+            self.scheduled_reward_dispatched_count += 1
+        if manual:
+            self.manual_reward_train_count += 1
+
+    def summary(self):
+        return {
+            "reward_volume_cap_enabled": self.reward_volume_cap_enabled,
+            "reward_volume_ul_per_train": self.reward_volume_ul_per_train,
+            "maximum_session_reward_ul": self.maximum_session_reward_ul,
+            "planned_reward_train_count": self.scheduled_reward_train_count,
+            "planned_reward_volume_ul": self.planned_reward_volume_ul,
+            "manual_reward_train_count": self.manual_reward_train_count,
+            "delivered_reward_train_count": self.delivered_reward_train_count,
+            "estimated_delivered_reward_ul": self.estimated_delivered_reward_ul,
+            "reward_volume_cap_exceeded": self.reward_volume_cap_exceeded,
+        }
+
+
+def planned_reward_train_count(trials):
+    return sum(1 for trial in trials if trial.get("reward_scheduled"))
+
+
+def _record_reward_volume_block(event_log_path, context, exc):
+    fields = dict(context or {})
+    fields["notes"] = str(exc)
+    append_event(
+        event_log_path,
+        exact_timestamp_event(
+            "reward_volume_cap_blocked_command",
+            **fields,
+        ),
+    )
+
+
 def load_hardware_config(path, simulate_gpio=False):
     path = Path(path)
     if not path.exists():
@@ -563,6 +746,8 @@ def load_hardware_config(path, simulate_gpio=False):
         "reward_pulse_on_sec",
         "reward_pulse_off_sec",
         "reward_num_pulses",
+        "reward_volume_ul_per_train",
+        "maximum_session_reward_ul",
     ]
     missing = [name for name in required if name not in config]
     if missing:
@@ -612,7 +797,7 @@ def load_hardware_config(path, simulate_gpio=False):
     if (config["suction_delay_from_stim_onset_sec"] + config["suction_duration_sec"]
             > earliest_next - MINIMUM_CLEAN_POST_SUCTION_SEC):
         raise RuntimeError("Suction does not leave the required 0.75 s clean gray interval.")
-    return config
+    return load_reward_volume_config(config)
 
 
 def get_git_commit(
@@ -876,6 +1061,7 @@ def run_trials(
     suction_delay_sec,
     suction_duration_sec,
     status_callback=None,
+    reward_volume_tracker=None,
 ):
     runtime_by_trial = {}
     pending_final_reward_checks = []
@@ -922,7 +1108,15 @@ def run_trials(
         runtime["reward_boundary_monotonic_ns"] = boundary_monotonic_ns
         reward_command_id = ""
         if trial["reward_scheduled"]:
-            reward_command_id = gpio_client.trigger_reward(context)
+            try:
+                if reward_volume_tracker is not None:
+                    reward_volume_tracker.check_next_command(scheduled=True)
+                reward_command_id = gpio_client.trigger_reward(context)
+                if reward_volume_tracker is not None:
+                    reward_volume_tracker.record_dispatched(scheduled=True)
+            except RewardVolumeCapExceeded as exc:
+                _record_reward_volume_block(event_log_path, context, exc)
+                raise
         runtime["reward_command_id"] = reward_command_id
         runtime["suction_scheduled"] = bool(trial.get("suction_scheduled", False))
 
@@ -1336,6 +1530,8 @@ def build_session_qc(
     trial_summary_rows,
     all_gpio_events,
     reward_num_pulses,
+    reward_volume_summary=None,
+    camera_data_secured=None,
 ):
     planned_trial_count = len(trials)
     executed_trial_count = sum(1 for row in trial_summary_rows if row.get("trial_executed"))
@@ -1506,6 +1702,7 @@ def build_session_qc(
         qc_fail_reasons.append("suction_command_integrity_failure")
 
     qc_pass = not qc_fail_reasons
+    reward_volume_summary = dict(reward_volume_summary or {})
     return {
         "schema_version": QC_SCHEMA_VERSION,
         "session_id": session_id,
@@ -1515,6 +1712,15 @@ def build_session_qc(
         "completed_trial_count": completed_trial_count,
         "planned_reward_count": planned_reward_count,
         "planned_suction_count": planned_suction_count,
+        "camera_data_secured": camera_data_secured,
+        "reward_volume_cap_enabled": reward_volume_summary.get("reward_volume_cap_enabled", False),
+        "reward_volume_ul_per_train": reward_volume_summary.get("reward_volume_ul_per_train"),
+        "maximum_session_reward_ul": reward_volume_summary.get("maximum_session_reward_ul"),
+        "planned_reward_volume_ul": reward_volume_summary.get("planned_reward_volume_ul"),
+        "manual_reward_train_count": reward_volume_summary.get("manual_reward_train_count", 0),
+        "delivered_reward_train_count": reward_volume_summary.get("delivered_reward_train_count", 0),
+        "estimated_delivered_reward_ul": reward_volume_summary.get("estimated_delivered_reward_ul"),
+        "reward_volume_cap_exceeded": reward_volume_summary.get("reward_volume_cap_exceeded", False),
         "reward_command_received_count": len(reward_command_received_events),
         "reward_complete_count": len(reward_complete_events),
         "reward_valve_on_count": len(reward_valve_on_events),
@@ -1690,6 +1896,16 @@ def main(argv=None):
         reward_delay_sec=REWARD_DELAY_SEC,
         suction_delay_sec=hardware_config["suction_delay_from_stim_onset_sec"],
     )
+    reward_volume_tracker = RewardVolumeTracker(
+        hardware_config.get("reward_volume_ul_per_train"),
+        hardware_config.get("maximum_session_reward_ul"),
+        planned_reward_train_count(trials),
+    )
+    try:
+        reward_volume_tracker.preflight()
+    except RewardVolumeCapExceeded as exc:
+        print("REWARD SAFETY ERROR: %s" % exc, file=sys.stderr)
+        raise
     plan_summary = summarize_trial_plan(trials)
     planned_task_sec = estimate_task_seconds(trials)
     planned_total_sec = (
@@ -1797,8 +2013,10 @@ def main(argv=None):
         "hardware_config": hardware_config,
         "reward_train_duration_sec": reward_train_duration_sec,
         "reward_train_extends_into_iti": reward_train_duration_sec > POST_REWARD_STIM_SEC,
+        **reward_volume_tracker.summary(),
         "base_ttl_bcm23_used": False,
         "face_camera_requested": use_camera,
+        "camera_data_secured": not use_camera,
         "screen_resolution": list(base.SCREEN_RESOLUTION),
         "screen_background_gray": base.SCREEN_BACKGROUND_GRAY,
         "refresh_rate_hz": base.REFRESH_RATE_HZ,
@@ -1818,12 +2036,26 @@ def main(argv=None):
         "plan_summary": plan_summary,
     }
     atomic_write_json(metadata_path, metadata)
-    atomic_write_json(manifest_path, {"session_id": session_id, "mouse_id": mouse_id,
-        "protocol": metadata["protocol"], "session_output_schema_version": SESSION_OUTPUT_SCHEMA_VERSION,
-        "status": "preparing", "files": {"metadata": metadata_path.name, "planned_sequence": planned_sequence_path.name,
-        "image_assignment": selected_images_path.name, "plan_summary": plan_summary_path.name, "event_log": event_log_path.name,
-        "trial_summary": trial_summary_path.name, "lick_events": lick_events_path.name, "session_qc": qc_path.name,
-        "camera_event_log": camera_event_log_path.name if use_camera else ""}})
+    atomic_write_json(
+        manifest_path,
+        build_session_manifest(
+            session_root, session_id, mouse_id, metadata["protocol"],
+            "preparing", {
+                "metadata": metadata_path,
+                "planned_sequence": planned_sequence_path,
+                "image_assignment": selected_images_path,
+                "plan_summary": plan_summary_path,
+                "event_log": event_log_path,
+                "trial_summary": trial_summary_path,
+                "lick_events": lick_events_path,
+                "session_qc": qc_path,
+                "camera_event_log": camera_event_log_path if use_camera else None,
+                "video_manifest": (
+                    session_root / "video" / "video_manifest.json"
+                    if use_camera else None),
+            },
+        ),
+    )
 
     all_gpio_events = []
     runtime_by_trial = {}
@@ -1908,7 +2140,17 @@ def main(argv=None):
                 "Deliver one manual test reward before starting baselines",
                 default_yes=False,
             ):
-                command_id = gpio_client.manual_reward()
+                try:
+                    reward_volume_tracker.check_next_command(scheduled=False)
+                    command_id = gpio_client.manual_reward()
+                    reward_volume_tracker.record_dispatched(manual=True)
+                except RewardVolumeCapExceeded as exc:
+                    _record_reward_volume_block(
+                        event_log_path,
+                        {"phase": "manual_reward", "reward_trigger_source": "manual_test"},
+                        exc,
+                    )
+                    raise
                 append_event(
                     event_log_path,
                     exact_timestamp_event(
@@ -2040,6 +2282,7 @@ def main(argv=None):
                 status_callback=lambda done, total, remaining: status_reporter.report(format_operator_status("TASK",
                     (time.monotonic_ns() - gate_camera_anchor) / 1e9 if gate_camera_anchor else None,
                     remaining, done, total, post_background_min * 60.0)),
+                reward_volume_tracker=reward_volume_tracker,
             )
             metadata["task_end_monotonic_ns"] = time.monotonic_ns()
             metadata["task_elapsed_sec"] = (metadata["task_end_monotonic_ns"] - metadata["task_start_monotonic_ns"]) / 1e9
@@ -2137,10 +2380,6 @@ def main(argv=None):
                                 notes=json.dumps(convert_state, sort_keys=True),
                             ),
                         )
-                    if (camera_stop_confirmed
-                            and latest_camera_state.get("camera_raw_files_verified")
-                            and latest_camera_state.get("camera_mp4_verified")):
-                        print("VIDEO | camera data secured")
                 except Exception as exc:
                     camera_cleanup_error = True
                     camera_cleanup_error_message = "%s: %s" % (type(exc).__name__, exc)
@@ -2205,29 +2444,37 @@ def main(argv=None):
                 print("GPIO shutdown error: %s" % exc, file=sys.stderr)
                 cleanup_errors.append("gpio_shutdown: %s: %s" % (type(exc).__name__, exc))
 
+        camera_data_secured = derive_camera_data_secured(
+            use_camera,
+            latest_camera_state,
+            camera_cleanup_error,
+        )
+        if (use_camera and latest_camera_state.get("remote_raw_cleanup_error")
+                and not camera_cleanup_error):
+            cleanup_errors.append(
+                "camera_cleanup: %s"
+                % latest_camera_state.get("remote_raw_cleanup_error"))
         try:
             trial_summary = build_trial_summary(trials, runtime_by_trial, all_gpio_events)
             write_rows(trial_summary_path, trial_summary, TRIAL_SUMMARY_FIELDS)
             lick_rows = [event for event in all_gpio_events if event.get("event_type") in ("lick_onset", "lick_offset")]
             write_rows(lick_events_path, lick_rows, ["unix_time_ns", "monotonic_ns", "event_type", "phase", "trial_index", "trial_number", "block_number", "image_role", "image_filename", "reward_scheduled", "suction_scheduled"])
-            qc = build_session_qc(session_id, trials, trial_summary, all_gpio_events, hardware_config["reward_num_pulses"])
+            qc = build_session_qc(
+                session_id, trials, trial_summary, all_gpio_events,
+                hardware_config["reward_num_pulses"],
+                reward_volume_summary=reward_volume_tracker.summary(),
+                camera_data_secured=camera_data_secured,
+            )
             atomic_write_json(qc_path, qc)
             metadata["session_qc_json"] = str(qc_path)
         except Exception as exc:
             finalization_errors.append("session_artifacts: %s: %s" % (type(exc).__name__, exc))
 
         metadata["utc_iso_end"] = base.utc_iso_now()
-        camera_cleanup_required = bool(use_camera and camera_started)
-        camera_data_secured = (
-            not camera_cleanup_required
-            or (camera_stop_confirmed and camera_fetch_completed and camera_conversion_completed)
-        )
-        session_completed = bool(
-            task_completed and post_background_completed and camera_data_secured and not camera_cleanup_error
-        )
         metadata["task_completed"] = task_completed
         metadata["post_background_completed"] = post_background_completed
-        metadata["session_completed"] = session_completed
+        metadata["camera_data_secured"] = camera_data_secured
+        metadata.update(reward_volume_tracker.summary())
         if task_completed and post_background_completed:
             try:
                 validate_operational_timing_metadata(
@@ -2239,10 +2486,21 @@ def main(argv=None):
                 finalization_errors.append(
                     "operational_timing_metadata: %s: %s"
                     % (type(exc).__name__, exc))
+        session_completed = bool(
+            task_completed
+            and post_background_completed
+            and camera_data_secured
+            and primary_error is None
+            and not camera_cleanup_error
+            and not cleanup_errors
+            and not finalization_errors
+        )
+        metadata["session_completed"] = session_completed
         metadata["session_status"] = derive_session_status(
             task_completed, post_background_completed, interrupted, primary_error,
             use_camera, latest_camera_state, cleanup_errors, finalization_errors,
-            camera_cleanup_error=camera_cleanup_error)
+            camera_cleanup_error=camera_cleanup_error,
+            camera_data_secured=camera_data_secured)
         metadata.update(final_camera_metadata(
             latest_camera_state, use_camera, camera_started, camera_stop_confirmed,
             camera_fetch_completed, camera_conversion_completed))
@@ -2258,9 +2516,40 @@ def main(argv=None):
         metadata["n_gpio_events_logged"] = len(all_gpio_events)
         try:
             atomic_write_json(metadata_path, metadata)
-            update_session_manifest_status(manifest_path, metadata["session_status"])
         except Exception as exc:
             finalization_errors.append("metadata: %s: %s" % (type(exc).__name__, exc))
+        try:
+            atomic_write_json(
+                manifest_path,
+                build_session_manifest(
+                    session_root, session_id, mouse_id, metadata["protocol"],
+                    metadata["session_status"], {
+                        "metadata": metadata_path,
+                        "planned_sequence": planned_sequence_path,
+                        "image_assignment": selected_images_path,
+                        "plan_summary": plan_summary_path,
+                        "event_log": event_log_path,
+                        "trial_summary": trial_summary_path,
+                        "lick_events": lick_events_path,
+                        "session_qc": qc_path,
+                        "camera_event_log": camera_event_log_path if use_camera else None,
+                        "video_manifest": (
+                            session_root / "video" / "video_manifest.json"
+                            if use_camera else None),
+                    },
+                ),
+            )
+        except Exception as exc:
+            finalization_errors.append("manifest: %s: %s" % (type(exc).__name__, exc))
+
+        if use_camera and camera_started:
+            if camera_data_secured:
+                print("VIDEO | camera data secured")
+            elif (metadata["session_status"]
+                  == "protocol_complete_camera_cleanup_failed"):
+                print("VIDEO | camera cleanup failed; raw data retained when possible")
+            else:
+                print("VIDEO | camera data not yet secured; recovery pending")
 
         if session_completed:
             print("Session finished. Files are in: %s" % session_root)

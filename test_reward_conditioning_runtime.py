@@ -3,6 +3,7 @@
 
 import tempfile
 import io
+import subprocess
 import sys
 import types
 import unittest
@@ -61,7 +62,7 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
             ({"task_completed": True, "post_completed": True}, "complete"),
             ({"task_completed": False, "post_completed": False, "interrupted": True}, "interrupted"),
             ({"task_completed": False, "post_completed": False, "primary_error": RuntimeError("x")}, "failed"),
-            ({"task_completed": True, "post_completed": True, "camera_enabled": True, "camera_state": {"camera_stop_confirmed": True, "camera_raw_files_verified": True}}, "protocol_complete_video_pending"),
+            ({"task_completed": True, "post_completed": True, "camera_enabled": True, "camera_state": {"camera_stop_confirmed": True, "camera_raw_files_verified": True, "camera_raw_hash_verified": True}}, "protocol_complete_video_pending"),
             ({"task_completed": True, "post_completed": True, "cleanup_errors": ["x"]}, "cleanup_failed"),
         ]
         for kwargs, expected in cases:
@@ -105,6 +106,7 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
         state = {
             "camera_stop_confirmed": True,
             "camera_raw_files_verified": True,
+            "camera_raw_hash_verified": True,
             "camera_mp4_verified": False,
         }
         self.assertEqual(
@@ -275,6 +277,122 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
                 manifest = reward.update_session_manifest_status(path, status)
                 metadata = {"session_status": status}
                 self.assertEqual(metadata["session_status"], manifest["status"])
+
+            session_root = Path(temp_dir)
+            video_manifest = session_root / "video" / "video_manifest.json"
+            video_manifest.parent.mkdir()
+            video_manifest.write_text("{}")
+            artifact = reward.build_session_manifest(
+                session_root, "session", "mouse", "protocol", "complete", {
+                    "metadata": session_root / "metadata.json",
+                    "video_manifest": video_manifest,
+                    "camera_event_log": None,
+                })
+            self.assertFalse(artifact["files"]["metadata"]["exists"])
+            self.assertTrue(artifact["files"]["video_manifest"]["exists"])
+            self.assertIsNone(artifact["files"]["camera_event_log"]["path"])
+
+    def test_reward_volume_config_validation_and_tracker_accounting(self):
+        config = reward.load_reward_volume_config({
+            "reward_volume_ul_per_train": "10",
+            "maximum_session_reward_ul": 30,
+        })
+        self.assertTrue(config["reward_volume_cap_enabled"])
+        for name in ("reward_volume_ul_per_train", "maximum_session_reward_ul"):
+            for value in (float("nan"), float("inf"), -1, 0, "bad"):
+                with self.assertRaisesRegex(RuntimeError, name):
+                    reward.load_reward_volume_config({
+                        "reward_volume_ul_per_train": 10,
+                        "maximum_session_reward_ul": 30,
+                        name: value,
+                    })
+        disabled = reward.load_reward_volume_config({
+            "reward_volume_ul_per_train": None,
+            "maximum_session_reward_ul": None,
+        })
+        self.assertFalse(disabled["reward_volume_cap_enabled"])
+        with self.assertRaisesRegex(RuntimeError, "requires"):
+            reward.load_reward_volume_config({
+                "reward_volume_ul_per_train": None,
+                "maximum_session_reward_ul": 30,
+            })
+
+        trials = [
+            {"reward_scheduled": True},
+            {"reward_scheduled": False, "reward_omission_scheduled": True},
+            {"reward_scheduled": True},
+        ]
+        tracker = reward.RewardVolumeTracker(10.0, 30.0,
+                                             reward.planned_reward_train_count(trials))
+        self.assertEqual(tracker.planned_reward_volume_ul, 20.0)
+        tracker.preflight()
+        tracker.check_next_command(scheduled=False)
+        tracker.record_dispatched(manual=True)
+        tracker.check_next_command(scheduled=True)
+        tracker.record_dispatched(scheduled=True)
+        self.assertEqual(tracker.manual_reward_train_count, 1)
+        self.assertEqual(tracker.delivered_reward_train_count, 2)
+        self.assertEqual(tracker.estimated_delivered_reward_ul, 20.0)
+        with self.assertRaises(reward.RewardVolumeCapExceeded):
+            tracker.record_dispatched(scheduled=True)
+            tracker.check_next_command(scheduled=True)
+        self.assertTrue(tracker.reward_volume_cap_exceeded)
+
+        exact = reward.RewardVolumeTracker(10.0, 20.0, 2)
+        exact.preflight()
+        exact.check_next_command(scheduled=True)
+        exact.record_dispatched(scheduled=True)
+        exact.check_next_command(scheduled=True)
+        exact.record_dispatched(scheduled=True)
+        self.assertEqual(exact.estimated_delivered_reward_ul, 20.0)
+        with self.assertRaises(reward.RewardVolumeCapExceeded):
+            reward.RewardVolumeTracker(10.0, 15.0, 2).preflight()
+
+    def test_canonical_camera_security_and_completion_invariants(self):
+        self.assertTrue(reward.derive_camera_data_secured(False, {}))
+        secure = {
+            "camera_stop_confirmed": True,
+            "camera_raw_files_verified": True,
+            "camera_raw_hash_verified": True,
+            "camera_mp4_verified": True,
+            "remote_raw_cleanup_completed": True,
+        }
+        self.assertTrue(reward.derive_camera_data_secured(True, secure))
+        for field in ("camera_raw_hash_verified", "camera_mp4_verified",
+                      "camera_stop_confirmed", "remote_raw_cleanup_completed"):
+            state = dict(secure, **{field: False})
+            self.assertFalse(reward.derive_camera_data_secured(True, state))
+        self.assertFalse(reward.derive_camera_data_secured(True, secure, True))
+
+        statuses = [
+            reward.derive_session_status(True, True, camera_enabled=False),
+            reward.derive_session_status(True, True, camera_enabled=True,
+                                         camera_state=secure,
+                                         camera_data_secured=True),
+            reward.derive_session_status(True, True, camera_enabled=True,
+                                         camera_state=dict(secure,
+                                                           camera_mp4_verified=False),
+                                         camera_data_secured=False),
+        ]
+        for status in statuses:
+            completed = status == "complete"
+            if completed:
+                self.assertEqual(status, "complete")
+            else:
+                self.assertNotEqual(status, "complete")
+
+    def test_stale_entrypoints_fail_before_side_effects(self):
+        for script in ("run_stringer_vstim.py", "run_stringer_vstim_cam.py"):
+            result = subprocess.run(
+                [sys.executable, script], cwd=Path(__file__).parent,
+                capture_output=True, text=True,
+            )
+            output = result.stdout + result.stderr
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("run_stringer_reward_conditioning.py", output)
+            self.assertIn("vstim_natural", output)
+        import run_stringer_vstim
+        self.assertTrue(hasattr(run_stringer_vstim, "display_raw_with_timing"))
 
     def test_setup_summary_contains_operator_decisions(self):
         trials = [

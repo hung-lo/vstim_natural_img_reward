@@ -7,6 +7,18 @@ This keeps the original stimulus runner untouched while adding explicit
 remote camera start/stop control for the second Pi.
 """
 
+import sys
+
+if __name__ == "__main__":
+    print(
+        "This repository's supported experiment entrypoint is:\n\n"
+        "  python3 run_stringer_reward_conditioning.py\n\n"
+        "For the natural-image-only protocol use:\n"
+        "  https://github.com/hung-lo/vstim_natural",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
+
 import json
 import math
 import select
@@ -1414,8 +1426,11 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except Exception as exc:
-        print("ERROR: %s" % exc, file=sys.stderr)
-        raise
+    print(
+        "This repository's supported experiment entrypoint is:\n\n"
+        "  python3 run_stringer_reward_conditioning.py\n\n"
+        "For the natural-image-only protocol use:\n"
+        "  https://github.com/hung-lo/vstim_natural",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)

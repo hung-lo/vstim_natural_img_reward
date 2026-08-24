@@ -1,41 +1,37 @@
 
-# Raspberry Pi Stringer Natural-Image Visual Stimulus Script
+# Raspberry Pi Stringer Natural-Image Reward Conditioning
 
-This repo now uses the lab's `rpg` framebuffer path again, not pygame.
-That matters for the headless behavior Pi, because the screen is controlled
-directly from the Pi framebuffer rather than through a desktop/X11 session.
+This repository contains the open-loop natural-image reward-conditioning task
+using the lab's `rpg` framebuffer path. The screen is controlled directly from
+the headless behavior Pi rather than through a desktop/X11 session.
 
-Current entrypoints:
+The supported experiment entrypoint in this repository is:
 
 ```text
-run_stringer_vstim.py
-run_stringer_vstim_cam.py
 run_stringer_reward_conditioning.py
 ```
 
-What the runtime does:
+`run_stringer_vstim.py` and `run_stringer_vstim_cam.py` are retained only for
+imports used by the reward runner and refuse direct execution. Natural-image-only
+experiments are maintained at <https://github.com/hung-lo/vstim_natural>.
 
-- asks for mouse ID and optional session notes
-- asks for number of images and repeats, using the current defaults when you just press Enter
-- confirms the session settings and estimated playback time before starting
-- chooses a reproducible subset of Stringer center-crop PNGs
-- bakes session-specific `rpg` raw files at startup
-- displays each image fullscreen for a fixed duration
-- shows gray ITI between images
-- prints a terminal progress line with percent and ETA during playback
-- optionally bakes a photodiode patch into the frames
-- logs display-request timestamps for `stim_on` and `iti_on` while the photodiode remains the ground truth for physical onset
-- with the camera wrapper, keeps the monitor on the ITI-style gray frame while the camera is started and confirmed, records a pre-stimulus baseline while stimulus raws are prepared, then holds a black post-stimulus screen until you confirm the camera stop/fetch step
-- logs planned sequence, request timestamps, baseline metadata, and session metadata
+The supported runner:
+
+- asks for the mouse/session settings and shows a final setup summary
+- uses the fixed 14-image assignment and precomputed 90% reward schedule
+- displays each stimulus as a 1.0 s plus 0.5 s RPG sequence
+- triggers reward at the 1.0 s boundary, independent of licking
+- applies scheduled suction at its open-loop onset on rewarded and omitted cues
+- records licks, display timing, QC, camera archival state, and completion status
+- reports live WAITING/PRE/TASK/POST status with realized-ITI ETA
 
 ## Default timing
 
 The current default stimulus timing is:
 
-- image on-screen time: `0.5` seconds
-- ITI time: uniform `3.0–4.5` seconds after image offset
-- initial gray screen: `3.0` seconds
-- final gray screen: `3.0` seconds
+- image on-screen time: `1.5` seconds (`1.0 + 0.5` RPG segments)
+- ITI time: configured realized uniform sequence
+- PRE and POST gray backgrounds: configured independently
 
 ## Expected paths on the Pi
 
@@ -50,7 +46,7 @@ The script looks for the PNG folder in these places:
 Session output goes to:
 
 ```text
-/mnt/hd/<mouse_id>_<YYYYMMDDThhmmssZ>_vstim_natural/
+/mnt/hd/<mouse_id>_<YYYYMMDDThhmmssZ>_vstim_natural_reward_conditioning/
 ```
 
 ## Dependencies
@@ -89,32 +85,17 @@ SSH shell on the behavior Pi. Do not use X-forwarded sessions for this.
 
 ```bash
 cd ~/vstim_natural_img_reward
-python3 run_stringer_vstim.py
+python3 run_stringer_reward_conditioning.py
 ```
 
-If the basic framebuffer path looks good, try the smoke test:
+Before hardware use, run the GPIO-only safety smoke test:
 
 ```bash
 python3 fullscreen_test.py
 ```
 
-If you want camera recording plus automatic file transfer and conversion, use:
-
-```bash
-python3 run_stringer_vstim_cam.py
-```
-
-That wrapper now asks for a pre-stimulus camera baseline in minutes, then lets
-you type `y` and press Enter to start early after the camera process is alive
-and its session-specific `.h264` file is confirmed to be growing. The baseline
-clock starts from that output-growth confirmation. After the stimulus sequence
-finishes, it leaves the screen black until camera stop is verified by both the
-tracked PID and the session-specific acquisition-process check. The PID file is
-removed only after that verification, and the screen remains black during file
-transfer or while a failed transfer is being resolved.
-
-Keep `run_stringer_vstim.py` around as the plain no-camera runner and as the
-baseline path if you want to debug the display flow independently.
+Camera recording, transfer, conversion, and recovery are selected through the
+reward-conditioning runner's CLI or interactive prompts.
 
 ## Photodiode patch
 
@@ -133,7 +114,7 @@ The older pygame approach was a dead end for the headless behavior Pi.
 The rpg path is the one the lab code already uses for framebuffer display,
 and it is the right place to put this stimulus runner.
 
-## Reward-conditioning runner
+## Reward-conditioning runner (supported entrypoint)
 
 The new open-loop reward task lives in `run_stringer_reward_conditioning.py`.
 It uses the same `rpg` framebuffer path, but adds fixed-probability reward
@@ -145,6 +126,11 @@ Launch it from the repo root:
 cd ~/vstim_natural_img_reward
 python3 run_stringer_reward_conditioning.py
 ```
+
+This repository supports the reward-conditioning runner above. The copied
+natural-image-only runners are retained only as importable compatibility
+modules and refuse direct execution. For the natural-image-only protocol, use
+the maintained repository at <https://github.com/hung-lo/vstim_natural>.
 
 Before the first hardware run, copy the template config and fill in the
 already calibrated solenoid pulse width from the working Go/NoGo setup:
@@ -178,6 +164,12 @@ The main files there are:
 - `<session>_metadata.json`
 - `<session>_session_qc.json`
 - `raw_cache/` with the baked RPG raws
+
+When calibrated volume fields are supplied in the hardware config, the runner
+enforces `reward_volume_ul_per_train` and `maximum_session_reward_ul` before
+hardware starts, includes manual test rewards in the allowance, and records
+planned, delivered, and estimated reward volume in metadata/QC. Null values
+explicitly disable the volume cap and volume estimate.
 
 ### Operator flow and live status
 
