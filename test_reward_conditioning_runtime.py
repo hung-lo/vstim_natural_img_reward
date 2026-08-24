@@ -3,6 +3,7 @@
 
 import tempfile
 import io
+import json
 import subprocess
 import sys
 import types
@@ -348,6 +349,41 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
         with self.assertRaises(reward.RewardVolumeCapExceeded):
             reward.RewardVolumeTracker(10.0, 15.0, 2).preflight()
 
+    def test_main_planned_over_cap_aborts_before_session_or_hardware(self):
+        hardware = {
+            "reward_num_pulses": 1,
+            "reward_pulse_on_sec": 0.01,
+            "reward_pulse_off_sec": 0.0,
+            "suction_delay_from_stim_onset_sec": 3.5,
+            "suction_duration_sec": 0.05,
+            "reward_volume_ul_per_train": 10.0,
+            "maximum_session_reward_ul": 5.0,
+            "reward_volume_cap_enabled": True,
+        }
+        trials = [{"reward_scheduled": True}]
+        gpio_constructor = mock.Mock()
+        ensure_dir = mock.Mock()
+        with mock.patch.dict(sys.modules, {"rpg": types.ModuleType("rpg")}), \
+             mock.patch.object(reward.base, "print_environment"), \
+             mock.patch.object(reward, "load_hardware_config", return_value=hardware), \
+             mock.patch.object(reward.base, "resolve_image_dir", return_value=Path("images")), \
+             mock.patch.object(reward.base, "list_png_files", return_value=[Path("image.png")]), \
+             mock.patch.object(reward, "create_or_load_assignment",
+                               return_value=([{"image_filename": "image.png"}],
+                                             Path("assignment.json"), False, 1)), \
+             mock.patch.object(reward, "make_trial_plan", return_value=(trials, 2)), \
+             mock.patch.object(reward, "BehaviorGPIOClient", gpio_constructor), \
+             mock.patch.object(reward.base, "ensure_dir", ensure_dir):
+            with self.assertRaises(reward.RewardVolumeCapExceeded):
+                reward.main([
+                    "--no-camera", "--simulate-gpio", "--mouse-id", "mouse",
+                    "--session-notes", "test", "--blocks", "1",
+                    "--iti-min-sec", "3", "--iti-max-sec", "4",
+                    "--pre-background-min", "0", "--post-background-min", "0",
+                ])
+        gpio_constructor.assert_not_called()
+        ensure_dir.assert_not_called()
+
     def test_canonical_camera_security_and_completion_invariants(self):
         self.assertTrue(reward.derive_camera_data_secured(False, {}))
         secure = {
@@ -364,22 +400,96 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
             self.assertFalse(reward.derive_camera_data_secured(True, state))
         self.assertFalse(reward.derive_camera_data_secured(True, secure, True))
 
-        statuses = [
-            reward.derive_session_status(True, True, camera_enabled=False),
-            reward.derive_session_status(True, True, camera_enabled=True,
-                                         camera_state=secure,
-                                         camera_data_secured=True),
-            reward.derive_session_status(True, True, camera_enabled=True,
-                                         camera_state=dict(secure,
-                                                           camera_mp4_verified=False),
-                                         camera_data_secured=False),
+        cases = [
+            ({"task_completed": True, "post_background_completed": True},
+             True, "complete"),
+            ({"task_completed": True, "post_background_completed": True,
+              "camera_enabled": True, "camera_state": secure},
+             True, "complete"),
+            ({"task_completed": True, "post_background_completed": True,
+              "camera_enabled": True,
+              "camera_state": dict(secure, camera_mp4_verified=False,
+                                   remote_raw_cleanup_completed=False)},
+             False, "protocol_complete_video_pending"),
+            ({"task_completed": True, "post_background_completed": True,
+              "camera_enabled": True, "camera_state": secure,
+              "camera_cleanup_error": True},
+             False, "protocol_complete_camera_cleanup_failed"),
+            ({"task_completed": True, "post_background_completed": True,
+              "finalization_errors": ["manifest failed"]},
+             False, "cleanup_failed"),
+            ({"task_completed": False, "post_background_completed": False,
+              "primary_error": RuntimeError("primary")},
+             False, "failed"),
+            ({"task_completed": False, "post_background_completed": False,
+              "interrupted": True},
+             False, "interrupted"),
         ]
-        for status in statuses:
-            completed = status == "complete"
-            if completed:
-                self.assertEqual(status, "complete")
-            else:
-                self.assertNotEqual(status, "complete")
+        for kwargs, expected_completed, expected_status in cases:
+            state = reward.resolve_final_completion_state(**kwargs)
+            self.assertEqual(state["session_completed"], expected_completed)
+            self.assertEqual(state["session_status"], expected_status)
+            self.assertEqual(
+                state["session_completed"],
+                state["session_status"] == "complete")
+
+    def test_final_status_artifact_repair_pass(self):
+        completion = {
+            "task_completed": True,
+            "post_background_completed": True,
+            "camera_enabled": False,
+        }
+
+        def exercise(failing_name=None, primary_error=None):
+            with tempfile.TemporaryDirectory(prefix="final_status_") as temp_dir:
+                root = Path(temp_dir)
+                metadata_path = root / "metadata.json"
+                manifest_path = root / "session_manifest.json"
+                reward.atomic_write_json(metadata_path, {"session_status": "preparing"})
+                errors = []
+
+                def writer(path, payload):
+                    if Path(path).name == failing_name:
+                        raise OSError("injected %s failure" % failing_name)
+                    reward.atomic_write_json(path, payload)
+
+                inputs = dict(completion)
+                inputs["primary_error"] = primary_error
+                state = reward.finalize_status_artifacts(
+                    {"protocol": "protocol"}, metadata_path, manifest_path,
+                    root, "session", "mouse", "protocol",
+                    {"metadata": metadata_path}, inputs, [], errors,
+                    write_json_fn=writer)
+                metadata = json.loads(metadata_path.read_text())
+                manifest = (json.loads(manifest_path.read_text())
+                            if manifest_path.exists() else None)
+                return state, errors, metadata, manifest
+
+        clean, errors, metadata, manifest = exercise()
+        self.assertEqual(clean["session_status"], "complete")
+        self.assertTrue(clean["session_completed"])
+        self.assertEqual(errors, [])
+        self.assertEqual(metadata["session_status"], manifest["status"])
+
+        state, errors, metadata, manifest = exercise("session_manifest.json")
+        self.assertFalse(state["session_completed"])
+        self.assertEqual(metadata["session_status"], "cleanup_failed")
+        self.assertTrue(any("manifest:" in error for error in errors))
+        with self.assertRaises(RuntimeError):
+            reward.final_session_exit(None, False, [], errors)
+
+        state, errors, metadata, manifest = exercise("metadata.json")
+        self.assertEqual(state["session_status"], "cleanup_failed")
+        self.assertEqual(manifest["status"], "cleanup_failed")
+        self.assertTrue(manifest["files"]["metadata"]["exists"])
+
+        primary = RuntimeError("primary experiment failure")
+        state, errors, metadata, manifest = exercise(
+            "session_manifest.json", primary_error=primary)
+        self.assertEqual(state["session_status"], "failed")
+        self.assertEqual(metadata["session_status"], "failed")
+        with self.assertRaisesRegex(RuntimeError, "primary experiment failure"):
+            reward.final_session_exit(primary, False, [], errors)
 
     def test_stale_entrypoints_fail_before_side_effects(self):
         for script in ("run_stringer_vstim.py", "run_stringer_vstim_cam.py"):
@@ -733,6 +843,7 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
         gpio = FakeGPIOClient()
         gpio.trigger_reward = mock.Mock(side_effect=lambda context: calls.append("reward") or "reward_1")
         gpio.trigger_suction = mock.Mock(side_effect=lambda context: calls.append("suction") or "suction_1")
+        reward_tracker = reward.RewardVolumeTracker(10.0, 10.0, 1).preflight()
 
         def fake_wait(deadline, gpio_client, event_path, events, status_callback=None):
             calls.append("wait_with_status" if status_callback else "wait_without_status")
@@ -753,6 +864,7 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
                 status_callback=lambda done, total, remaining: (
                     calls.append("status"),
                     status_updates.append((done, total, remaining))),
+                reward_volume_tracker=reward_tracker,
             )
 
         self.assertEqual(calls[:4], ["segment1", "reward", "segment2", "background"])
@@ -762,6 +874,59 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
         self.assertLess(calls.index("wait_with_status"), calls.index("suction"))
         self.assertLess(calls.index("suction"), calls.index("verify_suction"))
         self.assertTrue(all(update[:2] == (1, 2) for update in status_updates))
+        self.assertEqual(reward_tracker.delivered_reward_train_count, 1)
+
+    def test_blocked_reward_transitions_to_gray_before_logging(self):
+        trial = {
+            "trial_index": 0, "trial_number": 1, "block_number": 1,
+            "image_role": "rewarded_high_1", "image_category": "conditioned",
+            "image_id": 1, "image_filename": "img.png",
+            "reward_eligible": True, "reward_scheduled": True,
+            "reward_omission_scheduled": False, "suction_scheduled": False,
+            "planned_iti_duration_sec": 4.0,
+        }
+        first = Path("first.raw")
+        second = Path("second.raw")
+        gray = Path("gray.loaded")
+        calls = []
+
+        def fake_display(screen, raw_path):
+            label = {first: "segment1", second: "segment2", gray: "safe_gray"}[raw_path]
+            calls.append(label)
+            base_ns = len(calls) * 1_000_000_000
+            return SimpleNamespace(start_time=0, mean_interframe=0,
+                                   stddev_interframe=0), {
+                "request_utc_iso": "iso", "request_unix_sec": "1.0",
+                "request_unix_ns": base_ns,
+                "request_perf_counter_ns": base_ns,
+                "return_unix_ns": base_ns + 1,
+                "return_perf_counter_ns": base_ns + 1,
+                "duration_sec": 0.001,
+            }
+
+        gpio = FakeGPIOClient()
+        gpio.trigger_reward = mock.Mock(return_value="must_not_send")
+        tracker = reward.RewardVolumeTracker(10.0, 10.0, 1).preflight()
+        tracker.record_dispatched(manual=True)
+
+        with mock.patch.object(reward.base, "display_raw_with_timing",
+                               side_effect=fake_display), \
+             mock.patch.object(reward, "append_event",
+                               side_effect=lambda *args, **kwargs: calls.append("event")):
+            with self.assertRaises(reward.RewardVolumeCapExceeded):
+                reward.run_trials(
+                    SimpleNamespace(), [trial],
+                    {"img.png": {"first": first, "second": second}}, gray,
+                    {"img.png": {"first": first, "second": second}},
+                    Path("gray.raw"), gpio, Path("events.csv"), [],
+                    6, 0.5, 3.5, 0.05,
+                    reward_volume_tracker=tracker)
+
+        self.assertEqual(calls[:2], ["segment1", "safe_gray"])
+        self.assertNotIn("segment2", calls)
+        self.assertGreaterEqual(calls.count("event"), 2)
+        self.assertGreater(calls.index("event"), calls.index("safe_gray"))
+        gpio.trigger_reward.assert_not_called()
 
 
 if __name__ == "__main__":

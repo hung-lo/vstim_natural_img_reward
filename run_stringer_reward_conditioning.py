@@ -452,6 +452,25 @@ def derive_camera_data_secured(camera_enabled, camera_state=None,
     )
 
 
+def resolve_final_completion_state(
+        task_completed, post_background_completed, interrupted=False,
+        primary_error=None, camera_enabled=False, camera_state=None,
+        camera_cleanup_error=False, cleanup_errors=None,
+        finalization_errors=None):
+    camera_data_secured = derive_camera_data_secured(
+        camera_enabled, camera_state, camera_cleanup_error)
+    session_status = derive_session_status(
+        task_completed, post_background_completed, interrupted, primary_error,
+        camera_enabled, camera_state, cleanup_errors, finalization_errors,
+        camera_cleanup_error=camera_cleanup_error,
+        camera_data_secured=camera_data_secured)
+    return {
+        "camera_data_secured": camera_data_secured,
+        "session_completed": session_status == "complete",
+        "session_status": session_status,
+    }
+
+
 def final_session_exit(primary_error, interrupted, cleanup_errors, finalization_errors,
                        camera_cleanup_error=False, camera_cleanup_error_message=""):
     """Return the final exit code or re-raise the authoritative failure."""
@@ -515,6 +534,68 @@ def build_session_manifest(session_root, session_id, mouse_id, protocol,
             for name, path in artifact_paths.items()
         },
     }
+
+
+def finalize_status_artifacts(
+        metadata, metadata_path, manifest_path, session_root, session_id,
+        mouse_id, protocol, artifact_paths, completion_inputs,
+        cleanup_errors, finalization_errors, write_json_fn=None):
+    """Write final metadata/manifest with one bounded consistency repair pass."""
+    writer = write_json_fn or atomic_write_json
+
+    def resolve_and_apply():
+        inputs = dict(completion_inputs)
+        inputs["cleanup_errors"] = cleanup_errors
+        inputs["finalization_errors"] = finalization_errors
+        state = resolve_final_completion_state(**inputs)
+        metadata.update(state)
+        metadata["cleanup_errors"] = list(cleanup_errors)
+        metadata["finalization_errors"] = list(finalization_errors)
+        return state
+
+    def manifest_payload(state):
+        return build_session_manifest(
+            session_root, session_id, mouse_id, protocol,
+            state["session_status"], artifact_paths)
+
+    state = resolve_and_apply()
+    metadata_ok = False
+    manifest_ok = False
+    try:
+        writer(metadata_path, metadata)
+        metadata_ok = True
+    except Exception as exc:
+        finalization_errors.append(
+            "metadata: %s: %s" % (type(exc).__name__, exc))
+        state = resolve_and_apply()
+
+    try:
+        writer(manifest_path, manifest_payload(state))
+        manifest_ok = True
+    except Exception as exc:
+        finalization_errors.append(
+            "manifest: %s: %s" % (type(exc).__name__, exc))
+        state = resolve_and_apply()
+
+    # One bounded repair pass updates whichever durable status artifact
+    # survived the first pass. There is deliberately no retry loop.
+    if metadata_ok and not manifest_ok:
+        try:
+            writer(metadata_path, metadata)
+        except Exception as exc:
+            finalization_errors.append(
+                "metadata_repair: %s: %s" % (type(exc).__name__, exc))
+    elif manifest_ok and not metadata_ok:
+        try:
+            writer(manifest_path, manifest_payload(state))
+        except Exception as exc:
+            finalization_errors.append(
+                "manifest_repair: %s: %s" % (type(exc).__name__, exc))
+
+    state = resolve_and_apply()
+    state["metadata_write_succeeded"] = metadata_ok
+    state["manifest_write_succeeded"] = manifest_ok
+    return state
 
 
 def validate_operational_timing_metadata(metadata, camera_required=False):
@@ -1115,6 +1196,46 @@ def run_trials(
                 if reward_volume_tracker is not None:
                     reward_volume_tracker.record_dispatched(scheduled=True)
             except RewardVolumeCapExceeded as exc:
+                # Exceptional safety path only: remove the stimulus before any
+                # file I/O or exception propagation. Normal reward timing does
+                # not enter this branch.
+                blocked_offset_monotonic_ns = time.monotonic_ns()
+                blocked_background_perf, blocked_background_timing = (
+                    base.display_raw_with_timing(screen, loaded_background_raw)
+                )
+                runtime["stim_presented"] = True
+                runtime["stim_segment1_return_unix_ns"] = first_timing["return_unix_ns"]
+                runtime["stim_offset_request_unix_ns"] = blocked_background_timing["request_unix_ns"]
+                runtime["stim_offset_monotonic_ns"] = blocked_offset_monotonic_ns
+
+                first_row = make_display_event(
+                    "stimulus_segment_1", trial, "first_1p0_sec",
+                    image_paths["first"], REWARD_DELAY_SEC,
+                    first_perf, first_timing)
+                first_row["notes"] = "partial_stimulus; reward_volume_cap_abort"
+                append_event(event_log_path, first_row)
+
+                blocked_offset_row = trial_context(trial, "stimulus")
+                blocked_offset_row.update({
+                    "utc_iso": blocked_background_timing["request_utc_iso"],
+                    "unix_time_utc_sec": blocked_background_timing["request_unix_sec"],
+                    "unix_time_ns": blocked_background_timing["request_unix_ns"],
+                    "monotonic_ns": blocked_background_timing["request_perf_counter_ns"],
+                    "event_type": "stimulus_offset_reward_volume_cap_abort",
+                    "segment_name": "gray_photodiode_off",
+                    "raw_path": str(background_raw_path),
+                    "planned_duration_sec": 0.0,
+                    "display_request_unix_ns": blocked_background_timing["request_unix_ns"],
+                    "display_return_unix_ns": blocked_background_timing["return_unix_ns"],
+                    "display_request_perf_counter_ns": blocked_background_timing["request_perf_counter_ns"],
+                    "display_return_perf_counter_ns": blocked_background_timing["return_perf_counter_ns"],
+                    "display_call_duration_sec": "%.9f" % blocked_background_timing["duration_sec"],
+                    "start_time_unix": getattr(blocked_background_perf, "start_time", ""),
+                    "mean_interframe_us": getattr(blocked_background_perf, "mean_interframe", ""),
+                    "stddev_interframe_us": getattr(blocked_background_perf, "stddev_interframe", ""),
+                    "notes": "segment_2_not_displayed; reward_command_not_sent",
+                })
+                append_event(event_log_path, blocked_offset_row)
                 _record_reward_volume_block(event_log_path, context, exc)
                 raise
         runtime["reward_command_id"] = reward_command_id
@@ -2444,16 +2565,16 @@ def main(argv=None):
                 print("GPIO shutdown error: %s" % exc, file=sys.stderr)
                 cleanup_errors.append("gpio_shutdown: %s: %s" % (type(exc).__name__, exc))
 
-        camera_data_secured = derive_camera_data_secured(
-            use_camera,
-            latest_camera_state,
-            camera_cleanup_error,
-        )
         if (use_camera and latest_camera_state.get("remote_raw_cleanup_error")
                 and not camera_cleanup_error):
             cleanup_errors.append(
                 "camera_cleanup: %s"
                 % latest_camera_state.get("remote_raw_cleanup_error"))
+        preliminary_completion = resolve_final_completion_state(
+            task_completed, post_background_completed, interrupted,
+            primary_error, use_camera, latest_camera_state,
+            camera_cleanup_error, cleanup_errors, finalization_errors)
+        camera_data_secured = preliminary_completion["camera_data_secured"]
         try:
             trial_summary = build_trial_summary(trials, runtime_by_trial, all_gpio_events)
             write_rows(trial_summary_path, trial_summary, TRIAL_SUMMARY_FIELDS)
@@ -2486,21 +2607,6 @@ def main(argv=None):
                 finalization_errors.append(
                     "operational_timing_metadata: %s: %s"
                     % (type(exc).__name__, exc))
-        session_completed = bool(
-            task_completed
-            and post_background_completed
-            and camera_data_secured
-            and primary_error is None
-            and not camera_cleanup_error
-            and not cleanup_errors
-            and not finalization_errors
-        )
-        metadata["session_completed"] = session_completed
-        metadata["session_status"] = derive_session_status(
-            task_completed, post_background_completed, interrupted, primary_error,
-            use_camera, latest_camera_state, cleanup_errors, finalization_errors,
-            camera_cleanup_error=camera_cleanup_error,
-            camera_data_secured=camera_data_secured)
         metadata.update(final_camera_metadata(
             latest_camera_state, use_camera, camera_started, camera_stop_confirmed,
             camera_fetch_completed, camera_conversion_completed))
@@ -2514,33 +2620,32 @@ def main(argv=None):
         metadata["cleanup_errors"] = cleanup_errors
         metadata["finalization_errors"] = finalization_errors
         metadata["n_gpio_events_logged"] = len(all_gpio_events)
-        try:
-            atomic_write_json(metadata_path, metadata)
-        except Exception as exc:
-            finalization_errors.append("metadata: %s: %s" % (type(exc).__name__, exc))
-        try:
-            atomic_write_json(
-                manifest_path,
-                build_session_manifest(
-                    session_root, session_id, mouse_id, metadata["protocol"],
-                    metadata["session_status"], {
-                        "metadata": metadata_path,
-                        "planned_sequence": planned_sequence_path,
-                        "image_assignment": selected_images_path,
-                        "plan_summary": plan_summary_path,
-                        "event_log": event_log_path,
-                        "trial_summary": trial_summary_path,
-                        "lick_events": lick_events_path,
-                        "session_qc": qc_path,
-                        "camera_event_log": camera_event_log_path if use_camera else None,
-                        "video_manifest": (
-                            session_root / "video" / "video_manifest.json"
-                            if use_camera else None),
-                    },
-                ),
-            )
-        except Exception as exc:
-            finalization_errors.append("manifest: %s: %s" % (type(exc).__name__, exc))
+        completion_state = finalize_status_artifacts(
+            metadata, metadata_path, manifest_path, session_root,
+            session_id, mouse_id, metadata["protocol"], {
+                "metadata": metadata_path,
+                "planned_sequence": planned_sequence_path,
+                "image_assignment": selected_images_path,
+                "plan_summary": plan_summary_path,
+                "event_log": event_log_path,
+                "trial_summary": trial_summary_path,
+                "lick_events": lick_events_path,
+                "session_qc": qc_path,
+                "camera_event_log": camera_event_log_path if use_camera else None,
+                "video_manifest": (
+                    session_root / "video" / "video_manifest.json"
+                    if use_camera else None),
+            }, {
+                "task_completed": task_completed,
+                "post_background_completed": post_background_completed,
+                "interrupted": interrupted,
+                "primary_error": primary_error,
+                "camera_enabled": use_camera,
+                "camera_state": latest_camera_state,
+                "camera_cleanup_error": camera_cleanup_error,
+            }, cleanup_errors, finalization_errors)
+        camera_data_secured = completion_state["camera_data_secured"]
+        session_completed = completion_state["session_completed"]
 
         if use_camera and camera_started:
             if camera_data_secured:
