@@ -147,6 +147,12 @@ Persistent assignments are saved under `/mnt/hd/vstim_reward_assignments/`:
 - `_global_reward_conditioning_14_image_panel.json` for the cohort-wide image panel
 - `<mouse_id>_reward_conditioning_assignment.json` for the per-mouse role mapping
 
+These are persistent longitudinal protocol files. They are created atomically
+under a filesystem lock and reused on future sessions. Do not delete or
+manually edit them after training or data collection begins. `force_new=True`
+is an explicit exceptional operation for deliberately replacing a mouse's
+assignment; it does not replace the cohort-wide panel.
+
 Session output is written under:
 
 ```text

@@ -19,10 +19,14 @@ The intended protocol has 14 images:
 
 from __future__ import print_function
 
+import fcntl
 import hashlib
 import json
 import math
+import os
 import random
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
 
@@ -32,6 +36,7 @@ DEFAULT_GLOBAL_PANEL_SEED = 777
 DEFAULT_ASSIGNMENT_MASTER_SEED = 20260804
 DEFAULT_SEQUENCE_MASTER_SEED = 20260805
 GLOBAL_PANEL_FILENAME = "_global_reward_conditioning_14_image_panel.json"
+ASSIGNMENT_LOCK_FILENAME = ".reward_conditioning_assignments.lock"
 
 # Protocol version 1 deliberately fixes this schedule. Do not expose it as
 # an operator prompt, command-line option, or hardware-configuration field.
@@ -102,38 +107,105 @@ def global_panel_path(assignment_dir):
     return Path(assignment_dir) / GLOBAL_PANEL_FILENAME
 
 
-def create_or_load_global_panel(
+@contextmanager
+def assignment_directory_lock(assignment_dir):
+    """Exclusively lock persistent panel/assignment operations in one directory."""
+    assignment_dir = Path(assignment_dir)
+    assignment_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = assignment_dir / ASSIGNMENT_LOCK_FILENAME
+    with lock_path.open("a+") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield lock_path
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def atomic_write_json(path, payload):
+    """Atomically install complete JSON and clean up an unpromoted temp file."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    serialized = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=str(path.parent),
+            prefix="." + path.name + ".",
+            suffix=".tmp",
+            delete=False,
+        ) as temp_file:
+            temp_path = Path(temp_file.name)
+            temp_file.write(serialized)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+
+        os.replace(str(temp_path), str(path))
+        temp_path = None
+
+        # The rename is the core atomicity guarantee. Directory fsync improves
+        # crash durability but is not supported by every mounted filesystem.
+        try:
+            directory_fd = os.open(str(path.parent), os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            pass
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+
+
+def _load_authoritative_json(path, description):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise RuntimeError(
+            "Could not load valid JSON from authoritative %s %s: %s"
+            % (description, path, error)
+        )
+
+
+def _validate_global_panel_payload(payload, available_by_name, path):
+    if not isinstance(payload, dict):
+        raise RuntimeError("Global panel %s must contain a JSON object." % path)
+    if payload.get("schema_version") != PANEL_SCHEMA_VERSION:
+        raise RuntimeError(
+            "Unsupported global panel schema in %s: %r"
+            % (path, payload.get("schema_version"))
+        )
+    filenames = list(payload.get("image_filenames", []))
+    if len(filenames) != len(ALL_ROLES) or len(set(filenames)) != len(filenames):
+        raise RuntimeError("Global panel must contain 14 unique image filenames.")
+    missing = [name for name in filenames if name not in available_by_name]
+    if missing:
+        raise RuntimeError(
+            "Global panel refers to missing image files: %s"
+            % ", ".join(sorted(missing))
+        )
+    return filenames
+
+
+def _create_or_load_global_panel_unlocked(
     available_image_files,
     assignment_dir,
     panel_seed=DEFAULT_GLOBAL_PANEL_SEED,
 ):
-    """Create or load one shared 14-image panel for the entire cohort.
-
-    Using the same image identities across mice improves cross-animal comparison.
-    Image-to-role mappings are still independently counterbalanced per mouse.
-    """
+    """Create/load the cohort panel while the caller holds the directory lock."""
     available_image_files = sorted(Path(path) for path in available_image_files)
     available_by_name = {path.name: path for path in available_image_files}
     assignment_dir = Path(assignment_dir)
-    assignment_dir.mkdir(parents=True, exist_ok=True)
     path = global_panel_path(assignment_dir)
 
     if path.exists():
-        payload = json.loads(path.read_text())
-        if payload.get("schema_version") != PANEL_SCHEMA_VERSION:
-            raise RuntimeError(
-                "Unsupported global panel schema in %s: %r"
-                % (path, payload.get("schema_version"))
-            )
-        filenames = list(payload.get("image_filenames", []))
-        if len(filenames) != len(ALL_ROLES) or len(set(filenames)) != len(filenames):
-            raise RuntimeError("Global panel must contain 14 unique image filenames.")
-        missing = [name for name in filenames if name not in available_by_name]
-        if missing:
-            raise RuntimeError(
-                "Global panel refers to missing image files: %s"
-                % ", ".join(sorted(missing))
-            )
+        payload = _load_authoritative_json(path, "global panel")
+        filenames = _validate_global_panel_payload(payload, available_by_name, path)
         return [available_by_name[name] for name in filenames], path, False
 
     if len(available_image_files) < len(ALL_ROLES):
@@ -152,8 +224,29 @@ def create_or_load_global_panel(
             "begins. Per-mouse files assign these images to protocol roles."
         ),
     }
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    _validate_global_panel_payload(payload, available_by_name, path)
+    atomic_write_json(path, payload)
     return selected, path, True
+
+
+def create_or_load_global_panel(
+    available_image_files,
+    assignment_dir,
+    panel_seed=DEFAULT_GLOBAL_PANEL_SEED,
+):
+    """Create or load one shared 14-image panel for the entire cohort.
+
+    Using the same image identities across mice improves cross-animal comparison.
+    Image-to-role mappings are still independently counterbalanced per mouse.
+    """
+    available_image_files = sorted(Path(path) for path in available_image_files)
+    assignment_dir = Path(assignment_dir)
+    with assignment_directory_lock(assignment_dir):
+        return _create_or_load_global_panel_unlocked(
+            available_image_files,
+            assignment_dir,
+            panel_seed=panel_seed,
+        )
 
 
 def _resolve_assignment_images(payload, available_image_files):
@@ -161,7 +254,12 @@ def _resolve_assignment_images(payload, available_image_files):
     available_by_name = {Path(path).name: Path(path) for path in available_image_files}
     resolved_rows = []
     missing = []
-    for saved_row in payload.get("images", []):
+    saved_rows = payload.get("images", [])
+    if not isinstance(saved_rows, list):
+        raise RuntimeError("Saved assignment images must be a JSON list.")
+    for saved_row in saved_rows:
+        if not isinstance(saved_row, dict) or "image_filename" not in saved_row:
+            raise RuntimeError("Saved assignment contains an invalid image row.")
         filename = saved_row["image_filename"]
         if filename not in available_by_name:
             missing.append(filename)
@@ -174,6 +272,36 @@ def _resolve_assignment_images(payload, available_image_files):
             "The saved assignment refers to missing image files: %s" % ", ".join(sorted(missing))
         )
     return resolved_rows
+
+
+def _validate_assignment_payload(
+    payload,
+    expected_mouse_id,
+    available_image_files,
+    assignment_path,
+    panel_filenames=None,
+):
+    if not isinstance(payload, dict):
+        raise RuntimeError("Assignment %s must contain a JSON object." % assignment_path)
+    if payload.get("schema_version") != ASSIGNMENT_SCHEMA_VERSION:
+        raise RuntimeError(
+            "Unsupported assignment schema in %s: %r"
+            % (assignment_path, payload.get("schema_version"))
+        )
+    if payload.get("mouse_id") != expected_mouse_id:
+        raise RuntimeError(
+            "Assignment mouse mismatch: expected %s, found %s"
+            % (expected_mouse_id, payload.get("mouse_id"))
+        )
+    rows = _resolve_assignment_images(payload, available_image_files)
+    validate_assignment_rows(rows)
+    if panel_filenames is not None:
+        assignment_filenames = {row["image_filename"] for row in rows}
+        if assignment_filenames != set(panel_filenames):
+            raise RuntimeError(
+                "Generated assignment filenames do not match the global panel."
+            )
+    return rows
 
 
 def create_or_load_assignment(
@@ -199,64 +327,70 @@ def create_or_load_assignment(
         )
 
     assignment_dir = Path(assignment_dir)
-    assignment_dir.mkdir(parents=True, exist_ok=True)
-    assignment_path = assignment_path_for_mouse(assignment_dir, mouse_id)
+    with assignment_directory_lock(assignment_dir):
+        assignment_path = assignment_path_for_mouse(assignment_dir, mouse_id)
 
-    if assignment_path.exists() and not force_new:
-        payload = json.loads(assignment_path.read_text())
-        if payload.get("schema_version") != ASSIGNMENT_SCHEMA_VERSION:
-            raise RuntimeError(
-                "Unsupported assignment schema in %s: %r"
-                % (assignment_path, payload.get("schema_version"))
+        if assignment_path.exists() and not force_new:
+            payload = _load_authoritative_json(assignment_path, "mouse assignment")
+            rows = _validate_assignment_payload(
+                payload,
+                mouse_id,
+                available_image_files,
+                assignment_path,
             )
-        if payload.get("mouse_id") != mouse_id:
-            raise RuntimeError(
-                "Assignment mouse mismatch: expected %s, found %s"
-                % (mouse_id, payload.get("mouse_id"))
+            return rows, assignment_path, False, payload.get("resolved_assignment_seed")
+
+        panel_files, panel_path, panel_created = (
+            _create_or_load_global_panel_unlocked(
+                available_image_files,
+                assignment_dir,
+                panel_seed=panel_seed,
             )
-        rows = _resolve_assignment_images(payload, available_image_files)
-        validate_assignment_rows(rows)
-        return rows, assignment_path, False, payload.get("resolved_assignment_seed")
-
-    panel_files, panel_path, panel_created = create_or_load_global_panel(
-        available_image_files,
-        assignment_dir,
-        panel_seed=panel_seed,
-    )
-    resolved_seed = stable_seed("reward-conditioning-role-assignment", master_seed, mouse_id)
-    rng = random.Random(resolved_seed)
-    role_ordered_files = list(panel_files)
-    rng.shuffle(role_ordered_files)
-
-    rows = []
-    for role, path in zip(ALL_ROLES, role_ordered_files):
-        row = _role_metadata(role)
-        row.update(
-            {
-                "image_filename": path.name,
-                "image_path": str(path),
-                "image_id": _parse_image_id(path),
-            }
         )
-        rows.append(row)
+        resolved_seed = stable_seed(
+            "reward-conditioning-role-assignment", master_seed, mouse_id
+        )
+        rng = random.Random(resolved_seed)
+        role_ordered_files = list(panel_files)
+        rng.shuffle(role_ordered_files)
 
-    validate_assignment_rows(rows)
-    payload = {
-        "schema_version": ASSIGNMENT_SCHEMA_VERSION,
-        "mouse_id": mouse_id,
-        "assignment_master_seed": int(master_seed),
-        "resolved_assignment_seed": int(resolved_seed),
-        "global_panel_seed": int(panel_seed),
-        "global_panel_path": str(panel_path),
-        "global_panel_created_with_this_assignment": bool(panel_created),
-        "images": rows,
-        "notes": (
-            "This file fixes image identities and roles for longitudinal use. "
-            "Do not delete or regenerate it after training begins."
-        ),
-    }
-    assignment_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-    return rows, assignment_path, True, resolved_seed
+        rows = []
+        for role, path in zip(ALL_ROLES, role_ordered_files):
+            row = _role_metadata(role)
+            row.update(
+                {
+                    "image_filename": path.name,
+                    "image_path": str(path),
+                    "image_id": _parse_image_id(path),
+                }
+            )
+            rows.append(row)
+
+        validate_assignment_rows(rows)
+        panel_filenames = {path.name for path in panel_files}
+        payload = {
+            "schema_version": ASSIGNMENT_SCHEMA_VERSION,
+            "mouse_id": mouse_id,
+            "assignment_master_seed": int(master_seed),
+            "resolved_assignment_seed": int(resolved_seed),
+            "global_panel_seed": int(panel_seed),
+            "global_panel_path": str(panel_path),
+            "global_panel_created_with_this_assignment": bool(panel_created),
+            "images": rows,
+            "notes": (
+                "This file fixes image identities and roles for longitudinal use. "
+                "Do not delete or regenerate it after training begins."
+            ),
+        }
+        _validate_assignment_payload(
+            payload,
+            mouse_id,
+            available_image_files,
+            assignment_path,
+            panel_filenames=panel_filenames,
+        )
+        atomic_write_json(assignment_path, payload)
+        return rows, assignment_path, True, resolved_seed
 
 
 def validate_assignment_rows(rows):
