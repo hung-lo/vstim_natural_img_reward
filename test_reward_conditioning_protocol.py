@@ -188,20 +188,127 @@ class RewardConditioningProtocolTests(unittest.TestCase):
             )
         )
         first_bytes = assignment_path.read_bytes()
+        panel_path = protocol.global_panel_path(self.temp_dir)
+        panel_bytes = panel_path.read_bytes()
 
-        rows_2, _, created_2, seed_2 = protocol.create_or_load_assignment(
-            "MOUSE_FIXED",
-            list(reversed(self.images)),
-            self.temp_dir,
-            master_seed=999,
-            panel_seed=888,
-        )
+        with mock.patch.object(protocol, "atomic_write_json") as atomic_write:
+            rows_2, _, created_2, seed_2 = protocol.create_or_load_assignment(
+                "MOUSE_FIXED",
+                list(reversed(self.images)),
+                self.temp_dir,
+                master_seed=999,
+                panel_seed=888,
+            )
 
         self.assertTrue(created_1)
         self.assertFalse(created_2)
         self.assertEqual(self.assignment_mapping(rows_1), self.assignment_mapping(rows_2))
         self.assertEqual(seed_1, seed_2)
         self.assertEqual(assignment_path.read_bytes(), first_bytes)
+        self.assertEqual(panel_path.read_bytes(), panel_bytes)
+        atomic_write.assert_not_called()
+
+    def test_saved_assignment_with_off_panel_image_is_rejected(self):
+        _, assignment_path, _, _ = protocol.create_or_load_assignment(
+            "MOUSE_OFF_PANEL", self.images, self.temp_dir
+        )
+        panel_path = protocol.global_panel_path(self.temp_dir)
+        panel_payload = json.loads(panel_path.read_text(encoding="utf-8"))
+        assignment_payload = json.loads(
+            assignment_path.read_text(encoding="utf-8")
+        )
+        replacement = next(
+            path
+            for path in self.images
+            if path.name not in set(panel_payload["image_filenames"])
+        )
+        assignment_payload["images"][0]["image_filename"] = replacement.name
+        assignment_payload["images"][0]["image_path"] = str(replacement)
+        protocol.atomic_write_json(assignment_path, assignment_payload)
+        altered_assignment_bytes = assignment_path.read_bytes()
+        panel_bytes = panel_path.read_bytes()
+
+        with self.assertRaisesRegex(RuntimeError, "do not match"):
+            protocol.create_or_load_assignment(
+                "MOUSE_OFF_PANEL", self.images, self.temp_dir
+            )
+
+        self.assertEqual(assignment_path.read_bytes(), altered_assignment_bytes)
+        self.assertEqual(panel_path.read_bytes(), panel_bytes)
+
+    def test_assignment_panel_provenance_is_checked_migration_safely(self):
+        _, assignment_path, _, _ = protocol.create_or_load_assignment(
+            "MOUSE_PROVENANCE", self.images, self.temp_dir
+        )
+        payload = json.loads(assignment_path.read_text(encoding="utf-8"))
+        authoritative_seed = payload["global_panel_seed"]
+        payload["global_panel_path"] = str(
+            Path("/previous/assignment/location") / protocol.GLOBAL_PANEL_FILENAME
+        )
+        protocol.atomic_write_json(assignment_path, payload)
+
+        with mock.patch.object(protocol, "atomic_write_json") as atomic_write:
+            _, _, created, _ = protocol.create_or_load_assignment(
+                "MOUSE_PROVENANCE", self.images, self.temp_dir
+            )
+        self.assertFalse(created)
+        atomic_write.assert_not_called()
+
+        payload["global_panel_seed"] = authoritative_seed + 1
+        protocol.atomic_write_json(assignment_path, payload)
+        mismatched_seed_bytes = assignment_path.read_bytes()
+        with self.assertRaisesRegex(RuntimeError, "seed"):
+            protocol.create_or_load_assignment(
+                "MOUSE_PROVENANCE", self.images, self.temp_dir
+            )
+        self.assertEqual(assignment_path.read_bytes(), mismatched_seed_bytes)
+
+        payload["global_panel_seed"] = authoritative_seed
+        payload["global_panel_path"] = "/previous/location/wrong_panel.json"
+        protocol.atomic_write_json(assignment_path, payload)
+        mismatched_path_bytes = assignment_path.read_bytes()
+        with self.assertRaisesRegex(RuntimeError, "panel path"):
+            protocol.create_or_load_assignment(
+                "MOUSE_PROVENANCE", self.images, self.temp_dir
+            )
+        self.assertEqual(assignment_path.read_bytes(), mismatched_path_bytes)
+
+    def test_existing_assignment_with_missing_panel_fails_without_repair(self):
+        _, assignment_path, _, _ = protocol.create_or_load_assignment(
+            "MOUSE_ORPHAN", self.images, self.temp_dir
+        )
+        assignment_bytes = assignment_path.read_bytes()
+        panel_path = protocol.global_panel_path(self.temp_dir)
+        panel_path.unlink()
+
+        with self.assertRaisesRegex(RuntimeError, "global panel is missing"):
+            protocol.create_or_load_assignment(
+                "MOUSE_ORPHAN", self.images, self.temp_dir
+            )
+
+        self.assertFalse(panel_path.exists())
+        self.assertEqual(assignment_path.read_bytes(), assignment_bytes)
+
+    def test_orphaned_assignment_blocks_new_mouse_and_direct_panel_creation(self):
+        _, assignment_path, _, _ = protocol.create_or_load_assignment(
+            "MOUSE_A", self.images, self.temp_dir
+        )
+        assignment_bytes = assignment_path.read_bytes()
+        panel_path = protocol.global_panel_path(self.temp_dir)
+        panel_path.unlink()
+
+        with self.assertRaisesRegex(RuntimeError, "Refusing to regenerate"):
+            protocol.create_or_load_global_panel(self.images, self.temp_dir)
+        with self.assertRaisesRegex(RuntimeError, "Refusing to regenerate"):
+            protocol.create_or_load_assignment(
+                "MOUSE_B", self.images, self.temp_dir
+            )
+
+        self.assertFalse(panel_path.exists())
+        self.assertFalse(
+            protocol.assignment_path_for_mouse(self.temp_dir, "MOUSE_B").exists()
+        )
+        self.assertEqual(assignment_path.read_bytes(), assignment_bytes)
 
     def test_corrupt_or_incompatible_panel_fails_without_replacement(self):
         for case_name, bad_bytes in (
@@ -212,6 +319,30 @@ class RewardConditioningProtocolTests(unittest.TestCase):
             case_dir.mkdir()
             panel_path = protocol.global_panel_path(case_dir)
             panel_path.write_bytes(bad_bytes)
+            with self.subTest(case=case_name):
+                with self.assertRaises(RuntimeError):
+                    protocol.create_or_load_global_panel(self.images, case_dir)
+                self.assertEqual(panel_path.read_bytes(), bad_bytes)
+
+    def test_global_panel_requires_integer_seed_metadata(self):
+        for case_name, bad_seed in (
+            ("missing_seed", None),
+            ("string_seed", "not-an-integer"),
+            ("float_seed", 7.5),
+            ("boolean_seed", True),
+        ):
+            case_dir = self.temp_dir / case_name
+            _, panel_path, _ = protocol.create_or_load_global_panel(
+                self.images, case_dir
+            )
+            payload = json.loads(panel_path.read_text(encoding="utf-8"))
+            if bad_seed is None:
+                del payload["panel_seed"]
+            else:
+                payload["panel_seed"] = bad_seed
+            protocol.atomic_write_json(panel_path, payload)
+            bad_bytes = panel_path.read_bytes()
+
             with self.subTest(case=case_name):
                 with self.assertRaises(RuntimeError):
                     protocol.create_or_load_global_panel(self.images, case_dir)
@@ -272,6 +403,9 @@ class RewardConditioningProtocolTests(unittest.TestCase):
             "MOUSE_FORCE", self.images, self.temp_dir, master_seed=111
         )
         original_bytes = assignment_path.read_bytes()
+        panel_path = protocol.global_panel_path(self.temp_dir)
+        panel_bytes = panel_path.read_bytes()
+        panel_payload = json.loads(panel_bytes.decode("utf-8"))
         original_atomic_write = protocol.atomic_write_json
 
         with mock.patch.object(
@@ -288,6 +422,7 @@ class RewardConditioningProtocolTests(unittest.TestCase):
                 self.images,
                 self.temp_dir,
                 master_seed=222,
+                panel_seed=987654,
                 force_new=True,
             )
             self.assertTrue(created)
@@ -295,6 +430,17 @@ class RewardConditioningProtocolTests(unittest.TestCase):
             self.assertEqual(Path(atomic_write.call_args[0][0]), assignment_path)
 
         self.assertNotEqual(assignment_path.read_bytes(), original_bytes)
+        self.assertEqual(panel_path.read_bytes(), panel_bytes)
+        replacement_payload = json.loads(
+            assignment_path.read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            {row["image_filename"] for row in replacement_payload["images"]},
+            set(panel_payload["image_filenames"]),
+        )
+        self.assertEqual(
+            replacement_payload["global_panel_seed"], panel_payload["panel_seed"]
+        )
 
     def test_failed_force_new_preserves_previous_assignment(self):
         rows, assignment_path, _, old_seed = protocol.create_or_load_assignment(
@@ -322,6 +468,38 @@ class RewardConditioningProtocolTests(unittest.TestCase):
         self.assertEqual(self.assignment_mapping(loaded_rows), self.assignment_mapping(rows))
         self.assertEqual(loaded_seed, old_seed)
         self.assert_no_json_temps()
+
+    def test_missing_or_corrupt_panel_blocks_force_new_assignment(self):
+        for case_name in ("missing", "corrupt"):
+            case_dir = self.temp_dir / ("force_new_" + case_name)
+            _, assignment_path, _, _ = protocol.create_or_load_assignment(
+                "MOUSE_FORCE_BLOCKED", self.images, case_dir
+            )
+            assignment_bytes = assignment_path.read_bytes()
+            panel_path = protocol.global_panel_path(case_dir)
+            if case_name == "missing":
+                panel_path.unlink()
+                expected_panel_bytes = None
+            else:
+                panel_path.write_bytes(b"not-json\n")
+                expected_panel_bytes = panel_path.read_bytes()
+
+            with self.subTest(case=case_name):
+                with mock.patch.object(protocol, "atomic_write_json") as atomic_write:
+                    with self.assertRaises(RuntimeError):
+                        protocol.create_or_load_assignment(
+                            "MOUSE_FORCE_BLOCKED",
+                            self.images,
+                            case_dir,
+                            master_seed=999,
+                            force_new=True,
+                        )
+                    atomic_write.assert_not_called()
+                self.assertEqual(assignment_path.read_bytes(), assignment_bytes)
+                if expected_panel_bytes is None:
+                    self.assertFalse(panel_path.exists())
+                else:
+                    self.assertEqual(panel_path.read_bytes(), expected_panel_bytes)
 
     def test_assignment_directory_lock_releases_after_exception(self):
         with self.assertRaisesRegex(RuntimeError, "synthetic lock failure"):
