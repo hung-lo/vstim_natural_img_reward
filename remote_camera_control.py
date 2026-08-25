@@ -80,6 +80,7 @@ CONTROLLER_REPOSITORY = "vstim_natural_img_reward"
 PROTOCOL_NAME = "open_loop_natural_image_reward_conditioning"
 
 CAMERA_FRAMERATE = 30
+CAMERA_EVENT_LOG_FILENAME = "camera_control_events.csv"
 JSON_RESULT_PREFIX = "CAMERA_CONTROL_RESULT_JSON="
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -863,7 +864,7 @@ def run_camera_conversion_workflow(camera_host, local_video_dir, framerate=CAMER
 
 def append_event(local_video_dir, event, details=None):
     local_video_dir.mkdir(parents=True, exist_ok=True)
-    path = local_video_dir / "camera_control_events.csv"
+    path = local_video_dir / CAMERA_EVENT_LOG_FILENAME
     exists = path.exists()
 
     fieldnames = ["unix_time_utc_sec", "iso_time_utc", "event", "details_json"]

@@ -39,6 +39,7 @@ from pathlib import Path
 import run_stringer_vstim as base
 
 from reward_conditioning_gpio import BehaviorGPIOClient
+from remote_camera_control import CAMERA_EVENT_LOG_FILENAME
 from reward_conditioning_protocol import (
     ALL_ROLES,
     REWARDED_HIGH_ROLES,
@@ -486,10 +487,17 @@ def final_session_exit(primary_error, interrupted, cleanup_errors, finalization_
     return 0
 
 
-def camera_elapsed_from_ns(recording_request_ns, stop_confirmed_ns):
-    if recording_request_ns is None or stop_confirmed_ns is None:
+def camera_elapsed_from_ns(recording_confirmed_ns, stop_confirmed_ns):
+    if recording_confirmed_ns is None or stop_confirmed_ns is None:
         return None
-    return max(0.0, (int(stop_confirmed_ns) - int(recording_request_ns)) / 1e9)
+    return max(0.0, (int(stop_confirmed_ns) - int(recording_confirmed_ns)) / 1e9)
+
+
+def camera_startup_confirmation_latency_from_ns(
+        recording_request_ns, recording_confirmed_ns):
+    if recording_request_ns is None or recording_confirmed_ns is None:
+        return None
+    return max(0.0, (int(recording_confirmed_ns) - int(recording_request_ns)) / 1e9)
 
 
 def resolve_camera_choice(camera_requested, no_camera_requested, camera_support,
@@ -2130,7 +2138,7 @@ def main(argv=None):
     session_root = base.ensure_dir(OUTPUT_ROOT / session_id)
     raw_cache_root = base.ensure_dir(session_root / "raw_cache")
     event_log_path = session_root / (session_id + "_event_log.csv")
-    camera_event_log_path = session_root / (session_id + "_camera_event_log.csv")
+    camera_event_log_path = session_root / "video" / CAMERA_EVENT_LOG_FILENAME
     planned_sequence_path = session_root / (session_id + "_planned_sequence.csv")
     selected_images_path = session_root / (session_id + "_image_assignment.csv")
     plan_summary_path = session_root / (session_id + "_plan_summary.csv")
@@ -2220,6 +2228,8 @@ def main(argv=None):
         "event_log_csv": str(event_log_path),
         "trial_summary_csv": str(trial_summary_path),
         "camera_event_log_csv": str(camera_event_log_path) if use_camera else "",
+        "camera_recording_elapsed_local_sec": None,
+        "camera_startup_confirmation_latency_sec": None,
         "session_qc_json": "",
         "lick_events_csv": str(lick_events_path),
         "suction_delay_from_stim_onset_sec": suction_delay_sec,
@@ -2379,7 +2389,7 @@ def main(argv=None):
                            gpio_client, event_log_path, all_gpio_events)
 
             if use_camera:
-                metadata["camera_timer_anchor"] = "local_monotonic_at_camera_start_request"
+                metadata["camera_timer_anchor"] = "local_monotonic_at_camera_recording_confirmed"
                 metadata["camera_recording_request_monotonic_ns"] = time.monotonic_ns()
                 append_event(
                     event_log_path,
@@ -2401,6 +2411,12 @@ def main(argv=None):
                     )
                 camera_started = True
                 metadata["camera_recording_confirmed_monotonic_ns"] = time.monotonic_ns()
+                metadata["camera_startup_confirmation_latency_sec"] = (
+                    camera_startup_confirmation_latency_from_ns(
+                        metadata["camera_recording_request_monotonic_ns"],
+                        metadata["camera_recording_confirmed_monotonic_ns"],
+                    )
+                )
                 metadata["camera_start_result"] = camera_result
                 latest_camera_state = dict(camera_result.get("controller_state", {}))
                 append_event(
@@ -2414,7 +2430,7 @@ def main(argv=None):
 
             metadata["operator_gate_enter_monotonic_ns"] = time.monotonic_ns()
             append_event(event_log_path, exact_timestamp_event("two_photon_operator_gate_entered", phase="preparation_gray"))
-            gate_camera_anchor = metadata.get("camera_recording_request_monotonic_ns")
+            gate_camera_anchor = metadata.get("camera_recording_confirmed_monotonic_ns")
             gate_wait_sec = wait_for_two_photon_gate(
                 lambda: status_reporter.report(format_operator_status("WAITING_FOR_2P",
                     (time.monotonic_ns() - gate_camera_anchor) / 1e9 if gate_camera_anchor else None,
@@ -2515,7 +2531,7 @@ def main(argv=None):
                     if not camera_stop_confirmed:
                         raise RuntimeError("Camera stop was not confirmed: %s" % json.dumps(stop_state, sort_keys=True))
                     metadata["camera_stop_confirmed_monotonic_ns"] = time.monotonic_ns()
-                    anchor_ns = metadata.get("camera_recording_request_monotonic_ns")
+                    anchor_ns = metadata.get("camera_recording_confirmed_monotonic_ns")
                     metadata["camera_recording_elapsed_local_sec"] = camera_elapsed_from_ns(
                         anchor_ns, metadata["camera_stop_confirmed_monotonic_ns"])
                     status_reporter.finalize("REC stopped %s | camera stop confirmed" % base.format_seconds(metadata["camera_recording_elapsed_local_sec"] or 0))
@@ -2608,7 +2624,7 @@ def main(argv=None):
                 latest_camera_state = dict(stop_state)
                 if camera_stop_confirmed and "camera_stop_confirmed_monotonic_ns" not in metadata:
                     metadata["camera_stop_confirmed_monotonic_ns"] = time.monotonic_ns()
-                    anchor_ns = metadata.get("camera_recording_request_monotonic_ns")
+                    anchor_ns = metadata.get("camera_recording_confirmed_monotonic_ns")
                     metadata["camera_recording_elapsed_local_sec"] = camera_elapsed_from_ns(
                         anchor_ns, metadata["camera_stop_confirmed_monotonic_ns"])
                 append_event(

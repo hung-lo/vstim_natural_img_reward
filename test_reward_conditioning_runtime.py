@@ -264,10 +264,30 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
         self.assertFalse(reward.resolve_camera_choice(False, False, None, prompt))
         prompt.assert_not_called()
 
-        elapsed = reward.camera_elapsed_from_ns(100_000_000_000, 160_000_000_000)
-        self.assertEqual(elapsed, 60.0)
+        elapsed = reward.camera_elapsed_from_ns(107_000_000_000, 377_000_000_000)
+        self.assertEqual(elapsed, 270.0)
         self.assertEqual(elapsed, reward.camera_elapsed_from_ns(
-            100_000_000_000, 160_000_000_000))
+            107_000_000_000, 377_000_000_000))
+        conversion_completed_ns = 450_000_000_000
+        self.assertEqual(
+            elapsed,
+            reward.camera_elapsed_from_ns(
+                107_000_000_000, 377_000_000_000
+            ),
+        )
+        self.assertGreater(conversion_completed_ns, 377_000_000_000)
+        self.assertEqual(
+            reward.camera_startup_confirmation_latency_from_ns(
+                100_000_000_000, 107_000_000_000
+            ),
+            7.0,
+        )
+        self.assertIsNone(reward.camera_elapsed_from_ns(None, 377_000_000_000))
+        self.assertIsNone(
+            reward.camera_startup_confirmation_latency_from_ns(
+                100_000_000_000, None
+            )
+        )
 
         with tempfile.TemporaryDirectory(prefix="manifest_status_") as temp_dir:
             path = Path(temp_dir) / "session_manifest.json"
@@ -283,15 +303,33 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
             video_manifest = session_root / "video" / "video_manifest.json"
             video_manifest.parent.mkdir()
             video_manifest.write_text("{}")
+            camera_event_log = session_root / "video" / "camera_control_events.csv"
+            absent_artifact = reward.build_session_manifest(
+                session_root, "session", "mouse", "protocol", "complete", {
+                    "camera_event_log": camera_event_log,
+                })
+            self.assertFalse(absent_artifact["files"]["camera_event_log"]["exists"])
+            camera_event_log.write_text("event,details\n")
             artifact = reward.build_session_manifest(
                 session_root, "session", "mouse", "protocol", "complete", {
                     "metadata": session_root / "metadata.json",
                     "video_manifest": video_manifest,
-                    "camera_event_log": None,
+                    "camera_event_log": camera_event_log,
                 })
             self.assertFalse(artifact["files"]["metadata"]["exists"])
             self.assertTrue(artifact["files"]["video_manifest"]["exists"])
-            self.assertIsNone(artifact["files"]["camera_event_log"]["path"])
+            self.assertTrue(artifact["files"]["camera_event_log"]["exists"])
+            self.assertEqual(
+                artifact["files"]["camera_event_log"]["path"],
+                "video/camera_control_events.csv",
+            )
+
+            disabled_artifact = reward.build_session_manifest(
+                session_root, "session", "mouse", "protocol", "complete", {
+                    "camera_event_log": None,
+                })
+            self.assertFalse(disabled_artifact["files"]["camera_event_log"]["exists"])
+            self.assertIsNone(disabled_artifact["files"]["camera_event_log"]["path"])
 
     def test_reward_volume_config_validation_and_tracker_accounting(self):
         config = reward.load_reward_volume_config({
