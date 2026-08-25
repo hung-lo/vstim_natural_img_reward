@@ -49,6 +49,72 @@ class FakeGPIOClient:
 
 
 class RewardConditioningRuntimeTests(unittest.TestCase):
+    def test_display_timing_calibration_falls_back_to_nominal_refreshes(self):
+        resolved = reward.resolve_display_timing_calibration({})
+        self.assertFalse(resolved["calibration_enabled"])
+        self.assertIsNone(resolved["calibration_id"])
+        self.assertEqual(resolved["calibration_refresh_rate_hz"], 60.0)
+        self.assertEqual(resolved["segment1_refreshes"], 60)
+        self.assertEqual(resolved["segment2_refreshes"], 30)
+        self.assertEqual(resolved["stim_total_refreshes"], 90)
+        self.assertEqual(resolved["stimulus_onset_compensation_sec"], 0.0)
+
+    def test_box151_display_timing_calibration_resolves_without_rescaling(self):
+        resolved = reward.resolve_display_timing_calibration({
+            "display_timing_calibration_id": "box151_photodiode_20ksps_50trial_60hz_v1",
+            "display_timing_calibration_refresh_rate_hz": 60.0,
+            "stim_segment1_refreshes": 64,
+            "stim_segment2_refreshes": 24,
+            "stimulus_onset_compensation_sec": 0.095,
+        })
+        self.assertTrue(resolved["calibration_enabled"])
+        self.assertEqual(resolved["segment1_refreshes"], 64)
+        self.assertEqual(resolved["segment2_refreshes"], 24)
+        self.assertAlmostEqual(resolved["segment1_programmed_duration_sec"], 64.0 / 60.0)
+        self.assertAlmostEqual(resolved["segment2_programmed_duration_sec"], 24.0 / 60.0)
+        self.assertAlmostEqual(resolved["total_programmed_duration_sec"], 88.0 / 60.0)
+        self.assertAlmostEqual(resolved["stimulus_onset_compensation_sec"], 0.095)
+
+    def test_display_timing_calibration_rejects_refresh_rate_mismatch(self):
+        with self.assertRaisesRegex(RuntimeError, "does not match"):
+            reward.resolve_display_timing_calibration({
+                "display_timing_calibration_id": "box151",
+                "display_timing_calibration_refresh_rate_hz": 59.94,
+                "stim_segment1_refreshes": 64,
+                "stim_segment2_refreshes": 24,
+                "stimulus_onset_compensation_sec": 0.095,
+            })
+
+    def test_suction_target_applies_compensation_without_changing_behavioral_delay(self):
+        self.assertAlmostEqual(
+            reward.suction_target_from_stim_request(100_000_000_000, 3.4, 0.095),
+            103.495,
+        )
+        self.assertAlmostEqual(
+            reward.suction_target_from_stim_request(100_000_000_000, 3.4, 0.0),
+            103.4,
+        )
+
+    def test_explicit_refresh_conversion_passes_refresh_count_to_rpg(self):
+        import run_stringer_vstim as vstim
+
+        class FakeRPG:
+            def __init__(self):
+                self.calls = []
+
+            def convert_raw(self, *args):
+                self.calls.append(args)
+
+        with tempfile.TemporaryDirectory(prefix="refresh_conversion_") as temp_dir:
+            raw_path = Path(temp_dir) / "stim_reward_pre_64r.raw"
+            rpg_module = FakeRPG()
+            canvas = SimpleNamespace(
+                convert=lambda mode: SimpleNamespace(tobytes=lambda: b"rgb")
+            )
+            vstim.convert_canvas_to_rpg_raw_refreshes(rpg_module, canvas, raw_path, 64)
+            self.assertEqual(rpg_module.calls[0][5], 64)
+            self.assertTrue(raw_path.parent.exists())
+
     def test_status_reporter_throttles_and_session_status_table(self):
         class Stream(io.StringIO):
             def isatty(self): return True
@@ -770,6 +836,34 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
         self.assertEqual(rows[1]["lick_count_pre_0p5_sec"], 1)
         self.assertEqual(rows[1]["trial_executed"], True)
         self.assertEqual(rows[1]["trial_completed"], True)
+
+    def test_trial_summary_reports_physical_onset_suction_estimate(self):
+        trial = {
+            "trial_index": 0, "trial_number": 1, "block_number": 1,
+            "image_role": "rewarded_high_1", "image_category": "conditioned",
+            "image_id": 1, "image_filename": "img.png",
+            "reward_eligible": True, "reward_scheduled": True,
+            "reward_omission_scheduled": False, "suction_scheduled": True,
+            "planned_iti_duration_sec": 4.0,
+        }
+        rows = reward.build_trial_summary(
+            [trial],
+            {0: {
+                "trial_executed": True,
+                "stim_presented": True,
+                "trial_completed": True,
+                "stim_request_monotonic_ns": 100_000_000_000,
+                "suction_command_id": "suction_1",
+            }},
+            [{"command_id": "suction_1", "event_type": "suction_on",
+              "unix_time_ns": 103_495_000_000,
+              "monotonic_ns": 103_495_000_000}],
+            stimulus_onset_compensation_sec=0.095,
+        )
+        self.assertAlmostEqual(rows[0]["software_suction_delay_sec"], 3.495)
+        self.assertAlmostEqual(
+            rows[0]["estimated_suction_delay_from_physical_onset_sec"], 3.4
+        )
 
     def test_zero_post_services_final_rewarded_suction(self):
         gpio_client = FakeGPIOClient()

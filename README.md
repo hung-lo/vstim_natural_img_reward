@@ -108,6 +108,35 @@ ENABLE_PHOTODIODE_PATCH = True
 
 The helper functions already bake the patch into the session raw files.
 
+### Box151 display-timing calibration
+
+The Box151 profile is an optional, hardware-specific RPG timing calibration.
+It was measured with a 20 kS/s Intan recording using ADC1 for the display
+photodiode and ADC3 for IRIG-H, across 50 no-mouse trials at 60 Hz. It is not
+a universal monitor or refresh-rate correction. The calibration uses 64 RPG
+refreshes before the reward boundary and 24 after it, with a `0.095` s
+stimulus-onset compensation for suction scheduling. Intan/photodiode timing
+remains the physical ground truth.
+
+When the calibration fields are null, the runner falls back to nominal 60/30
+refreshes at the configured 60 Hz base rate and zero compensation. To use the
+Box151 profile, set these fields in the local, uncommitted
+`reward_conditioning_config.json` (after copying the example):
+
+```json
+"display_timing_calibration_id": "box151_photodiode_20ksps_50trial_60hz_v1",
+"display_timing_calibration_refresh_rate_hz": 60.0,
+"stim_segment1_refreshes": 64,
+"stim_segment2_refreshes": 24,
+"stimulus_onset_compensation_sec": 0.095
+```
+
+The behavioral targets remain a 1.0 s reward boundary, 1.5 s planned
+stimulus, and the configured physical suction delay. The calibration changes
+only the programmed raw refresh counts and the software suction target; the
+trial summary records both the software-aligned and compensation-adjusted
+suction delays.
+
 ## Notes on the display backend
 
 The older pygame approach was a dead end for the headless behavior Pi.

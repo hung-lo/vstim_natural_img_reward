@@ -11,5 +11,10 @@
   "reward_pulse_off_sec": 0.01,
   "reward_pulse_on_sec": null,
   "reward_volume_ul_per_train": null,
+  "display_timing_calibration_id": null,
+  "display_timing_calibration_refresh_rate_hz": null,
+  "stim_segment1_refreshes": null,
+  "stim_segment2_refreshes": null,
+  "stimulus_onset_compensation_sec": 0.0,
   "simulate_gpio": false
 }

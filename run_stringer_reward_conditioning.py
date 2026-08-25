@@ -74,7 +74,7 @@ REWARD_VERIFICATION_MARGIN_SEC = 0.25
 QC_SCHEMA_VERSION = 1
 SESSION_OUTPUT_SCHEMA_VERSION = 2
 EVENT_LOG_SCHEMA_VERSION = 1
-TRIAL_SUMMARY_SCHEMA_VERSION = 1
+TRIAL_SUMMARY_SCHEMA_VERSION = 2
 
 CORE_OPERATIONAL_TIMING_FIELDS = (
     "operator_gate_enter_monotonic_ns",
@@ -205,6 +205,7 @@ TRIAL_SUMMARY_FIELDS = [
     "suction_complete_unix_ns",
     "suction_complete_monotonic_ns",
     "software_suction_delay_sec",
+    "estimated_suction_delay_from_physical_onset_sec",
     "first_reward_valve_on_unix_ns",
     "actual_reward_delay_from_software_stim_request_sec",
     "lick_count_pre_0p5_sec",
@@ -854,6 +855,86 @@ def calculate_reward_timing(hardware_config):
     }
 
 
+def _calibration_field_present(value):
+    return value not in (None, "")
+
+
+def _validated_refresh_count(value, field_name):
+    if isinstance(value, bool):
+        raise RuntimeError("%s must be an integer refresh count." % field_name)
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        raise RuntimeError("%s must be an integer refresh count." % field_name)
+    if not math.isfinite(numeric) or numeric != int(numeric) or int(numeric) < 1:
+        raise RuntimeError("%s must be an integer refresh count of at least 1." % field_name)
+    return int(numeric)
+
+
+def resolve_display_timing_calibration(hardware_config):
+    """Resolve optional Box151 photodiode calibration without changing targets."""
+    calibration_id = hardware_config.get("display_timing_calibration_id")
+    refresh_rate = hardware_config.get("display_timing_calibration_refresh_rate_hz")
+    segment1_refreshes = hardware_config.get("stim_segment1_refreshes")
+    segment2_refreshes = hardware_config.get("stim_segment2_refreshes")
+    compensation = hardware_config.get("stimulus_onset_compensation_sec")
+    any_calibration_field = any(
+        _calibration_field_present(value)
+        for value in (calibration_id, refresh_rate, segment1_refreshes, segment2_refreshes)
+    ) or (compensation not in (None, "", 0, 0.0))
+
+    if not any_calibration_field:
+        segment1_refreshes = base.refreshes_for_seconds(REWARD_DELAY_SEC)
+        segment2_refreshes = base.refreshes_for_seconds(POST_REWARD_STIM_SEC)
+        return {
+            "calibration_enabled": False,
+            "calibration_id": None,
+            "calibration_refresh_rate_hz": float(base.REFRESH_RATE_HZ),
+            "segment1_refreshes": segment1_refreshes,
+            "segment2_refreshes": segment2_refreshes,
+            "stim_total_refreshes": segment1_refreshes + segment2_refreshes,
+            "segment1_programmed_duration_sec": segment1_refreshes / float(base.REFRESH_RATE_HZ),
+            "segment2_programmed_duration_sec": segment2_refreshes / float(base.REFRESH_RATE_HZ),
+            "total_programmed_duration_sec": (segment1_refreshes + segment2_refreshes) / float(base.REFRESH_RATE_HZ),
+            "stimulus_onset_compensation_sec": 0.0,
+        }
+
+    if calibration_id in (None, "") or not str(calibration_id).strip():
+        raise RuntimeError("display_timing_calibration_id is required when calibration is configured.")
+    try:
+        refresh_rate = float(refresh_rate)
+    except (TypeError, ValueError):
+        raise RuntimeError("display_timing_calibration_refresh_rate_hz must be finite and positive.")
+    if not math.isfinite(refresh_rate) or refresh_rate <= 0:
+        raise RuntimeError("display_timing_calibration_refresh_rate_hz must be finite and positive.")
+    if not math.isclose(refresh_rate, float(base.REFRESH_RATE_HZ), rel_tol=0.0, abs_tol=1e-9):
+        raise RuntimeError(
+            "display timing calibration refresh rate %.9g Hz does not match configured base refresh rate %.9g Hz."
+            % (refresh_rate, float(base.REFRESH_RATE_HZ))
+        )
+    segment1_refreshes = _validated_refresh_count(segment1_refreshes, "stim_segment1_refreshes")
+    segment2_refreshes = _validated_refresh_count(segment2_refreshes, "stim_segment2_refreshes")
+    try:
+        compensation = float(0.0 if compensation in (None, "") else compensation)
+    except (TypeError, ValueError):
+        raise RuntimeError("stimulus_onset_compensation_sec must be finite and nonnegative.")
+    if not math.isfinite(compensation) or compensation < 0:
+        raise RuntimeError("stimulus_onset_compensation_sec must be finite and nonnegative.")
+    total_refreshes = segment1_refreshes + segment2_refreshes
+    return {
+        "calibration_enabled": True,
+        "calibration_id": str(calibration_id).strip(),
+        "calibration_refresh_rate_hz": refresh_rate,
+        "segment1_refreshes": segment1_refreshes,
+        "segment2_refreshes": segment2_refreshes,
+        "stim_total_refreshes": total_refreshes,
+        "segment1_programmed_duration_sec": segment1_refreshes / refresh_rate,
+        "segment2_programmed_duration_sec": segment2_refreshes / refresh_rate,
+        "total_programmed_duration_sec": total_refreshes / refresh_rate,
+        "stimulus_onset_compensation_sec": compensation,
+    }
+
+
 def _record_reward_volume_block(event_log_path, context, exc):
     fields = dict(context or {})
     fields["notes"] = str(exc)
@@ -968,22 +1049,27 @@ def build_background_raw(rpg_module, raw_cache_root):
     return path
 
 
-def build_stimulus_segment_raws(rpg_module, raw_cache_root, assignment_rows):
-    first_dir = base.ensure_dir(raw_cache_root / "stim_first_1p0_sec")
-    second_dir = base.ensure_dir(raw_cache_root / "stim_second_0p5_sec")
+def build_stimulus_segment_raws(
+    rpg_module, raw_cache_root, assignment_rows, display_timing=None
+):
+    display_timing = display_timing or resolve_display_timing_calibration({})
+    segment1_refreshes = display_timing["segment1_refreshes"]
+    segment2_refreshes = display_timing["segment2_refreshes"]
+    first_dir = base.ensure_dir(raw_cache_root / ("stim_reward_pre_%dr" % segment1_refreshes))
+    second_dir = base.ensure_dir(raw_cache_root / ("stim_reward_post_%dr" % segment2_refreshes))
     raw_paths = {}
     for row in assignment_rows:
         image_path = Path(row["image_path"])
         canvas = base.build_canvas(
             image_path, base.SCREEN_RESOLUTION, photodiode_on=True
         )
-        first_path = first_dir / (image_path.stem + "_first_1p0s.raw")
-        second_path = second_dir / (image_path.stem + "_second_0p5s.raw")
-        base.convert_canvas_to_rpg_raw(
-            rpg_module, canvas, first_path, REWARD_DELAY_SEC
+        first_path = first_dir / (image_path.stem + "_reward_pre_%dr.raw" % segment1_refreshes)
+        second_path = second_dir / (image_path.stem + "_reward_post_%dr.raw" % segment2_refreshes)
+        base.convert_canvas_to_rpg_raw_refreshes(
+            rpg_module, canvas, first_path, segment1_refreshes
         )
-        base.convert_canvas_to_rpg_raw(
-            rpg_module, canvas, second_path, POST_REWARD_STIM_SEC
+        base.convert_canvas_to_rpg_raw_refreshes(
+            rpg_module, canvas, second_path, segment2_refreshes
         )
         raw_paths[image_path.name] = {
             "first": first_path,
@@ -1185,6 +1271,16 @@ def verify_suction_command(gpio_client, command_id, event_log_path, all_gpio_eve
     raise RuntimeError("Suction command %s did not complete before the ITI deadline." % command_id)
 
 
+def suction_target_from_stim_request(
+    stim_request_monotonic_ns, suction_delay_sec, stimulus_onset_compensation_sec=0.0
+):
+    return (
+        float(stim_request_monotonic_ns) / 1e9
+        + float(stimulus_onset_compensation_sec)
+        + float(suction_delay_sec)
+    )
+
+
 def run_trials(
     screen,
     trials,
@@ -1201,6 +1297,7 @@ def run_trials(
     suction_duration_sec,
     status_callback=None,
     reward_volume_tracker=None,
+    stimulus_onset_compensation_sec=0.0,
 ):
     runtime_by_trial = {}
     pending_final_reward_checks = []
@@ -1381,7 +1478,11 @@ def run_trials(
         suction_check = None
         if trial.get("suction_scheduled"):
             suction_check = {
-                "target": runtime["stim_request_monotonic_ns"] / 1e9 + float(suction_delay_sec),
+                "target": suction_target_from_stim_request(
+                    runtime["stim_request_monotonic_ns"],
+                    suction_delay_sec,
+                    stimulus_onset_compensation_sec,
+                ),
                 "duration_sec": float(suction_duration_sec),
             }
 
@@ -1563,6 +1664,7 @@ def _blank_trial_summary(trial):
         "suction_complete_unix_ns": "",
         "suction_complete_monotonic_ns": "",
         "software_suction_delay_sec": "",
+        "estimated_suction_delay_from_physical_onset_sec": "",
         "first_reward_valve_on_unix_ns": "",
         "actual_reward_delay_from_software_stim_request_sec": "",
         "lick_count_pre_0p5_sec": "",
@@ -1578,7 +1680,9 @@ def _blank_trial_summary(trial):
     }
 
 
-def build_trial_summary(trials, runtime_by_trial, all_gpio_events):
+def build_trial_summary(
+    trials, runtime_by_trial, all_gpio_events, stimulus_onset_compensation_sec=0.0
+):
     all_lick_monotonic_ns = sorted(
         int(event["monotonic_ns"])
         for event in all_gpio_events
@@ -1630,6 +1734,9 @@ def build_trial_summary(trials, runtime_by_trial, all_gpio_events):
                 row[prefix + "_monotonic_ns"] = match.get("monotonic_ns", "")
         if row["suction_on_monotonic_ns"] not in ("", None) and row["stim_request_monotonic_ns"] not in ("", None):
             row["software_suction_delay_sec"] = (int(row["suction_on_monotonic_ns"]) - int(row["stim_request_monotonic_ns"])) / 1e9
+            row["estimated_suction_delay_from_physical_onset_sec"] = (
+                row["software_suction_delay_sec"] - float(stimulus_onset_compensation_sec)
+            )
 
         reward_command_id = row["reward_command_id"]
         reward_events = reward_events_by_command_id.get(reward_command_id, []) if reward_command_id else []
@@ -1951,7 +2058,8 @@ def format_setup_summary(mouse_id, session_notes, assignment_path,
                          planned_total_sec, hardware_config, use_camera,
                          suction_delay_sec, reward_train_duration_sec,
                          reward_timing=None,
-                         output_root=OUTPUT_ROOT):
+                         output_root=OUTPUT_ROOT,
+                         display_timing=None):
     if reward_timing is None:
         reward_extension_sec = max(
             0.0, reward_train_duration_sec - POST_REWARD_STIM_SEC
@@ -1968,6 +2076,9 @@ def format_setup_summary(mouse_id, session_notes, assignment_path,
                 - reward_train_duration_sec
             ),
         }
+    if display_timing is None:
+        display_timing = resolve_display_timing_calibration({})
+    calibration_label = display_timing["calibration_id"] or "none (nominal fallback)"
     lines = [
         "Session setup summary:",
         "  Mouse: %s" % mouse_id,
@@ -1981,6 +2092,21 @@ def format_setup_summary(mouse_id, session_notes, assignment_path,
         "  Scheduled omissions: %d" % sum(1 for trial in trials if trial["reward_omission_scheduled"]),
         "  Scheduled suction events: %d" % sum(1 for trial in trials if trial.get("suction_scheduled")),
         "  Stimulus: 1.5 s; open-loop reward boundary: 1.0 s",
+        "  Display timing calibration: %s" % calibration_label,
+        "  Display refresh profile: %.1f Hz; segments %d/%d refreshes (%.6f/%.6f s programmed)"
+        % (
+            display_timing["calibration_refresh_rate_hz"] or base.REFRESH_RATE_HZ,
+            display_timing["segment1_refreshes"],
+            display_timing["segment2_refreshes"],
+            display_timing["segment1_programmed_duration_sec"],
+            display_timing["segment2_programmed_duration_sec"],
+        ),
+        "  Total programmed stimulus: %d refreshes (%.6f s); suction onset compensation: +%.3f s"
+        % (
+            display_timing["stim_total_refreshes"],
+            display_timing["total_programmed_duration_sec"],
+            display_timing["stimulus_onset_compensation_sec"],
+        ),
         "  Reward probability: %.3f (fixed)" % REWARD_PROBABILITY,
         "  ITI: uniform %.3f-%.3f s" % (iti_min_sec, iti_max_sec),
         "  PRE gray background: %s" % base.format_seconds(pre_sec),
@@ -2019,6 +2145,7 @@ def main(argv=None):
     )
     suction_delay_sec = float(hardware_config["suction_delay_from_stim_onset_sec"])
     reward_timing = calculate_reward_timing(hardware_config)
+    display_timing = resolve_display_timing_calibration(hardware_config)
     reward_train_duration_sec = reward_timing["reward_train_duration_sec"]
     reward_verification_timeout_sec = reward_train_duration_sec + REWARD_VERIFICATION_MARGIN_SEC
     try:
@@ -2116,7 +2243,7 @@ def main(argv=None):
         pre_background_min * 60.0, post_background_min * 60.0,
         planned_task_sec, planned_total_sec, hardware_config, use_camera,
         suction_delay_sec, reward_train_duration_sec,
-        reward_timing=reward_timing))
+        reward_timing=reward_timing, display_timing=display_timing))
     print()
     for row in plan_summary:
         print(
@@ -2185,6 +2312,19 @@ def main(argv=None):
         "stim_duration_sec": STIM_DURATION_SEC,
         "reward_delay_sec": REWARD_DELAY_SEC,
         "post_reward_stim_sec": POST_REWARD_STIM_SEC,
+        "display_timing_calibration_enabled": display_timing["calibration_enabled"],
+        "display_timing_calibration_id": display_timing["calibration_id"],
+        "display_timing_calibration_refresh_rate_hz": display_timing["calibration_refresh_rate_hz"],
+        "stim_segment1_refreshes": display_timing["segment1_refreshes"],
+        "stim_segment2_refreshes": display_timing["segment2_refreshes"],
+        "stim_total_refreshes": display_timing["stim_total_refreshes"],
+        "stim_segment1_programmed_duration_sec": display_timing["segment1_programmed_duration_sec"],
+        "stim_segment2_programmed_duration_sec": display_timing["segment2_programmed_duration_sec"],
+        "stim_total_programmed_duration_sec": display_timing["total_programmed_duration_sec"],
+        "stimulus_onset_compensation_sec": display_timing["stimulus_onset_compensation_sec"],
+        "behavioral_target_reward_delay_sec": REWARD_DELAY_SEC,
+        "behavioral_target_stim_duration_sec": STIM_DURATION_SEC,
+        "behavioral_target_suction_delay_sec": suction_delay_sec,
         "iti_distribution": "uniform",
         "iti_min_sec": iti_min_sec,
         "iti_max_sec": iti_max_sec,
@@ -2319,7 +2459,7 @@ def main(argv=None):
             print("Building 14 image raws while the screen remains gray...")
             raw_build_start = time.monotonic()
             raw_paths = build_stimulus_segment_raws(
-                rpg, raw_cache_root, assignment_rows
+                rpg, raw_cache_root, assignment_rows, display_timing
             )
             raw_build_sec = time.monotonic() - raw_build_start
             loaded_raws = {}
@@ -2487,6 +2627,7 @@ def main(argv=None):
                 reward_verification_timeout_sec,
                 hardware_config["suction_delay_from_stim_onset_sec"],
                 hardware_config["suction_duration_sec"],
+                stimulus_onset_compensation_sec=display_timing["stimulus_onset_compensation_sec"],
                 status_callback=lambda done, total, remaining: status_reporter.report(format_operator_status("TASK",
                     (time.monotonic_ns() - gate_camera_anchor) / 1e9 if gate_camera_anchor else None,
                     remaining, done, total, post_background_min * 60.0)),
@@ -2663,7 +2804,12 @@ def main(argv=None):
             camera_cleanup_error, cleanup_errors, finalization_errors)
         camera_data_secured = preliminary_completion["camera_data_secured"]
         try:
-            trial_summary = build_trial_summary(trials, runtime_by_trial, all_gpio_events)
+            trial_summary = build_trial_summary(
+                trials,
+                runtime_by_trial,
+                all_gpio_events,
+                stimulus_onset_compensation_sec=display_timing["stimulus_onset_compensation_sec"],
+            )
             write_rows(trial_summary_path, trial_summary, TRIAL_SUMMARY_FIELDS)
             lick_rows = [event for event in all_gpio_events if event.get("event_type") in ("lick_onset", "lick_offset")]
             write_rows(lick_events_path, lick_rows, ["unix_time_ns", "monotonic_ns", "event_type", "phase", "trial_index", "trial_number", "block_number", "image_role", "image_filename", "reward_scheduled", "suction_scheduled"])

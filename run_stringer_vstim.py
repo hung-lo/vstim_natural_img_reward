@@ -277,6 +277,19 @@ def build_canvas(image_path, screen_size, photodiode_on):
 
 
 def convert_canvas_to_rpg_raw(rpg_module, canvas, raw_path, duration_sec):
+    return convert_canvas_to_rpg_raw_refreshes(
+        rpg_module,
+        canvas,
+        raw_path,
+        refreshes_for_seconds(duration_sec),
+    )
+
+
+def convert_canvas_to_rpg_raw_refreshes(rpg_module, canvas, raw_path, refresh_count):
+    """Convert one RGB canvas to an RPG raw with an explicit frame count."""
+    refresh_count = int(refresh_count)
+    if refresh_count < 1:
+        raise ValueError("refresh_count must be at least 1")
     ensure_dir(raw_path.parent)
     fd, source_name = tempfile.mkstemp(prefix="%s_" % raw_path.stem, suffix=".rgb.raw", dir=str(raw_path.parent))
     source_path = Path(source_name)
@@ -289,7 +302,7 @@ def convert_canvas_to_rpg_raw(rpg_module, canvas, raw_path, duration_sec):
             1,
             SCREEN_RESOLUTION[0],
             SCREEN_RESOLUTION[1],
-            refreshes_for_seconds(duration_sec),
+            refresh_count,
             SCREEN_COLORMODE,
         )
     finally:
