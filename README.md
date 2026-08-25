@@ -142,6 +142,14 @@ cp reward_conditioning_config.example.json reward_conditioning_config.json
 Do not guess `reward_pulse_on_sec`. Use the calibrated
 `session_info["solenoid_blink_duration"]` value from the working box.
 
+Reward is triggered at 1.0 s after image onset, and the visual image always
+ends at 1.5 s. A calibrated reward train longer than the remaining 0.5 s may
+continue into the gray ITI, but it must finish before the scheduled suction
+onset. For example, the Box151 configuration of 6 pulses with 0.100 s on and
+0.010 s between pulses produces a 0.650 s train that nominally ends at 1.650 s;
+these pulse values are a Box151 example, not universal defaults. Physical
+timing should be confirmed from Intan/photodiode/valve recordings.
+
 Persistent assignments are saved under `/mnt/hd/vstim_reward_assignments/`:
 
 - `_global_reward_conditioning_14_image_panel.json` for the cohort-wide image panel

@@ -796,6 +796,56 @@ def planned_reward_train_count(trials):
     return sum(1 for trial in trials if trial.get("reward_scheduled"))
 
 
+def calculate_reward_timing(hardware_config):
+    """Calculate nominal reward timing and reject overlap in the GPIO worker."""
+    reward_train_duration_sec = (
+        int(hardware_config["reward_num_pulses"])
+        * float(hardware_config["reward_pulse_on_sec"])
+        + max(0, int(hardware_config["reward_num_pulses"]) - 1)
+        * float(hardware_config["reward_pulse_off_sec"])
+    )
+    suction_delay_sec = float(
+        hardware_config["suction_delay_from_stim_onset_sec"]
+    )
+    reward_nominal_start_from_stim_onset_sec = REWARD_DELAY_SEC
+    reward_nominal_completion_from_stim_onset_sec = (
+        REWARD_DELAY_SEC + reward_train_duration_sec
+    )
+    reward_to_suction_nominal_gap_sec = (
+        suction_delay_sec - reward_nominal_completion_from_stim_onset_sec
+    )
+    reward_train_extension_into_iti_sec = max(
+        0.0,
+        reward_train_duration_sec - POST_REWARD_STIM_SEC,
+    )
+    if reward_nominal_completion_from_stim_onset_sec > suction_delay_sec:
+        raise RuntimeError(
+            "Configured reward train would nominally finish at %.3f s after "
+            "stimulus onset, later than suction onset at %.3f s. Reward and "
+            "suction must not overlap in the single GPIO worker."
+            % (
+                reward_nominal_completion_from_stim_onset_sec,
+                suction_delay_sec,
+            )
+        )
+    return {
+        "reward_train_duration_sec": reward_train_duration_sec,
+        "reward_nominal_start_from_stim_onset_sec": (
+            reward_nominal_start_from_stim_onset_sec
+        ),
+        "reward_nominal_completion_from_stim_onset_sec": (
+            reward_nominal_completion_from_stim_onset_sec
+        ),
+        "reward_to_suction_nominal_gap_sec": reward_to_suction_nominal_gap_sec,
+        "reward_train_extension_into_iti_sec": (
+            reward_train_extension_into_iti_sec
+        ),
+        "reward_train_extends_into_iti": (
+            reward_train_extension_into_iti_sec > 0.0
+        ),
+    }
+
+
 def _record_reward_volume_block(event_log_path, context, exc):
     fields = dict(context or {})
     fields["notes"] = str(exc)
@@ -1892,7 +1942,24 @@ def format_setup_summary(mouse_id, session_notes, assignment_path,
                          iti_max_sec, pre_sec, post_sec, planned_task_sec,
                          planned_total_sec, hardware_config, use_camera,
                          suction_delay_sec, reward_train_duration_sec,
+                         reward_timing=None,
                          output_root=OUTPUT_ROOT):
+    if reward_timing is None:
+        reward_extension_sec = max(
+            0.0, reward_train_duration_sec - POST_REWARD_STIM_SEC
+        )
+        reward_timing = {
+            "reward_nominal_completion_from_stim_onset_sec": (
+                REWARD_DELAY_SEC + reward_train_duration_sec
+            ),
+            "reward_train_extension_into_iti_sec": reward_extension_sec,
+            "reward_train_extends_into_iti": reward_extension_sec > 0.0,
+            "reward_to_suction_nominal_gap_sec": (
+                suction_delay_sec
+                - REWARD_DELAY_SEC
+                - reward_train_duration_sec
+            ),
+        }
     lines = [
         "Session setup summary:",
         "  Mouse: %s" % mouse_id,
@@ -1916,8 +1983,17 @@ def format_setup_summary(mouse_id, session_notes, assignment_path,
         "  Reward pin: BCM%d" % hardware_config["reward_pin_bcm"],
         "  Lick pin: BCM%d" % hardware_config["lick_pin_bcm"],
         "  Suction pin: BCM%d" % hardware_config["suction_pin_bcm"],
-        "  Suction boundary: %.1f s after reward-associated image onset" % suction_delay_sec,
         "  Reward pulse-train duration: %.3f s" % reward_train_duration_sec,
+        "  Reward nominal completion: %.3f s after stimulus onset"
+        % reward_timing["reward_nominal_completion_from_stim_onset_sec"],
+        "  Reward extends into gray ITI: %s (%.3f s)"
+        % (
+            "yes" if reward_timing["reward_train_extends_into_iti"] else "no",
+            reward_timing["reward_train_extension_into_iti_sec"],
+        ),
+        "  Suction onset: %.3f s after stimulus onset" % suction_delay_sec,
+        "  Reward-to-suction nominal gap: %.3f s"
+        % reward_timing["reward_to_suction_nominal_gap_sec"],
         "  GPIO simulation: %s" % hardware_config["simulate_gpio"],
         "  Face camera: %s" % use_camera,
         "  Output destination: %s/<session_id>" % output_root,
@@ -1930,6 +2006,13 @@ def format_setup_summary(mouse_id, session_notes, assignment_path,
 def main(argv=None):
     args = parse_args(argv)
     base.print_environment()
+    hardware_config = load_hardware_config(
+        args.hardware_config, simulate_gpio=args.simulate_gpio
+    )
+    suction_delay_sec = float(hardware_config["suction_delay_from_stim_onset_sec"])
+    reward_timing = calculate_reward_timing(hardware_config)
+    reward_train_duration_sec = reward_timing["reward_train_duration_sec"]
+    reward_verification_timeout_sec = reward_train_duration_sec + REWARD_VERIFICATION_MARGIN_SEC
     try:
         import rpg
     except ImportError as exc:
@@ -1938,23 +2021,6 @@ def main(argv=None):
             "on the behavior Pi first."
         ) from exc
 
-    hardware_config = load_hardware_config(
-        args.hardware_config, simulate_gpio=args.simulate_gpio
-    )
-    suction_delay_sec = float(hardware_config["suction_delay_from_stim_onset_sec"])
-    reward_train_duration_sec = (
-        hardware_config["reward_num_pulses"]
-        * hardware_config["reward_pulse_on_sec"]
-        + max(0, hardware_config["reward_num_pulses"] - 1)
-        * hardware_config["reward_pulse_off_sec"]
-    )
-    reward_verification_timeout_sec = reward_train_duration_sec + REWARD_VERIFICATION_MARGIN_SEC
-    if reward_train_duration_sec > POST_REWARD_STIM_SEC:
-        raise RuntimeError(
-            "Configured reward train duration %.6f s exceeds the %.6f s "
-            "post-reward image segment."
-            % (reward_train_duration_sec, POST_REWARD_STIM_SEC)
-        )
     camera_support = maybe_import_camera_support(args.no_camera)
     if args.camera and camera_support is None:
         raise RuntimeError("--camera was requested but camera support is unavailable.")
@@ -2041,7 +2107,8 @@ def main(argv=None):
         n_blocks, trials, iti_min_sec, iti_max_sec,
         pre_background_min * 60.0, post_background_min * 60.0,
         planned_task_sec, planned_total_sec, hardware_config, use_camera,
-        suction_delay_sec, reward_train_duration_sec))
+        suction_delay_sec, reward_train_duration_sec,
+        reward_timing=reward_timing))
     print()
     for row in plan_summary:
         print(
@@ -2133,7 +2200,11 @@ def main(argv=None):
         "hardware_config_path": str(Path(args.hardware_config)),
         "hardware_config": hardware_config,
         "reward_train_duration_sec": reward_train_duration_sec,
-        "reward_train_extends_into_iti": reward_train_duration_sec > POST_REWARD_STIM_SEC,
+        "reward_train_extends_into_iti": reward_timing["reward_train_extends_into_iti"],
+        "reward_train_extension_into_iti_sec": reward_timing["reward_train_extension_into_iti_sec"],
+        "reward_nominal_start_from_stim_onset_sec": reward_timing["reward_nominal_start_from_stim_onset_sec"],
+        "reward_nominal_completion_from_stim_onset_sec": reward_timing["reward_nominal_completion_from_stim_onset_sec"],
+        "reward_to_suction_nominal_gap_sec": reward_timing["reward_to_suction_nominal_gap_sec"],
         **reward_volume_tracker.summary(),
         "base_ttl_bcm23_used": False,
         "face_camera_requested": use_camera,

@@ -349,6 +349,103 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
         with self.assertRaises(reward.RewardVolumeCapExceeded):
             reward.RewardVolumeTracker(10.0, 15.0, 2).preflight()
 
+    def test_box151_reward_train_may_extend_safely_into_iti(self):
+        hardware = {
+            "reward_pin_bcm": 19,
+            "lick_pin_bcm": 26,
+            "suction_pin_bcm": 25,
+            "reward_num_pulses": 6,
+            "reward_pulse_on_sec": 0.1,
+            "reward_pulse_off_sec": 0.01,
+            "suction_delay_from_stim_onset_sec": 3.4,
+            "suction_duration_sec": 0.25,
+            "reward_volume_ul_per_train": None,
+            "maximum_session_reward_ul": None,
+        }
+        with tempfile.TemporaryDirectory(prefix="box151_reward_timing_") as temp_dir:
+            config_path = Path(temp_dir) / "hardware.json"
+            reward.atomic_write_json(config_path, hardware)
+            loaded = reward.load_hardware_config(config_path)
+
+            timing = reward.calculate_reward_timing(loaded)
+            self.assertAlmostEqual(timing["reward_train_duration_sec"], 0.65)
+            self.assertAlmostEqual(
+                timing["reward_nominal_start_from_stim_onset_sec"], 1.0
+            )
+            self.assertAlmostEqual(
+                timing["reward_nominal_completion_from_stim_onset_sec"], 1.65
+            )
+            self.assertAlmostEqual(
+                timing["reward_train_extension_into_iti_sec"], 0.15
+            )
+            self.assertAlmostEqual(
+                timing["reward_to_suction_nominal_gap_sec"], 1.75
+            )
+            self.assertTrue(timing["reward_train_extends_into_iti"])
+
+            hardware["suction_duration_sec"] = 0.36
+            reward.atomic_write_json(config_path, hardware)
+            with self.assertRaisesRegex(RuntimeError, "clean gray"):
+                reward.load_hardware_config(config_path)
+
+    def test_reward_timing_accepts_safe_long_exact_and_short_trains(self):
+        cases = (
+            ("safe_long", 0.6, 3.0, True, 0.1),
+            ("exact_segment", 0.5, 3.0, False, 0.0),
+            ("short", 0.3, 3.0, False, 0.0),
+        )
+        for case_name, duration, suction_delay, extends, extension in cases:
+            with self.subTest(case=case_name):
+                timing = reward.calculate_reward_timing({
+                    "reward_num_pulses": 1,
+                    "reward_pulse_on_sec": duration,
+                    "reward_pulse_off_sec": 0.0,
+                    "suction_delay_from_stim_onset_sec": suction_delay,
+                })
+                self.assertAlmostEqual(
+                    timing["reward_train_duration_sec"], duration
+                )
+                self.assertEqual(
+                    timing["reward_train_extends_into_iti"], extends
+                )
+                self.assertAlmostEqual(
+                    timing["reward_train_extension_into_iti_sec"], extension
+                )
+        self.assertEqual(reward.STIM_DURATION_SEC, 1.5)
+        self.assertEqual(reward.REWARD_DELAY_SEC, 1.0)
+        self.assertEqual(reward.POST_REWARD_STIM_SEC, 0.5)
+
+    def test_reward_suction_overlap_is_rejected(self):
+        with self.assertRaisesRegex(RuntimeError, "must not overlap"):
+            reward.calculate_reward_timing({
+                "reward_num_pulses": 1,
+                "reward_pulse_on_sec": 2.5,
+                "reward_pulse_off_sec": 0.0,
+                "suction_delay_from_stim_onset_sec": 3.4,
+            })
+
+    def test_main_reward_suction_overlap_aborts_before_hardware_start(self):
+        hardware = {
+            "reward_num_pulses": 1,
+            "reward_pulse_on_sec": 2.5,
+            "reward_pulse_off_sec": 0.0,
+            "suction_delay_from_stim_onset_sec": 3.4,
+        }
+        gpio_constructor = mock.Mock()
+        camera_import = mock.Mock()
+        resolve_image_dir = mock.Mock()
+        with mock.patch.dict(sys.modules, {"rpg": types.ModuleType("rpg")}), \
+             mock.patch.object(reward.base, "print_environment"), \
+             mock.patch.object(reward, "load_hardware_config", return_value=hardware), \
+             mock.patch.object(reward, "maybe_import_camera_support", camera_import), \
+             mock.patch.object(reward.base, "resolve_image_dir", resolve_image_dir), \
+             mock.patch.object(reward, "BehaviorGPIOClient", gpio_constructor):
+            with self.assertRaisesRegex(RuntimeError, "must not overlap"):
+                reward.main(["--no-camera"])
+        camera_import.assert_not_called()
+        resolve_image_dir.assert_not_called()
+        gpio_constructor.assert_not_called()
+
     def test_main_planned_over_cap_aborts_before_session_or_hardware(self):
         hardware = {
             "reward_num_pulses": 1,
@@ -511,12 +608,19 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
             {"reward_scheduled": False, "reward_omission_scheduled": True,
              "suction_scheduled": True},
         ]
+        reward_timing = reward.calculate_reward_timing({
+            "reward_num_pulses": 6,
+            "reward_pulse_on_sec": 0.1,
+            "reward_pulse_off_sec": 0.01,
+            "suction_delay_from_stim_onset_sec": 3.4,
+        })
         summary = reward.format_setup_summary(
             "mouse1", "notes", Path("assignment.json"), False, 1, trials,
             3.0, 4.5, 300.0, 300.0, 12.0, 612.0,
             {"reward_pin_bcm": 19, "lick_pin_bcm": 26,
              "suction_pin_bcm": 25, "simulate_gpio": True},
-            True, 3.5, 0.3, output_root=Path("/output"))
+            True, 3.4, 0.65, reward_timing=reward_timing,
+            output_root=Path("/output"))
         for text in (
                 "Mouse:", "Session notes:", "Blocks:", "Total trials:",
                 "Scheduled rewards:", "Scheduled omissions:",
@@ -524,6 +628,11 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
                 "ITI: uniform", "PRE gray background:", "POST gray background:",
                 "Planned task duration:", "Planned PRE + task + POST:",
                 "Camera/video cleanup not included.", "GPIO simulation:",
+                "Reward pulse-train duration: 0.650 s",
+                "Reward nominal completion: 1.650 s",
+                "Reward extends into gray ITI: yes (0.150 s)",
+                "Suction onset: 3.400 s",
+                "Reward-to-suction nominal gap: 1.750 s",
                 "Face camera:", "Output destination:"):
             self.assertIn(text, summary)
 
