@@ -248,6 +248,32 @@ sequence and excludes the skipped final ITI. REC is a controller-side
 operational timer, not a measurement of remote physical camera frames.
 Photodiode/DAQ remains the ground truth for neural alignment.
 
+### Control Pi telemetry
+
+The runner sends optional, read-only, best-effort UDP telemetry to the Control
+Pi at `192.168.1.150:5055` by default. Network I/O and JSON encoding run in a
+separate process; the experiment uses a bounded nonblocking queue, so monitor
+availability, dropped packets, and queue pressure cannot delay stimulus,
+reward, suction, GPIO processing, or session finalization. Disable it with:
+
+```bash
+python3 run_stringer_reward_conditioning.py --no-telemetry
+```
+
+Override the destination with `--telemetry-host` and `--telemetry-port`, or
+with `RIG_MONITOR_HOST` and `RIG_MONITOR_PORT`. CLI values take precedence.
+Telemetry phases include `WAITING_FOR_2P`, `PRE`, `STIMULUS`, `ITI`, `POST`,
+and `COMPLETE`; dashboard timestamps are operator telemetry, not scientific
+synchronization. Photodiode/DAQ remains the physical visual-timing ground
+truth.
+
+`reward_volume_ul_per_train` is the current per-train volume estimate or
+calibration. `task_water_delivered_ul_session` equals verified task rewards
+times that volume, while `task_water_likely_consumed_ul_session` equals
+verified rewards with a lick between actual valve-on and suction-on times,
+times that volume. “Likely consumed” is a heuristic, not a direct volumetric
+measurement. Manual test rewards are not included in task counters.
+
 The metadata retains `session_completed` for compatibility. Its more detailed
 `session_status` is also copied to `session_manifest.json` and can be:
 `complete`, `interrupted`, `failed`, `protocol_complete_video_pending`,

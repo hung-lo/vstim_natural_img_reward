@@ -865,6 +865,76 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
             rows[0]["estimated_suction_delay_from_physical_onset_sec"], 3.4
         )
 
+    def test_telemetry_reward_fields_and_physical_lick_alignment(self):
+        trial = {
+            "trial_number": 24, "block_number": 1,
+            "image_filename": "natimg_center_1825.png",
+            "image_role": "rewarded_high_1",
+            "reward_scheduled": True,
+            "reward_omission_scheduled": False,
+        }
+        runtime = {
+            "reward_command_id": "reward_1",
+            "suction_command_id": "suction_1",
+            "stim_request_monotonic_ns": 100_000_000_000,
+        }
+        events = [
+            {"command_id": "reward_1", "event_type": "reward_command_received"},
+            {"command_id": "reward_1", "event_type": "reward_valve_on",
+             "monotonic_ns": 101_000_000_000},
+            {"command_id": "reward_1", "event_type": "reward_valve_off",
+             "monotonic_ns": 101_100_000_000},
+            {"command_id": "reward_1", "event_type": "reward_complete"},
+            {"command_id": "suction_1", "event_type": "suction_on",
+             "monotonic_ns": 103_400_000_000},
+            {"event_type": "lick_onset", "monotonic_ns": 100_100_000_000},
+            {"event_type": "lick_onset", "monotonic_ns": 101_500_000_000},
+            {"event_type": "lick_onset", "monotonic_ns": 104_000_000_000},
+        ]
+        payload = reward.build_trial_telemetry_payload(
+            trial, runtime, events, 500, 10, 1,
+            stimulus_onset_compensation_sec=0.1,
+        )
+        self.assertTrue(payload["reward_delivered"])
+        self.assertTrue(payload["reward_contacted"])
+        self.assertTrue(payload["anticipatory_lick"])
+        self.assertEqual(payload["lick_time_reference"], "estimated_physical_stim_onset")
+        self.assertEqual(payload["lick_times_sec"], [0.0, 1.4, 3.9])
+
+    def test_telemetry_reward_contact_is_null_when_required_timing_missing(self):
+        trial = {
+            "reward_scheduled": True, "reward_omission_scheduled": False,
+        }
+        events = [
+            {"command_id": "reward_1", "event_type": "reward_command_received"},
+            {"command_id": "reward_1", "event_type": "reward_valve_on",
+             "monotonic_ns": 101},
+            {"command_id": "reward_1", "event_type": "reward_valve_off",
+             "monotonic_ns": 102},
+            {"command_id": "reward_1", "event_type": "reward_complete"},
+        ]
+        fields = reward.derive_telemetry_reward_fields(
+            trial, {"reward_command_id": "reward_1", "suction_command_id": "suction_1"},
+            events, 1,
+        )
+        self.assertTrue(fields["reward_delivered"])
+        self.assertIsNone(fields["reward_contacted"])
+
+    def test_task_water_accounting_is_idempotent_and_task_only(self):
+        accounting = reward.TaskWaterTelemetryAccounting(3.0)
+        accounting.record_trial(1, True, True)
+        accounting.record_trial(1, True, True)
+        accounting.record_trial(2, True, False)
+        accounting.record_trial(3, False, False)
+        accounting.record_trial(4, False, None)
+        self.assertEqual(accounting.summary()["task_reward_trains_verified_session"], 2)
+        self.assertEqual(accounting.summary()["task_reward_trains_contacted_session"], 1)
+        self.assertEqual(accounting.summary()["task_water_delivered_ul_session"], 6.0)
+        self.assertEqual(accounting.summary()["task_water_likely_consumed_ul_session"], 3.0)
+        self.assertIsNone(
+            reward.TaskWaterTelemetryAccounting(None).summary()["task_water_delivered_ul_session"]
+        )
+
     def test_zero_post_services_final_rewarded_suction(self):
         gpio_client = FakeGPIOClient()
         gpio_client.trigger_suction = mock.Mock(return_value="suction_1")
@@ -1093,6 +1163,13 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
                     status_callback(0.5)
 
         status_updates = []
+        telemetry_calls = []
+        telemetry_publisher = SimpleNamespace(
+            publish_trial=lambda payload: (telemetry_calls.append("telemetry_trial"), calls.append("telemetry_trial"))
+        )
+        telemetry_state_reporter = SimpleNamespace(
+            report_state=lambda payload, force=False: (telemetry_calls.append("telemetry_state"), calls.append("telemetry_state"))
+        )
         with tempfile.TemporaryDirectory(prefix="reward_boundary_") as temp_dir, \
              mock.patch.object(reward.base, "display_raw_with_timing", side_effect=fake_display), \
              mock.patch.object(reward, "wait_until", side_effect=fake_wait), \
@@ -1106,10 +1183,22 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
                     calls.append("status"),
                     status_updates.append((done, total, remaining))),
                 reward_volume_tracker=reward_tracker,
+                telemetry_publisher=telemetry_publisher,
+                telemetry_state_reporter=telemetry_state_reporter,
+                total_blocks=1,
+                post_background_sec=5.0,
             )
 
-        self.assertEqual(calls[:4], ["segment1", "reward", "segment2", "background"])
-        self.assertNotIn("status", calls[:4])
+        first_index = calls.index("segment1")
+        reward_index = calls.index("reward")
+        second_index = calls.index("segment2")
+        self.assertEqual(
+            calls[first_index:second_index + 1],
+            ["segment1", "reward", "segment2"],
+        )
+        self.assertEqual(reward_index, first_index + 1)
+        self.assertEqual(telemetry_calls[0], "telemetry_state")
+        self.assertEqual(telemetry_calls.count("telemetry_trial"), 1)
         self.assertEqual(calls.count("wait_with_status"), 2)
         self.assertEqual(calls.count("status"), 2)
         self.assertLess(calls.index("wait_with_status"), calls.index("suction"))
