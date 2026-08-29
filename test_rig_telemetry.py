@@ -70,8 +70,9 @@ class RigTelemetryTests(unittest.TestCase):
             self.assertFalse(hasattr(publisher, "message_queue"))
             context.Queue.assert_not_called()
             context.Process.assert_called_once()
+            process_call_args, process_call_kwargs = context.Process.call_args
             self.assertEqual(
-                context.Process.call_args.kwargs["target"],
+                process_call_kwargs["target"],
                 rig_telemetry._telemetry_worker,
             )
             process.start.assert_called_once_with()

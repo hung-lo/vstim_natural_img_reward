@@ -50,14 +50,16 @@ class CameraControlSafetyTests(unittest.TestCase):
         with mock.patch.object(camera, "run_cmd") as run_cmd:
             run_cmd.return_value = mock.Mock()
             camera.run_rsync("pi@test", "/remote/video", Path(self.temp_dir.name), dry_run=True)
-        command = run_cmd.call_args.args[0]
+        run_cmd_call_args, _ = run_cmd.call_args
+        command = run_cmd_call_args[0]
         self.assertNotIn("--remove-source-files", command)
         self.assertIn("--append-verify", command)
 
     def test_manifest_uses_long_hash_timeout(self):
         with mock.patch.object(camera, "run_ssh", return_value=mock.Mock(stdout="/remote/video/a.h264\t1\t" + "a" * 64)) as run_ssh:
             camera.collect_remote_raw_manifest("pi@test", "/remote/video")
-        self.assertEqual(run_ssh.call_args.kwargs["timeout"], camera.CAMERA_MANIFEST_TIMEOUT_SEC)
+        _, run_ssh_call_kwargs = run_ssh.call_args
+        self.assertEqual(run_ssh_call_kwargs["timeout"], camera.CAMERA_MANIFEST_TIMEOUT_SEC)
 
     def test_manifest_verification_rejects_wrong_size_or_hash(self):
         video_dir = Path(self.temp_dir.name) / "video"
