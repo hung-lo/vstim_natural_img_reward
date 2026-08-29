@@ -47,9 +47,11 @@ from rig_telemetry import (
 )
 from reward_conditioning_protocol import (
     ALL_ROLES,
+    LOW_ROLES,
     REWARDED_HIGH_ROLES,
     REWARD_PROBABILITY,
     TRIALS_PER_BLOCK,
+    UNREWARDED_HIGH_ROLES,
     create_or_load_assignment,
     global_panel_path,
     make_trial_plan,
@@ -893,10 +895,12 @@ class TaskWaterTelemetryAccounting(object):
         self.verified_trial_indices = set()
         self.contacted_trial_indices = set()
         self.behavior_recorded_trial_indices = set()
-        self.high_cue_trials_completed = set()
-        self.high_cue_anticipatory_lick_trials = set()
-        self.low_cue_trials_completed = set()
-        self.low_cue_anticipatory_lick_trials = set()
+        self.rewarded_high_cue_trials_completed = set()
+        self.rewarded_high_cue_anticipatory_lick_trials = set()
+        self.unrewarded_high_cue_trials_completed = set()
+        self.unrewarded_high_cue_anticipatory_lick_trials = set()
+        self.low_probability_cue_trials_completed = set()
+        self.low_probability_cue_anticipatory_lick_trials = set()
 
     def record_trial(self, trial_index, reward_delivered, reward_contacted):
         if reward_delivered:
@@ -905,19 +909,26 @@ class TaskWaterTelemetryAccounting(object):
             self.contacted_trial_indices.add(int(trial_index))
 
     def record_completed_behavior_trial(self, trial, anticipatory_lick):
-        """Record one completed high/low cue trial, idempotently."""
+        """Record one completed protocol-role trial, idempotently."""
         trial_index = int(trial["trial_index"])
         if trial_index in self.behavior_recorded_trial_indices:
             return
-        self.behavior_recorded_trial_indices.add(trial_index)
-        if bool(trial.get("reward_eligible")):
-            self.high_cue_trials_completed.add(trial_index)
-            if anticipatory_lick:
-                self.high_cue_anticipatory_lick_trials.add(trial_index)
+        role = trial.get("image_role")
+        if role in REWARDED_HIGH_ROLES:
+            completed = self.rewarded_high_cue_trials_completed
+            anticipatory = self.rewarded_high_cue_anticipatory_lick_trials
+        elif role in UNREWARDED_HIGH_ROLES:
+            completed = self.unrewarded_high_cue_trials_completed
+            anticipatory = self.unrewarded_high_cue_anticipatory_lick_trials
+        elif role in LOW_ROLES:
+            completed = self.low_probability_cue_trials_completed
+            anticipatory = self.low_probability_cue_anticipatory_lick_trials
         else:
-            self.low_cue_trials_completed.add(trial_index)
-            if anticipatory_lick:
-                self.low_cue_anticipatory_lick_trials.add(trial_index)
+            raise ValueError("Unknown trial image role for behavior counters: %r" % role)
+        self.behavior_recorded_trial_indices.add(trial_index)
+        completed.add(trial_index)
+        if anticipatory_lick:
+            anticipatory.add(trial_index)
 
     def summary(self):
         volume = self.reward_volume_ul_per_train
@@ -931,10 +942,12 @@ class TaskWaterTelemetryAccounting(object):
             "task_water_likely_consumed_ul_session": (
                 None if volume is None else len(self.contacted_trial_indices) * volume
             ),
-            "task_high_cue_trials_completed_session": len(self.high_cue_trials_completed),
-            "task_high_cue_anticipatory_lick_trials_session": len(self.high_cue_anticipatory_lick_trials),
-            "task_low_cue_trials_completed_session": len(self.low_cue_trials_completed),
-            "task_low_cue_anticipatory_lick_trials_session": len(self.low_cue_anticipatory_lick_trials),
+            "task_rewarded_high_cue_trials_completed_session": len(self.rewarded_high_cue_trials_completed),
+            "task_rewarded_high_cue_anticipatory_lick_trials_session": len(self.rewarded_high_cue_anticipatory_lick_trials),
+            "task_unrewarded_high_cue_trials_completed_session": len(self.unrewarded_high_cue_trials_completed),
+            "task_unrewarded_high_cue_anticipatory_lick_trials_session": len(self.unrewarded_high_cue_anticipatory_lick_trials),
+            "task_low_probability_cue_trials_completed_session": len(self.low_probability_cue_trials_completed),
+            "task_low_probability_cue_anticipatory_lick_trials_session": len(self.low_probability_cue_anticipatory_lick_trials),
         }
 
 
@@ -946,10 +959,12 @@ def _telemetry_water_fields(water_accounting):
             "task_reward_trains_contacted_session": 0,
             "task_water_delivered_ul_session": None,
             "task_water_likely_consumed_ul_session": None,
-            "task_high_cue_trials_completed_session": 0,
-            "task_high_cue_anticipatory_lick_trials_session": 0,
-            "task_low_cue_trials_completed_session": 0,
-            "task_low_cue_anticipatory_lick_trials_session": 0,
+            "task_rewarded_high_cue_trials_completed_session": 0,
+            "task_rewarded_high_cue_anticipatory_lick_trials_session": 0,
+            "task_unrewarded_high_cue_trials_completed_session": 0,
+            "task_unrewarded_high_cue_anticipatory_lick_trials_session": 0,
+            "task_low_probability_cue_trials_completed_session": 0,
+            "task_low_probability_cue_anticipatory_lick_trials_session": 0,
         }
     return water_accounting.summary()
 
