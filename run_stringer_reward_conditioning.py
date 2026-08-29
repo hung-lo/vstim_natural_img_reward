@@ -1622,8 +1622,10 @@ def run_trials(
     water_accounting=None,
     total_blocks=0,
     post_background_sec=0.0,
+    runtime_by_trial=None,
 ):
-    runtime_by_trial = {}
+    if runtime_by_trial is None:
+        runtime_by_trial = {}
     pending_final_reward_checks = []
     task_start_monotonic = time.monotonic()
     total_trials = len(trials)
@@ -3081,6 +3083,7 @@ def main(argv=None):
                 water_accounting=water_accounting,
                 total_blocks=n_blocks,
                 post_background_sec=post_background_min * 60.0,
+                runtime_by_trial=runtime_by_trial,
             )
             metadata["task_end_monotonic_ns"] = time.monotonic_ns()
             metadata["task_elapsed_sec"] = (metadata["task_end_monotonic_ns"] - metadata["task_start_monotonic_ns"]) / 1e9

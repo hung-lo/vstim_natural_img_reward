@@ -1069,6 +1069,200 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
         self.assertEqual(invalid["unexpected_suction_command_ids"], ["rogue_suction"])
         self.assertFalse(invalid["qc_pass"])
 
+    def _run_trials_until_iti_interrupt(self, interrupt_on_trial_number):
+        trials = []
+        for index in range(4):
+            trials.append({
+                "trial_index": index,
+                "trial_number": index + 1,
+                "block_number": 1,
+                "image_role": "role_%d" % index,
+                "image_category": "conditioned",
+                "image_id": index + 1,
+                "image_filename": "img_%d.png" % index,
+                "reward_eligible": False,
+                "reward_scheduled": False,
+                "reward_omission_scheduled": False,
+                "suction_scheduled": False,
+                "planned_iti_duration_sec": 4.0,
+            })
+
+        loaded_raws = {
+            trial["image_filename"]: {
+                "first": Path("first.raw"), "second": Path("second.raw")
+            }
+            for trial in trials
+        }
+        raw_paths = {
+            trial["image_filename"]: {
+                "first": Path("first.raw"), "second": Path("second.raw")
+            }
+            for trial in trials
+        }
+        display_count = {"value": 0}
+        wait_count = {"value": 0}
+
+        def fake_display(screen, raw_path):
+            del screen, raw_path
+            display_count["value"] += 1
+            base_ns = display_count["value"] * 1_000_000_000
+            return SimpleNamespace(
+                start_time=0, mean_interframe=0, stddev_interframe=0
+            ), {
+                "request_utc_iso": "iso",
+                "request_unix_sec": "1.0",
+                "request_unix_ns": base_ns,
+                "request_perf_counter_ns": base_ns,
+                "return_unix_ns": base_ns + 1,
+                "return_perf_counter_ns": base_ns + 1,
+                "duration_sec": 0.001,
+            }
+
+        def interrupting_wait(*args, **kwargs):
+            del args, kwargs
+            wait_count["value"] += 1
+            if wait_count["value"] == interrupt_on_trial_number:
+                raise KeyboardInterrupt()
+
+        caller_runtime = {}
+        gpio_client = FakeGPIOClient()
+        with tempfile.TemporaryDirectory(prefix="reward_interrupt_runtime_") as temp_dir:
+            with mock.patch.object(
+                reward.base,
+                "display_raw_with_timing",
+                side_effect=fake_display,
+            ), mock.patch.object(
+                reward,
+                "wait_until",
+                side_effect=interrupting_wait,
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    reward.run_trials(
+                        SimpleNamespace(),
+                        trials,
+                        loaded_raws,
+                        Path(temp_dir) / "gray.loaded",
+                        raw_paths,
+                        Path(temp_dir) / "gray.raw",
+                        gpio_client,
+                        Path(temp_dir) / "events.csv",
+                        [],
+                        6,
+                        0.5,
+                        3.5,
+                        0.05,
+                        runtime_by_trial=caller_runtime,
+                    )
+        return trials, caller_runtime
+
+    def test_interruption_preserves_completed_trials(self):
+        trials, runtime_by_trial = self._run_trials_until_iti_interrupt(3)
+        self.assertEqual(sorted(runtime_by_trial), [0, 1, 2])
+        for trial_index in (0, 1):
+            self.assertTrue(runtime_by_trial[trial_index]["trial_executed"])
+            self.assertTrue(runtime_by_trial[trial_index]["stim_presented"])
+            self.assertTrue(runtime_by_trial[trial_index]["trial_completed"])
+        self.assertTrue(runtime_by_trial[2]["trial_executed"])
+        self.assertTrue(runtime_by_trial[2]["stim_presented"])
+        self.assertFalse(runtime_by_trial[2]["trial_completed"])
+        self.assertNotIn(3, runtime_by_trial)
+        self.assertEqual(len(trials), 4)
+
+    def test_interruption_during_current_iti_preserves_partial_trial(self):
+        trials, runtime_by_trial = self._run_trials_until_iti_interrupt(2)
+        self.assertTrue(runtime_by_trial[0]["trial_completed"])
+        current = runtime_by_trial[1]
+        self.assertTrue(current["trial_executed"])
+        self.assertTrue(current["stim_presented"])
+        self.assertFalse(current["trial_completed"])
+        self.assertNotIn(2, runtime_by_trial)
+        self.assertEqual(trials[1]["trial_index"], 1)
+
+    def test_partial_trial_summary_preserves_executed_command_ids(self):
+        trial = {
+            "trial_index": 0, "trial_number": 1, "block_number": 1,
+            "image_role": "rewarded_high_1", "image_category": "conditioned",
+            "image_id": 1, "image_filename": "img.png",
+            "reward_eligible": True, "reward_scheduled": True,
+            "reward_omission_scheduled": False, "suction_scheduled": True,
+            "planned_iti_duration_sec": 4.0,
+        }
+        runtime = {
+            "trial_executed": True,
+            "stim_presented": True,
+            "trial_completed": False,
+            "reward_command_id": "reward_1",
+            "suction_command_id": "suction_1",
+            "stim_request_monotonic_ns": 100_000_000_000,
+        }
+        events = [
+            {"event_type": "reward_command_received", "command_id": "reward_1"},
+            {"event_type": "reward_valve_on", "command_id": "reward_1", "monotonic_ns": 101_000_000_000},
+            {"event_type": "reward_valve_off", "command_id": "reward_1", "monotonic_ns": 101_100_000_000},
+            {"event_type": "reward_complete", "command_id": "reward_1"},
+            {"event_type": "suction_command_received", "command_id": "suction_1"},
+            {"event_type": "suction_on", "command_id": "suction_1", "monotonic_ns": 103_400_000_000},
+            {"event_type": "suction_off", "command_id": "suction_1", "monotonic_ns": 103_450_000_000},
+            {"event_type": "suction_complete", "command_id": "suction_1"},
+        ]
+        rows = reward.build_trial_summary([trial], {0: runtime}, events)
+        self.assertTrue(rows[0]["trial_executed"])
+        self.assertTrue(rows[0]["stim_presented"])
+        self.assertFalse(rows[0]["trial_completed"])
+        self.assertEqual(rows[0]["reward_command_id"], "reward_1")
+        self.assertEqual(rows[0]["suction_command_id"], "suction_1")
+        self.assertEqual(rows[0]["suction_on_monotonic_ns"], 103_400_000_000)
+
+    def test_partial_qc_does_not_mark_executed_commands_unexpected(self):
+        def make_trial(index, reward_scheduled, suction_scheduled):
+            return {
+                "trial_index": index, "trial_number": index + 1,
+                "block_number": 1, "image_role": "role_%d" % index,
+                "image_category": "conditioned", "image_id": index + 1,
+                "image_filename": "img_%d.png" % index,
+                "reward_eligible": reward_scheduled,
+                "reward_scheduled": reward_scheduled,
+                "reward_omission_scheduled": False,
+                "suction_scheduled": suction_scheduled,
+                "planned_iti_duration_sec": 4.0,
+            }
+
+        executed_trial = make_trial(0, True, True)
+        future_trial = make_trial(1, False, False)
+        runtime = {
+            "trial_executed": True,
+            "stim_presented": True,
+            "trial_completed": False,
+            "reward_command_id": "reward_1",
+            "suction_command_id": "suction_1",
+            "stim_request_monotonic_ns": 100_000_000_000,
+        }
+        events = [
+            {"event_type": "reward_command_received", "command_id": "reward_1"},
+            {"event_type": "reward_valve_on", "command_id": "reward_1"},
+            {"event_type": "reward_valve_off", "command_id": "reward_1"},
+            {"event_type": "reward_complete", "command_id": "reward_1"},
+            {"event_type": "suction_command_received", "command_id": "suction_1"},
+            {"event_type": "suction_on", "command_id": "suction_1"},
+            {"event_type": "suction_off", "command_id": "suction_1"},
+            {"event_type": "suction_complete", "command_id": "suction_1"},
+        ]
+        rows = reward.build_trial_summary(
+            [executed_trial, future_trial], {0: runtime}, events
+        )
+        qc = reward.build_session_qc(
+            "interrupted-session",
+            [executed_trial, future_trial],
+            rows,
+            events,
+            reward_num_pulses=1,
+        )
+        self.assertFalse(qc["qc_pass"])
+        self.assertEqual(qc["executed_trial_count"], 1)
+        self.assertEqual(qc["completed_trial_count"], 0)
+        self.assertEqual(qc["unexpected_reward_command_ids"], [])
+        self.assertEqual(qc["unexpected_suction_command_ids"], [])
+
     def test_run_trials_skips_final_iti(self):
         trials = [
             {
@@ -1143,6 +1337,7 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
             event_log_path = Path(temp_dir) / "event_log.csv"
             background_raw_path = Path(temp_dir) / "gray.raw"
             loaded_background_raw = Path(temp_dir) / "gray_loaded.raw"
+            caller_runtime = {}
             with mock.patch.object(reward.base, "display_raw_with_timing", side_effect=fake_display_raw_with_timing),                  mock.patch.object(reward, "wait_until", side_effect=fake_wait_until):
                 runtime_by_trial, pending_final_reward_checks = reward.run_trials(
                     fake_screen,
@@ -1160,9 +1355,11 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
                     suction_duration_sec=0.05,
                     status_callback=lambda done, total, remaining: status_updates.append(
                         (done, total, remaining)),
+                    runtime_by_trial=caller_runtime,
                 )
 
         self.assertEqual(len(wait_calls), 1)
+        self.assertIs(runtime_by_trial, caller_runtime)
         self.assertTrue(runtime_by_trial[0]["trial_completed"])
         self.assertTrue(runtime_by_trial[1]["trial_completed"])
         self.assertEqual(pending_final_reward_checks, [])
