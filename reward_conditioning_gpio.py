@@ -250,10 +250,36 @@ def gpio_worker_main(connection, config):
                              suction_pin_bcm=config["suction_pin_bcm"], suction_duration_sec=duration))
 
         running = True
+        simulated_lick_deadlines = []
         while running:
-            # Blocking recv wakes immediately on a parent command and releases
-            # the GIL while waiting, allowing gpiozero lick callback threads to
-            # continue running.
+            # In simulation, poll until either a parent command arrives or a
+            # pending synthetic lick deadline is due.  Real GPIO remains on
+            # the blocking command path; its callbacks are independent.
+            if simulated_lick_deadlines:
+                timeout = max(0.0, min(simulated_lick_deadlines) - time.monotonic())
+                if not connection.poll(timeout):
+                    now = time.monotonic()
+                    due = [
+                        deadline for deadline in simulated_lick_deadlines
+                        if deadline <= now
+                    ]
+                    simulated_lick_deadlines = [
+                        deadline for deadline in simulated_lick_deadlines
+                        if deadline > now
+                    ]
+                    for _deadline in due:
+                        safe_send(
+                            _event(
+                                "lick_onset",
+                                context_snapshot(),
+                                lick_pin_bcm=config["lick_pin_bcm"],
+                                lick_edge="simulated_behavior_test",
+                                notes="synthetic_anticipatory_behavior_validation",
+                            )
+                        )
+                    continue
+            else:
+                connection.poll(None)
             command = connection.recv()
             command_type = command.get("command")
             command_id = command.get("command_id", "")
@@ -325,6 +351,21 @@ def gpio_worker_main(connection, config):
                         lick_edge="simulated_test",
                         notes="synthetic_water_accounting_validation",
                     )
+                )
+
+            elif command_type == "schedule_simulated_lick":
+                if not simulate:
+                    raise RuntimeError("Synthetic licks require simulate_gpio.")
+                delay_sec = float(command.get("delay_sec", 0.0))
+                if delay_sec < 0:
+                    raise ValueError("Synthetic lick delay must be nonnegative.")
+                simulated_lick_deadlines.append(time.monotonic() + delay_sec)
+                safe_send(
+                    {
+                        "message_type": "ack",
+                        "command": "schedule_simulated_lick",
+                        "command_id": command_id,
+                    }
                 )
 
             elif command_type == "shutdown":
@@ -524,6 +565,24 @@ class BehaviorGPIOClient(object):
             "command": "simulate_lick",
             "command_id": command_id,
         })
+        return command_id
+
+    def schedule_simulated_lick(self, delay_sec):
+        """Schedule one asynchronous test lick in the simulated GPIO child."""
+        if not bool(self.config.get("simulate_gpio", False)):
+            raise RuntimeError(
+                "Synthetic licks require --simulate-gpio; refusing real GPIO mode."
+            )
+        delay_sec = float(delay_sec)
+        if delay_sec < 0:
+            raise ValueError("Synthetic lick delay must be nonnegative.")
+        command_id = self._next_command_id("schedule_simulate_lick")
+        self._connection.send({
+            "command": "schedule_simulated_lick",
+            "command_id": command_id,
+            "delay_sec": delay_sec,
+        })
+        self._wait_for_ack("schedule_simulated_lick", command_id)
         return command_id
 
     def drain_events(self):

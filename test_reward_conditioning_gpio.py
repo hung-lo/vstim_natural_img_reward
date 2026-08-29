@@ -63,6 +63,33 @@ class RewardConditioningGPIOTests(unittest.TestCase):
             client.simulate_lick()
         client._connection.send.assert_not_called()
 
+    def test_schedule_simulated_lick_emits_asynchronously(self):
+        client = BehaviorGPIOClient(_simulation_config())
+        try:
+            client.start()
+            client.schedule_simulated_lick(0.05)
+            immediate = client.drain_events()
+            self.assertFalse(
+                any(event.get("lick_edge") == "simulated_behavior_test" for event in immediate)
+            )
+            deadline = time.monotonic() + 1.0
+            events = []
+            while time.monotonic() < deadline:
+                events.extend(client.drain_events())
+                if any(event.get("lick_edge") == "simulated_behavior_test" for event in events):
+                    break
+                time.sleep(0.01)
+            lick = next(
+                event for event in events
+                if event.get("lick_edge") == "simulated_behavior_test"
+            )
+            self.assertIn("monotonic_ns", lick)
+            self.assertEqual(
+                lick["notes"], "synthetic_anticipatory_behavior_validation"
+            )
+        finally:
+            client.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

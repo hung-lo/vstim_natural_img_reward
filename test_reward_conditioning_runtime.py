@@ -289,6 +289,15 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
         self.assertTrue(args.simulate_gpio)
         self.assertTrue(args.simulate_water_test)
 
+    def test_simulate_behavior_test_requires_simulate_gpio_and_composes(self):
+        with self.assertRaises(SystemExit):
+            reward.parse_args(["--simulate-behavior-test"])
+        args = reward.parse_args([
+            "--simulate-gpio", "--simulate-behavior-test", "--simulate-water-test"
+        ])
+        self.assertTrue(args.simulate_behavior_test)
+        self.assertTrue(args.simulate_water_test)
+
     def test_latest_camera_state_populates_final_metadata(self):
         fetch_state = {
             "camera_transfer_completed": True, "camera_raw_files_verified": True,

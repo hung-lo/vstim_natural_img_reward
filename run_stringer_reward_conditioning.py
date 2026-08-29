@@ -245,6 +245,11 @@ def parse_args(argv=None):
         action="store_true",
         help="Inject deterministic synthetic licks for water-accounting validation. Requires --simulate-gpio. Never use for experimental sessions.",
     )
+    parser.add_argument(
+        "--simulate-behavior-test",
+        action="store_true",
+        help="Inject deterministic synthetic anticipatory licks for behavior-metric validation. Requires --simulate-gpio. Never use for experimental sessions.",
+    )
     parser.add_argument("--mouse-id")
     parser.add_argument("--session-notes")
     parser.add_argument("--blocks", type=int)
@@ -274,6 +279,8 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if args.simulate_water_test and not args.simulate_gpio:
         parser.error("--simulate-water-test requires --simulate-gpio")
+    if args.simulate_behavior_test and not args.simulate_gpio:
+        parser.error("--simulate-behavior-test requires --simulate-gpio")
     return args
 
 
@@ -1685,6 +1692,7 @@ def run_trials(
     post_background_sec=0.0,
     runtime_by_trial=None,
     simulate_water_test=False,
+    simulate_behavior_test=False,
 ):
     if runtime_by_trial is None:
         runtime_by_trial = {}
@@ -1692,6 +1700,11 @@ def run_trials(
     task_start_monotonic = time.monotonic()
     total_trials = len(trials)
     simulated_reward_ordinal = 0
+    simulated_behavior_ordinals = {
+        "rewarded_high": 0,
+        "unrewarded_high": 0,
+        "low_probability": 0,
+    }
 
     for completed_count, trial in enumerate(trials, start=1):
         trial_index = trial["trial_index"]
@@ -1730,6 +1743,30 @@ def run_trials(
             water_accounting,
             force=True,
         )
+        if simulate_behavior_test:
+            if trial.get("image_role") in REWARDED_HIGH_ROLES:
+                behavior_category = "rewarded_high"
+                anticipatory_target = 15
+            elif trial.get("image_role") in UNREWARDED_HIGH_ROLES:
+                behavior_category = "unrewarded_high"
+                anticipatory_target = 4
+            elif trial.get("image_role") in LOW_ROLES:
+                behavior_category = "low_probability"
+                anticipatory_target = 1
+            else:
+                raise ValueError(
+                    "Unknown trial image role for behavior simulation: %r"
+                    % trial.get("image_role")
+                )
+            simulated_behavior_ordinals[behavior_category] += 1
+            if simulated_behavior_ordinals[behavior_category] <= anticipatory_target:
+                # The worker receives this before the authoritative stimulus
+                # request.  Add the calibrated request-to-physical-onset
+                # compensation so telemetry lands near +0.60 s from its
+                # estimated physical onset.
+                gpio_client.schedule_simulated_lick(
+                    0.60 + float(stimulus_onset_compensation_sec)
+                )
         runtime["trial_executed"] = True
         runtime["stim_request_monotonic_ns"] = time.monotonic_ns()
         stim_request_timestamp = base.capture_timestamp()
@@ -2568,6 +2605,7 @@ def format_setup_summary(mouse_id, session_notes, assignment_path,
             display_timing["stimulus_onset_compensation_sec"],
         ),
         "  Reward probability: %.3f (fixed)" % REWARD_PROBABILITY,
+        "  Synthetic behavior-metric test: %s" % hardware_config.get("simulate_behavior_test", False),
         "  ITI: uniform %.3f-%.3f s" % (iti_min_sec, iti_max_sec),
         "  PRE gray background: %s" % base.format_seconds(pre_sec),
         "  POST gray background: %s" % base.format_seconds(post_sec),
@@ -2605,6 +2643,7 @@ def main(argv=None):
         args.hardware_config, simulate_gpio=args.simulate_gpio
     )
     hardware_config["simulate_water_test"] = bool(args.simulate_water_test)
+    hardware_config["simulate_behavior_test"] = bool(args.simulate_behavior_test)
     suction_delay_sec = float(hardware_config["suction_delay_from_stim_onset_sec"])
     reward_timing = calculate_reward_timing(hardware_config)
     display_timing = resolve_display_timing_calibration(hardware_config)
@@ -2791,6 +2830,7 @@ def main(argv=None):
         "reward_is_lick_contingent": False,
         "simulate_gpio": bool(hardware_config["simulate_gpio"]),
         "simulate_water_test": bool(args.simulate_water_test),
+        "simulate_behavior_test": bool(args.simulate_behavior_test),
         "reward_trigger_rule": "precomputed schedule only; licking is recorded but never gates reward",
         "n_unique_images": 14,
         "n_blocks": n_blocks,
@@ -3167,6 +3207,7 @@ def main(argv=None):
                 post_background_sec=post_background_min * 60.0,
                 runtime_by_trial=runtime_by_trial,
                 simulate_water_test=args.simulate_water_test,
+                simulate_behavior_test=args.simulate_behavior_test,
             )
             metadata["task_end_monotonic_ns"] = time.monotonic_ns()
             metadata["task_elapsed_sec"] = (metadata["task_end_monotonic_ns"] - metadata["task_start_monotonic_ns"]) / 1e9
