@@ -238,6 +238,11 @@ def parse_args(argv=None):
         action="store_true",
         help="Run the GPIO child with a mock valve and no lick input.",
     )
+    parser.add_argument(
+        "--simulate-water-test",
+        action="store_true",
+        help="Inject deterministic synthetic licks for water-accounting validation. Requires --simulate-gpio. Never use for experimental sessions.",
+    )
     parser.add_argument("--mouse-id")
     parser.add_argument("--session-notes")
     parser.add_argument("--blocks", type=int)
@@ -264,7 +269,10 @@ def parse_args(argv=None):
         action="store_true",
         help="Disable optional read-only UDP telemetry.",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.simulate_water_test and not args.simulate_gpio:
+        parser.error("--simulate-water-test requires --simulate-gpio")
+    return args
 
 
 def _strict_prompt(prompt):
@@ -1623,12 +1631,14 @@ def run_trials(
     total_blocks=0,
     post_background_sec=0.0,
     runtime_by_trial=None,
+    simulate_water_test=False,
 ):
     if runtime_by_trial is None:
         runtime_by_trial = {}
     pending_final_reward_checks = []
     task_start_monotonic = time.monotonic()
     total_trials = len(trials)
+    simulated_reward_ordinal = 0
 
     for completed_count, trial in enumerate(trials, start=1):
         trial_index = trial["trial_index"]
@@ -1803,6 +1813,21 @@ def run_trials(
         )
         second_row["segment_boundary_gap_sec"] = "%.9f" % segment_boundary_gap_sec
         append_event(event_log_path, second_row)
+
+        # This test-only hook is after the complete visual stimulus has
+        # returned to gray and outside the segment1 -> reward -> segment2
+        # timing boundary. Contact and water accounting still use the normal
+        # timestamped GPIO event derivation.
+        if simulate_water_test:
+            inject_simulated_lick = False
+            if trial["reward_scheduled"]:
+                simulated_reward_ordinal += 1
+                inject_simulated_lick = simulated_reward_ordinal % 2 == 1
+            elif trial["reward_omission_scheduled"]:
+                inject_simulated_lick = True
+            if inject_simulated_lick:
+                gpio_client.set_context(trial_context(trial, "iti"))
+                gpio_client.simulate_lick()
 
         if trial["reward_scheduled"]:
             reward_check = {
@@ -2511,6 +2536,7 @@ def format_setup_summary(mouse_id, session_notes, assignment_path,
         "  Reward-to-suction nominal gap: %.3f s"
         % reward_timing["reward_to_suction_nominal_gap_sec"],
         "  GPIO simulation: %s" % hardware_config["simulate_gpio"],
+        "  Synthetic water-accounting test: %s" % hardware_config.get("simulate_water_test", False),
         "  Face camera: %s" % use_camera,
         "  Output destination: %s/<session_id>" % output_root,
         "  IMPORTANT: reward delivery is independent of licking.",
@@ -2525,6 +2551,7 @@ def main(argv=None):
     hardware_config = load_hardware_config(
         args.hardware_config, simulate_gpio=args.simulate_gpio
     )
+    hardware_config["simulate_water_test"] = bool(args.simulate_water_test)
     suction_delay_sec = float(hardware_config["suction_delay_from_stim_onset_sec"])
     reward_timing = calculate_reward_timing(hardware_config)
     display_timing = resolve_display_timing_calibration(hardware_config)
@@ -2709,6 +2736,8 @@ def main(argv=None):
         "session_notes": session_notes,
         "protocol": "open_loop_natural_image_reward_conditioning",
         "reward_is_lick_contingent": False,
+        "simulate_gpio": bool(hardware_config["simulate_gpio"]),
+        "simulate_water_test": bool(args.simulate_water_test),
         "reward_trigger_rule": "precomputed schedule only; licking is recorded but never gates reward",
         "n_unique_images": 14,
         "n_blocks": n_blocks,
@@ -3084,6 +3113,7 @@ def main(argv=None):
                 total_blocks=n_blocks,
                 post_background_sec=post_background_min * 60.0,
                 runtime_by_trial=runtime_by_trial,
+                simulate_water_test=args.simulate_water_test,
             )
             metadata["task_end_monotonic_ns"] = time.monotonic_ns()
             metadata["task_elapsed_sec"] = (metadata["task_end_monotonic_ns"] - metadata["task_start_monotonic_ns"]) / 1e9

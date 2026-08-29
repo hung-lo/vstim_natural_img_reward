@@ -314,6 +314,19 @@ def gpio_worker_main(connection, config):
                                        "reward_scheduled": False, "suction_scheduled": False})
                 deliver_suction(manual_context, command_id, "operator_manual_test")
 
+            elif command_type == "simulate_lick":
+                if not simulate:
+                    raise RuntimeError("Synthetic licks require simulate_gpio.")
+                safe_send(
+                    _event(
+                        "lick_onset",
+                        context_snapshot(),
+                        lick_pin_bcm=config["lick_pin_bcm"],
+                        lick_edge="simulated_test",
+                        notes="synthetic_water_accounting_validation",
+                    )
+                )
+
             elif command_type == "shutdown":
                 running = False
                 safe_send(
@@ -498,6 +511,19 @@ class BehaviorGPIOClient(object):
                 "command_id": command_id,
             }
         )
+        return command_id
+
+    def simulate_lick(self):
+        """Inject one test lick only when the GPIO worker is simulated."""
+        if not bool(self.config.get("simulate_gpio", False)):
+            raise RuntimeError(
+                "Synthetic licks require --simulate-gpio; refusing real GPIO mode."
+            )
+        command_id = self._next_command_id("simulate_lick")
+        self._connection.send({
+            "command": "simulate_lick",
+            "command_id": command_id,
+        })
         return command_id
 
     def drain_events(self):

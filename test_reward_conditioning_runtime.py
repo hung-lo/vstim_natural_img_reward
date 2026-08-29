@@ -282,6 +282,13 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             reward.parse_args(["--camera", "--no-camera"])
 
+    def test_simulate_water_test_requires_simulate_gpio(self):
+        with self.assertRaises(SystemExit):
+            reward.parse_args(["--simulate-water-test"])
+        args = reward.parse_args(["--simulate-gpio", "--simulate-water-test"])
+        self.assertTrue(args.simulate_gpio)
+        self.assertTrue(args.simulate_water_test)
+
     def test_latest_camera_state_populates_final_metadata(self):
         fetch_state = {
             "camera_transfer_completed": True, "camera_raw_files_verified": True,
@@ -732,6 +739,7 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
                 "ITI: uniform", "PRE gray background:", "POST gray background:",
                 "Planned task duration:", "Planned PRE + task + POST:",
                 "Camera/video cleanup not included.", "GPIO simulation:",
+                "Synthetic water-accounting test:",
                 "Reward pulse-train duration: 0.650 s",
                 "Reward nominal completion: 1.650 s",
                 "Reward extends into gray ITI: yes (0.150 s)",
@@ -944,6 +952,42 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
         )
         self.assertTrue(fields["reward_delivered"])
         self.assertFalse(fields["reward_contacted"])
+
+    def test_simulated_lick_contacts_reward_but_not_omission(self):
+        reward_trial = {"reward_scheduled": True, "reward_omission_scheduled": False}
+        omission_trial = {"reward_scheduled": False, "reward_omission_scheduled": True}
+        reward_runtime = {
+            "reward_command_id": "reward_1", "suction_command_id": "suction_1",
+            "stim_request_monotonic_ns": 100_000_000_000,
+        }
+        reward_events = [
+            {"command_id": "reward_1", "event_type": "reward_command_received"},
+            {"command_id": "reward_1", "event_type": "reward_valve_on",
+             "monotonic_ns": 101_000_000_000},
+            {"command_id": "reward_1", "event_type": "reward_valve_off",
+             "monotonic_ns": 101_100_000_000},
+            {"command_id": "reward_1", "event_type": "reward_complete"},
+            {"command_id": "suction_1", "event_type": "suction_on",
+             "monotonic_ns": 103_400_000_000},
+            {"event_type": "lick_onset", "lick_edge": "simulated_test",
+             "notes": "synthetic_water_accounting_validation",
+             "monotonic_ns": 101_500_000_000},
+        ]
+        contacted = reward.derive_telemetry_reward_fields(
+            reward_trial, reward_runtime, reward_events, 1)
+        self.assertTrue(contacted["reward_delivered"])
+        self.assertTrue(contacted["reward_contacted"])
+
+        omission_events = [{
+            "event_type": "lick_onset", "lick_edge": "simulated_test",
+            "notes": "synthetic_water_accounting_validation",
+            "monotonic_ns": 101_500_000_000,
+        }]
+        omission = reward.derive_telemetry_reward_fields(
+            omission_trial, {"stim_request_monotonic_ns": 100_000_000_000},
+            omission_events, 1)
+        self.assertFalse(omission["reward_delivered"])
+        self.assertFalse(omission["reward_contacted"])
 
     def test_telemetry_recent_event_view_excludes_prior_session_events(self):
         events = [

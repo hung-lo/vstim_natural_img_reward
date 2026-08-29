@@ -314,6 +314,23 @@ python3 smoke_test_reward_gpio.py
 python3 test_remote_camera_control.py
 ```
 
+For an end-to-end simulated water-accounting check, create a temporary config
+with `reward_volume_ul_per_train` set to `3.0` (leave the real config
+unchanged), then run:
+
+```bash
+python3 run_stringer_reward_conditioning.py \
+  --hardware-config /tmp/reward_conditioning_water_test.json \
+  --simulate-gpio --simulate-water-test --no-camera \
+  --mouse-id water_monitor_test --blocks 1 \
+  --iti-min-sec 3.0 --iti-max-sec 3.0 \
+  --pre-background-min 0.05 --post-background-min 0.05
+```
+
+This deliberately injects synthetic licks only in GPIO simulation mode. A
+standard 50-trial block should report 18 verified rewards, 9 contacted
+rewards, 54.0 uL delivered, and 27.0 uL likely consumed.
+
 After that, run one simulated session with `--simulate-gpio` before touching
 the valve or lick hardware. On the Pi, confirm the GPIO pins are wired as
 BCM19 for reward, BCM25 for suction, and BCM26 for lick detection.
