@@ -252,9 +252,10 @@ Photodiode/DAQ remains the ground truth for neural alignment.
 
 The runner sends optional, read-only, best-effort UDP telemetry to the Control
 Pi at `192.168.1.150:5055` by default. Network I/O and JSON encoding run in a
-separate process; the experiment uses a bounded nonblocking queue, so monitor
-availability, dropped packets, and queue pressure cannot delay stimulus,
-reward, suction, GPIO processing, or session finalization. Disable it with:
+separate process; the experiment hands off small pickled messages through a
+bounded, nonblocking `AF_UNIX SOCK_DGRAM` socketpair, so monitor availability,
+dropped packets, and local IPC pressure cannot delay stimulus, reward, suction,
+GPIO processing, or session finalization. Disable it with:
 
 ```bash
 python3 run_stringer_reward_conditioning.py --no-telemetry
@@ -262,6 +263,16 @@ python3 run_stringer_reward_conditioning.py --no-telemetry
 
 Override the destination with `--telemetry-host` and `--telemetry-port`, or
 with `RIG_MONITOR_HOST` and `RIG_MONITOR_PORT`. CLI values take precedence.
+To characterize parent-side handoff overhead on Box151, run at least 1,000
+calls against the live telemetry worker:
+
+```bash
+python3 benchmark_rig_telemetry_publish.py --host 192.168.1.150 --port 5055 --count 1000
+```
+
+The diagnostic reports median, p95, and maximum publish-call duration in
+microseconds, plus dropped calls and parent errors. It is not part of normal
+experiment runs.
 Telemetry phases include `WAITING_FOR_2P`, `PRE`, `STIMULUS`, `ITI`, `POST`,
 and `COMPLETE`; dashboard timestamps are operator telemetry, not scientific
 synchronization. Photodiode/DAQ remains the physical visual-timing ground
