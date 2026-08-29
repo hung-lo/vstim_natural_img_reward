@@ -892,12 +892,32 @@ class TaskWaterTelemetryAccounting(object):
         self.reward_volume_ul_per_train = reward_volume_ul_per_train
         self.verified_trial_indices = set()
         self.contacted_trial_indices = set()
+        self.behavior_recorded_trial_indices = set()
+        self.high_cue_trials_completed = set()
+        self.high_cue_anticipatory_lick_trials = set()
+        self.low_cue_trials_completed = set()
+        self.low_cue_anticipatory_lick_trials = set()
 
     def record_trial(self, trial_index, reward_delivered, reward_contacted):
         if reward_delivered:
             self.verified_trial_indices.add(int(trial_index))
         if reward_delivered and reward_contacted is True:
             self.contacted_trial_indices.add(int(trial_index))
+
+    def record_completed_behavior_trial(self, trial, anticipatory_lick):
+        """Record one completed high/low cue trial, idempotently."""
+        trial_index = int(trial["trial_index"])
+        if trial_index in self.behavior_recorded_trial_indices:
+            return
+        self.behavior_recorded_trial_indices.add(trial_index)
+        if bool(trial.get("reward_eligible")):
+            self.high_cue_trials_completed.add(trial_index)
+            if anticipatory_lick:
+                self.high_cue_anticipatory_lick_trials.add(trial_index)
+        else:
+            self.low_cue_trials_completed.add(trial_index)
+            if anticipatory_lick:
+                self.low_cue_anticipatory_lick_trials.add(trial_index)
 
     def summary(self):
         volume = self.reward_volume_ul_per_train
@@ -911,6 +931,10 @@ class TaskWaterTelemetryAccounting(object):
             "task_water_likely_consumed_ul_session": (
                 None if volume is None else len(self.contacted_trial_indices) * volume
             ),
+            "task_high_cue_trials_completed_session": len(self.high_cue_trials_completed),
+            "task_high_cue_anticipatory_lick_trials_session": len(self.high_cue_anticipatory_lick_trials),
+            "task_low_cue_trials_completed_session": len(self.low_cue_trials_completed),
+            "task_low_cue_anticipatory_lick_trials_session": len(self.low_cue_anticipatory_lick_trials),
         }
 
 
@@ -922,6 +946,10 @@ def _telemetry_water_fields(water_accounting):
             "task_reward_trains_contacted_session": 0,
             "task_water_delivered_ul_session": None,
             "task_water_likely_consumed_ul_session": None,
+            "task_high_cue_trials_completed_session": 0,
+            "task_high_cue_anticipatory_lick_trials_session": 0,
+            "task_low_cue_trials_completed_session": 0,
+            "task_low_cue_anticipatory_lick_trials_session": 0,
         }
     return water_accounting.summary()
 
@@ -1113,6 +1141,16 @@ def publish_completed_trial_telemetry(publisher, trial, runtime,
                 reward_fields["reward_delivered"],
                 reward_fields["reward_contacted"],
             )
+            if runtime.get("trial_completed", False):
+                lick_times = telemetry_lick_times_sec(
+                    all_gpio_events,
+                    runtime.get("stim_request_monotonic_ns"),
+                    stimulus_onset_compensation_sec,
+                )
+                water_accounting.record_completed_behavior_trial(
+                    trial,
+                    any(0.0 <= value < 1.0 for value in lick_times),
+                )
         if publisher is None:
             return reward_fields
         publisher.publish_trial(build_trial_telemetry_payload(

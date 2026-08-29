@@ -1042,6 +1042,70 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
             reward.TaskWaterTelemetryAccounting(None).summary()["task_water_delivered_ul_session"]
         )
 
+    def test_behavior_counters_use_completed_high_and_low_cue_trials(self):
+        accounting = reward.TaskWaterTelemetryAccounting(3.0)
+        high_reward = {"trial_index": 1, "reward_eligible": True}
+        high_omission = {"trial_index": 2, "reward_eligible": True}
+        high_no_lick = {"trial_index": 3, "reward_eligible": True}
+        low_lick = {"trial_index": 4, "reward_eligible": False}
+        low_no_lick = {"trial_index": 5, "reward_eligible": False}
+
+        accounting.record_completed_behavior_trial(high_reward, True)
+        accounting.record_completed_behavior_trial(high_omission, True)
+        accounting.record_completed_behavior_trial(high_no_lick, False)
+        accounting.record_completed_behavior_trial(low_lick, True)
+        accounting.record_completed_behavior_trial(low_no_lick, False)
+        # Multiple licks on one completed trial still contribute one numerator.
+        accounting.record_completed_behavior_trial(high_reward, True)
+
+        summary = accounting.summary()
+        self.assertEqual(summary["task_high_cue_trials_completed_session"], 3)
+        self.assertEqual(summary["task_high_cue_anticipatory_lick_trials_session"], 2)
+        self.assertEqual(summary["task_low_cue_trials_completed_session"], 2)
+        self.assertEqual(summary["task_low_cue_anticipatory_lick_trials_session"], 1)
+        self.assertEqual(
+            reward.build_telemetry_state_payload(
+                "ITI", total_trials=5, water_accounting=accounting
+            )["task_high_cue_trials_completed_session"],
+            3,
+        )
+        trial_payload = reward.build_trial_telemetry_payload(
+            high_no_lick,
+            {"stim_request_monotonic_ns": ""},
+            [], 5, 1, 1, water_accounting=accounting,
+        )
+        self.assertEqual(
+            trial_payload["task_low_cue_anticipatory_lick_trials_session"], 1
+        )
+
+    def test_behavior_counters_ignore_partial_and_post_reward_licks(self):
+        accounting = reward.TaskWaterTelemetryAccounting(3.0)
+        partial = {"trial_index": 10, "reward_eligible": True}
+        partial_runtime = {
+            "trial_completed": False,
+            "stim_request_monotonic_ns": 100_000_000_000,
+        }
+        reward.publish_completed_trial_telemetry(
+            None, partial, partial_runtime, [], 1, 1, 1,
+            water_accounting=accounting,
+        )
+        post_reward_only = {"trial_index": 11, "reward_eligible": True}
+        post_reward_only_lick = [
+            {"event_type": "lick_onset", "monotonic_ns": 101_500_000_000}
+        ]
+        runtime = {
+            "trial_completed": True,
+            "stim_request_monotonic_ns": 100_000_000_000,
+        }
+        result = reward.publish_completed_trial_telemetry(
+            None, post_reward_only, runtime, post_reward_only_lick,
+            1, 1, 1, water_accounting=accounting,
+        )
+        self.assertFalse(result["reward_delivered"])
+        summary = accounting.summary()
+        self.assertEqual(summary["task_high_cue_trials_completed_session"], 1)
+        self.assertEqual(summary["task_high_cue_anticipatory_lick_trials_session"], 0)
+
     def test_zero_post_services_final_rewarded_suction(self):
         gpio_client = FakeGPIOClient()
         gpio_client.trigger_suction = mock.Mock(return_value="suction_1")
