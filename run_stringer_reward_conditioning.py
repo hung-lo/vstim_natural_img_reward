@@ -284,6 +284,31 @@ def parse_args(argv=None):
     return args
 
 
+def simulated_behavior_category(image_role):
+    if image_role in REWARDED_HIGH_ROLES:
+        return "rewarded_high"
+    if image_role in UNREWARDED_HIGH_ROLES:
+        return "unrewarded_high"
+    if image_role in LOW_ROLES:
+        return "low_probability"
+    raise ValueError(
+        "Unknown trial image role for behavior simulation: %r" % image_role
+    )
+
+
+def should_schedule_simulated_behavior_lick(image_role, category_ordinal):
+    """Return the deterministic one-block anticipatory-lick selection."""
+    ordinal = int(category_ordinal)
+    if ordinal < 1:
+        raise ValueError("Behavior simulation category ordinal must be positive.")
+    targets = {
+        "rewarded_high": 15,
+        "unrewarded_high": 4,
+        "low_probability": 1,
+    }
+    return ordinal <= targets[simulated_behavior_category(image_role)]
+
+
 def _strict_prompt(prompt):
     try:
         value = input(prompt)
@@ -1744,22 +1769,11 @@ def run_trials(
             force=True,
         )
         if simulate_behavior_test:
-            if trial.get("image_role") in REWARDED_HIGH_ROLES:
-                behavior_category = "rewarded_high"
-                anticipatory_target = 15
-            elif trial.get("image_role") in UNREWARDED_HIGH_ROLES:
-                behavior_category = "unrewarded_high"
-                anticipatory_target = 4
-            elif trial.get("image_role") in LOW_ROLES:
-                behavior_category = "low_probability"
-                anticipatory_target = 1
-            else:
-                raise ValueError(
-                    "Unknown trial image role for behavior simulation: %r"
-                    % trial.get("image_role")
-                )
+            behavior_category = simulated_behavior_category(trial.get("image_role"))
             simulated_behavior_ordinals[behavior_category] += 1
-            if simulated_behavior_ordinals[behavior_category] <= anticipatory_target:
+            if should_schedule_simulated_behavior_lick(
+                    trial.get("image_role"),
+                    simulated_behavior_ordinals[behavior_category]):
                 # The worker receives this before the authoritative stimulus
                 # request.  Add the calibrated request-to-physical-onset
                 # compensation so telemetry lands near +0.60 s from its

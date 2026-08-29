@@ -23,6 +23,7 @@ except ImportError:
     sys.modules["PIL"] = pil_stub
 
 import run_stringer_reward_conditioning as reward
+import reward_conditioning_protocol as protocol
 
 
 class FakeGPIOClient:
@@ -297,6 +298,52 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
         ])
         self.assertTrue(args.simulate_behavior_test)
         self.assertTrue(args.simulate_water_test)
+
+    def test_simulated_behavior_selection_matches_one_block_targets(self):
+        assignment = []
+        for role in protocol.ALL_ROLES:
+            assignment.append({
+                "image_role": role,
+                "image_filename": "%s.png" % role,
+                "reward_eligible": role in protocol.REWARDED_HIGH_ROLES,
+            })
+        trials, _ = protocol.make_trial_plan(
+            assignment, n_blocks=1, iti_min_sec=1.0, iti_max_sec=1.1,
+            sequence_seed=12345, mouse_id="SIM_BEHAVIOR",
+        )
+        self.assertEqual(len(trials), 50)
+        ordinals = {category: 0 for category in (
+            "rewarded_high", "unrewarded_high", "low_probability")}
+        selected = {category: 0 for category in ordinals}
+        for trial in trials:
+            category = reward.simulated_behavior_category(trial["image_role"])
+            ordinals[category] += 1
+            if reward.should_schedule_simulated_behavior_lick(
+                    trial["image_role"], ordinals[category]):
+                selected[category] += 1
+        self.assertEqual(ordinals, {
+            "rewarded_high": 20, "unrewarded_high": 20, "low_probability": 10,
+        })
+        self.assertEqual(selected, {
+            "rewarded_high": 15, "unrewarded_high": 4, "low_probability": 1,
+        })
+
+    def test_reward_omission_remains_rewarded_high_behavior_category(self):
+        trial = {
+            "image_role": "rewarded_high_1",
+            "reward_eligible": True,
+            "reward_scheduled": False,
+            "reward_omission_scheduled": True,
+        }
+        self.assertEqual(
+            reward.simulated_behavior_category(trial["image_role"]),
+            "rewarded_high",
+        )
+        self.assertTrue(
+            reward.should_schedule_simulated_behavior_lick(
+                trial["image_role"], 15
+            )
+        )
 
     def test_latest_camera_state_populates_final_metadata(self):
         fetch_state = {
@@ -961,6 +1008,55 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
         )
         self.assertTrue(fields["reward_delivered"])
         self.assertFalse(fields["reward_contacted"])
+
+    def test_anticipatory_lick_before_reward_does_not_create_contact(self):
+        trial = {"reward_scheduled": True, "reward_omission_scheduled": False}
+        runtime = {
+            "reward_command_id": "reward_1", "suction_command_id": "suction_1",
+            "stim_request_monotonic_ns": 100_000_000_000,
+        }
+        events = [
+            {"command_id": "reward_1", "event_type": "reward_command_received"},
+            {"command_id": "reward_1", "event_type": "reward_valve_on",
+             "monotonic_ns": 101_000_000_000},
+            {"command_id": "reward_1", "event_type": "reward_valve_off",
+             "monotonic_ns": 101_100_000_000},
+            {"command_id": "reward_1", "event_type": "reward_complete"},
+            {"command_id": "suction_1", "event_type": "suction_on",
+             "monotonic_ns": 103_400_000_000},
+            {"event_type": "lick_onset", "monotonic_ns": 100_600_000_000},
+        ]
+        payload = reward.build_trial_telemetry_payload(
+            trial, runtime, events, 1, 1, 1,
+        )
+        self.assertTrue(payload["anticipatory_lick"])
+        self.assertTrue(payload["reward_delivered"])
+        self.assertFalse(payload["reward_contacted"])
+
+    def test_combined_behavior_and_water_licks_have_independent_roles(self):
+        trial = {"reward_scheduled": True, "reward_omission_scheduled": False}
+        runtime = {
+            "reward_command_id": "reward_1", "suction_command_id": "suction_1",
+            "stim_request_monotonic_ns": 100_000_000_000,
+        }
+        events = [
+            {"command_id": "reward_1", "event_type": "reward_command_received"},
+            {"command_id": "reward_1", "event_type": "reward_valve_on",
+             "monotonic_ns": 101_000_000_000},
+            {"command_id": "reward_1", "event_type": "reward_valve_off",
+             "monotonic_ns": 101_100_000_000},
+            {"command_id": "reward_1", "event_type": "reward_complete"},
+            {"command_id": "suction_1", "event_type": "suction_on",
+             "monotonic_ns": 103_400_000_000},
+            {"event_type": "lick_onset", "monotonic_ns": 100_600_000_000},
+            {"event_type": "lick_onset", "monotonic_ns": 101_500_000_000},
+        ]
+        payload = reward.build_trial_telemetry_payload(
+            trial, runtime, events, 1, 1, 1,
+        )
+        self.assertTrue(payload["anticipatory_lick"])
+        self.assertTrue(payload["reward_contacted"])
+        self.assertEqual(payload["lick_times_sec"], [0.6, 1.5])
 
     def test_simulated_lick_contacts_reward_but_not_omission(self):
         reward_trial = {"reward_scheduled": True, "reward_omission_scheduled": False}

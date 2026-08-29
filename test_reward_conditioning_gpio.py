@@ -63,6 +63,14 @@ class RewardConditioningGPIOTests(unittest.TestCase):
             client.simulate_lick()
         client._connection.send.assert_not_called()
 
+    def test_schedule_simulated_lick_refuses_real_gpio_before_send(self):
+        config = dict(_simulation_config(), simulate_gpio=False)
+        client = BehaviorGPIOClient(config)
+        client._connection = mock.Mock()
+        with self.assertRaisesRegex(RuntimeError, "real GPIO mode"):
+            client.schedule_simulated_lick(0.6)
+        client._connection.send.assert_not_called()
+
     def test_schedule_simulated_lick_emits_asynchronously(self):
         client = BehaviorGPIOClient(_simulation_config())
         try:
