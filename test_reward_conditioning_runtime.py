@@ -908,17 +908,80 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
         events = [
             {"command_id": "reward_1", "event_type": "reward_command_received"},
             {"command_id": "reward_1", "event_type": "reward_valve_on",
-             "monotonic_ns": 101},
+             "monotonic_ns": 100_000_000_001},
             {"command_id": "reward_1", "event_type": "reward_valve_off",
-             "monotonic_ns": 102},
+             "monotonic_ns": 100_000_000_002},
             {"command_id": "reward_1", "event_type": "reward_complete"},
         ]
         fields = reward.derive_telemetry_reward_fields(
-            trial, {"reward_command_id": "reward_1", "suction_command_id": "suction_1"},
+            trial, {"reward_command_id": "reward_1", "suction_command_id": "suction_1",
+                    "stim_request_monotonic_ns": 100_000_000_000},
             events, 1,
         )
         self.assertTrue(fields["reward_delivered"])
         self.assertIsNone(fields["reward_contacted"])
+
+    def test_telemetry_reward_contact_is_false_when_known_window_has_no_lick(self):
+        trial = {"reward_scheduled": True, "reward_omission_scheduled": False}
+        events = [
+            {"command_id": "reward_1", "event_type": "reward_command_received"},
+            {"command_id": "reward_1", "event_type": "reward_valve_on",
+             "monotonic_ns": 101_000_000_000},
+            {"command_id": "reward_1", "event_type": "reward_valve_off",
+             "monotonic_ns": 101_100_000_000},
+            {"command_id": "reward_1", "event_type": "reward_complete"},
+            {"command_id": "suction_1", "event_type": "suction_on",
+             "monotonic_ns": 103_400_000_000},
+            {"event_type": "lick_onset", "monotonic_ns": 100_500_000_000},
+            {"event_type": "lick_onset", "monotonic_ns": 103_500_000_000},
+        ]
+        fields = reward.derive_telemetry_reward_fields(
+            trial,
+            {"reward_command_id": "reward_1", "suction_command_id": "suction_1",
+             "stim_request_monotonic_ns": 100_000_000_000},
+            events,
+            1,
+        )
+        self.assertTrue(fields["reward_delivered"])
+        self.assertFalse(fields["reward_contacted"])
+
+    def test_telemetry_recent_event_view_excludes_prior_session_events(self):
+        events = [
+            {"event_type": "lick_onset", "monotonic_ns": 1},
+            {"event_type": "lick_onset", "monotonic_ns": 99_400_000_000},
+            {"event_type": "lick_onset", "monotonic_ns": 99_600_000_000},
+            {"event_type": "lick_onset", "monotonic_ns": 100_100_000_000},
+        ]
+        recent = reward.recent_trial_gpio_events(events, 100_000_000_000)
+        self.assertEqual(
+            [event["monotonic_ns"] for event in recent],
+            [99_600_000_000, 100_100_000_000],
+        )
+
+    def test_telemetry_state_and_trial_failures_are_best_effort(self):
+        class FailingReporter:
+            publisher = None
+            parent_error_count = 0
+
+            def report_state(self, payload, force=False):
+                raise RuntimeError("telemetry test failure")
+
+        self.assertFalse(reward.safe_report_telemetry_state(
+            FailingReporter(), "PRE", total_trials=1, total_blocks=1))
+
+        class FailingPublisher:
+            parent_error_count = 0
+
+            def publish_trial(self, payload):
+                raise RuntimeError("telemetry test failure")
+
+        result = reward.publish_completed_trial_telemetry(
+            FailingPublisher(),
+            {"trial_index": 0, "reward_scheduled": False,
+             "reward_omission_scheduled": False},
+            {"stim_request_monotonic_ns": 100}, [], 1, 1, 1,
+        )
+        self.assertIsNone(result)
 
     def test_task_water_accounting_is_idempotent_and_task_only(self):
         accounting = reward.TaskWaterTelemetryAccounting(3.0)

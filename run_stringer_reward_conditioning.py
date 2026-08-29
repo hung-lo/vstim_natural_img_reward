@@ -356,17 +356,51 @@ class TelemetryStateReporter(object):
         self.interval_sec = float(interval_sec)
         self.monotonic_fn = monotonic_fn or time.monotonic
         self.last_report = None
+        self.parent_error_count = 0
 
     def report_state(self, payload, force=False):
-        if self.publisher is None or not self.publisher.enabled:
+        try:
+            if self.publisher is None or not self.publisher.enabled:
+                return False
+            now = self.monotonic_fn()
+            if (not force and self.last_report is not None
+                    and now - self.last_report < self.interval_sec):
+                return False
+            published = self.publisher.publish_state(payload)
+            self.last_report = now
+            return published
+        except Exception:
+            _record_telemetry_parent_error(self)
             return False
-        now = self.monotonic_fn()
-        if (not force and self.last_report is not None
-                and now - self.last_report < self.interval_sec):
-            return False
-        published = self.publisher.publish_state(payload)
-        self.last_report = now
-        return published
+
+
+def _record_telemetry_parent_error(*objects):
+    for obj in objects:
+        if obj is None:
+            continue
+        try:
+            obj.parent_error_count = getattr(obj, "parent_error_count", 0) + 1
+        except Exception:
+            pass
+
+
+def safe_report_telemetry_state(reporter, phase, trial=None,
+                                total_trials=0, total_blocks=0, eta_sec=None,
+                                water_accounting=None, force=False):
+    """Build and enqueue telemetry state without affecting experiment flow."""
+    if reporter is None:
+        return False
+    try:
+        return reporter.report_state(
+            build_telemetry_state_payload(
+                phase, trial, total_trials, total_blocks, eta_sec,
+                water_accounting),
+            force=force,
+        )
+    except Exception:
+        _record_telemetry_parent_error(
+            reporter, getattr(reporter, "publisher", None))
+        return False
 
 
 def derive_session_status(task_completed, post_completed, interrupted=False, primary_error=None,
@@ -912,6 +946,26 @@ def _event_monotonic_ns(event):
         return None
 
 
+def recent_trial_gpio_events(all_gpio_events, stim_request_monotonic_ns,
+                             stimulus_onset_compensation_sec=0.0):
+    """Return only current-trial/recent events needed by telemetry derivation."""
+    if stim_request_monotonic_ns in (None, ""):
+        return []
+    estimated_onset_ns = int(round(
+        int(stim_request_monotonic_ns)
+        + float(stimulus_onset_compensation_sec) * 1_000_000_000.0
+    ))
+    lower_ns = estimated_onset_ns - 500_000_000
+    recent = []
+    for event in reversed(all_gpio_events):
+        event_ns = _event_monotonic_ns(event)
+        if event_ns is not None and event_ns < lower_ns:
+            break
+        recent.append(event)
+    recent.reverse()
+    return recent
+
+
 def telemetry_lick_times_sec(all_gpio_events, stim_request_monotonic_ns,
                              stimulus_onset_compensation_sec=0.0):
     """Return recent lick onsets in the dashboard's estimated physical window."""
@@ -924,7 +978,9 @@ def telemetry_lick_times_sec(all_gpio_events, stim_request_monotonic_ns,
     lower_ns = estimated_onset_ns - 500_000_000
     upper_ns = estimated_onset_ns + 4_000_000_000
     values = []
-    for event in reversed(all_gpio_events):
+    for event in reversed(recent_trial_gpio_events(
+            all_gpio_events, stim_request_monotonic_ns,
+            stimulus_onset_compensation_sec)):
         event_ns = _event_monotonic_ns(event)
         if event_ns is None:
             continue
@@ -946,14 +1002,20 @@ def _first_gpio_event_ns(events, event_type):
 
 
 def derive_telemetry_reward_fields(trial, runtime, all_gpio_events,
-                                   reward_num_pulses):
+                                   reward_num_pulses,
+                                   recent_events=None):
+    recent_events = (
+        recent_events if recent_events is not None else
+        recent_trial_gpio_events(
+            all_gpio_events, runtime.get("stim_request_monotonic_ns"))
+    )
     reward_scheduled = bool(trial.get("reward_scheduled"))
     reward_omission = bool(trial.get("reward_omission_scheduled"))
     command_id = runtime.get("reward_command_id", "")
     reward_delivered = False
     reward_contacted = False if not reward_scheduled else None
     command_events = [
-        event for event in all_gpio_events
+        event for event in recent_events
         if command_id and event.get("command_id") == command_id
     ]
     if reward_scheduled and command_id:
@@ -966,13 +1028,14 @@ def derive_telemetry_reward_fields(trial, runtime, all_gpio_events,
             reward_on_ns = _first_gpio_event_ns(command_events, "reward_valve_on")
             suction_on_ns = _first_gpio_event_ns(
                 [
-                    event for event in all_gpio_events
+                    event for event in recent_events
                     if event.get("command_id") == runtime.get("suction_command_id", "")
                 ],
                 "suction_on",
             )
             if reward_on_ns is not None and suction_on_ns is not None:
-                for event in all_gpio_events:
+                reward_contacted = False
+                for event in recent_events:
                     if event.get("event_type") != "lick_onset":
                         continue
                     event_ns = _event_monotonic_ns(event)
@@ -1026,21 +1089,32 @@ def publish_completed_trial_telemetry(publisher, trial, runtime,
                                       total_blocks, reward_num_pulses,
                                       stimulus_onset_compensation_sec=0.0,
                                       eta_sec=None, water_accounting=None):
-    reward_fields = derive_telemetry_reward_fields(
-        trial, runtime, all_gpio_events, reward_num_pulses)
-    if water_accounting is not None:
-        water_accounting.record_trial(
-            trial.get("trial_index", -1),
-            reward_fields["reward_delivered"],
-            reward_fields["reward_contacted"],
+    try:
+        recent_events = recent_trial_gpio_events(
+            all_gpio_events,
+            runtime.get("stim_request_monotonic_ns"),
+            stimulus_onset_compensation_sec,
         )
-    if publisher is None:
+        reward_fields = derive_telemetry_reward_fields(
+            trial, runtime, all_gpio_events, reward_num_pulses,
+            recent_events=recent_events,
+        )
+        if water_accounting is not None:
+            water_accounting.record_trial(
+                trial.get("trial_index", -1),
+                reward_fields["reward_delivered"],
+                reward_fields["reward_contacted"],
+            )
+        if publisher is None:
+            return reward_fields
+        publisher.publish_trial(build_trial_telemetry_payload(
+            trial, runtime, recent_events, total_trials, total_blocks,
+            reward_num_pulses, stimulus_onset_compensation_sec,
+            eta_sec, water_accounting, reward_fields=reward_fields))
         return reward_fields
-    publisher.publish_trial(build_trial_telemetry_payload(
-        trial, runtime, all_gpio_events, total_trials, total_blocks,
-        reward_num_pulses, stimulus_onset_compensation_sec,
-        eta_sec, water_accounting, reward_fields=reward_fields))
-    return reward_fields
+    except Exception:
+        _record_telemetry_parent_error(publisher)
+        return None
 
 
 def planned_reward_train_count(trials):
@@ -1580,19 +1654,17 @@ def run_trials(
         image_raws = loaded_raws[trial["image_filename"]]
         image_paths = raw_paths[trial["image_filename"]]
 
-        if telemetry_state_reporter is not None:
-            telemetry_state_reporter.report_state(
-                build_telemetry_state_payload(
-                    "STIMULUS",
-                    trial,
-                    total_trials,
-                    total_blocks,
-                    planned_task_remaining_seconds(trials, completed_count - 1)
-                    + float(post_background_sec),
-                    water_accounting,
-                ),
-                force=True,
-            )
+        safe_report_telemetry_state(
+            telemetry_state_reporter,
+            "STIMULUS",
+            trial,
+            total_trials,
+            total_blocks,
+            planned_task_remaining_seconds(trials, completed_count - 1)
+            + float(post_background_sec),
+            water_accounting,
+            force=True,
+        )
         runtime["trial_executed"] = True
         runtime["stim_request_monotonic_ns"] = time.monotonic_ns()
         stim_request_timestamp = base.capture_timestamp()
@@ -1820,20 +1892,18 @@ def run_trials(
             }
         )
         append_event(event_log_path, background_row)
-        if telemetry_state_reporter is not None:
-            telemetry_state_reporter.report_state(
-                build_telemetry_state_payload(
-                    "ITI",
-                    trial,
-                    total_trials,
-                    total_blocks,
-                    float(trial["planned_iti_duration_sec"])
-                    + planned_task_remaining_seconds(trials, completed_count)
-                    + float(post_background_sec),
-                    water_accounting,
-                ),
-                force=True,
-            )
+        safe_report_telemetry_state(
+            telemetry_state_reporter,
+            "ITI",
+            trial,
+            total_trials,
+            total_blocks,
+            float(trial["planned_iti_duration_sec"])
+            + planned_task_remaining_seconds(trials, completed_count)
+            + float(post_background_sec),
+            water_accounting,
+            force=True,
+        )
 
         # The ITI deadline is anchored to gray onset. Verification and suction
         # are serviced inside this interval and may not extend it.
@@ -1848,19 +1918,17 @@ def run_trials(
                     planned_task_remaining_during_iti(
                         trials, completed_count - 1, iti_deadline),
                 )
-            if telemetry_state_reporter is not None:
-                telemetry_state_reporter.report_state(
-                    build_telemetry_state_payload(
-                        "ITI",
-                        trial,
-                        total_trials,
-                        total_blocks,
-                        planned_task_remaining_during_iti(
-                            trials, completed_count - 1, iti_deadline)
-                        + float(post_background_sec),
-                        water_accounting,
-                    )
-                )
+            safe_report_telemetry_state(
+                telemetry_state_reporter,
+                "ITI",
+                trial,
+                total_trials,
+                total_blocks,
+                planned_task_remaining_during_iti(
+                    trials, completed_count - 1, iti_deadline)
+                + float(post_background_sec),
+                water_accounting,
+            )
 
         if reward_check is not None:
             verify_reward_command(
@@ -1875,7 +1943,11 @@ def run_trials(
             wait_until(
                 suction_check["target"], gpio_client, event_log_path,
                 all_gpio_events,
-                status_callback=iti_status_callback if status_callback else None,
+                status_callback=(
+                    iti_status_callback
+                    if status_callback is not None or telemetry_state_reporter is not None
+                    else None
+                ),
             )
             suction_command_id = gpio_client.trigger_suction(context)
             runtime["suction_command_id"] = suction_command_id
@@ -1887,7 +1959,11 @@ def run_trials(
             gpio_client,
             event_log_path,
             all_gpio_events,
-            status_callback=iti_status_callback if status_callback else None,
+            status_callback=(
+                iti_status_callback
+                if status_callback is not None or telemetry_state_reporter is not None
+                else None
+            ),
         )
         actual_iti = time.monotonic() - iti_start_monotonic
         append_event(
@@ -2658,6 +2734,7 @@ def main(argv=None):
         "telemetry_host": args.telemetry_host,
         "telemetry_port": args.telemetry_port,
         "telemetry_queue_dropped_count": telemetry_publisher.dropped_count,
+        "telemetry_parent_error_count": telemetry_publisher.parent_error_count,
         "telemetry_start_error": telemetry_publisher.start_error or "",
         **_telemetry_water_fields(water_accounting),
         "iti_distribution": "uniform",
@@ -2911,12 +2988,11 @@ def main(argv=None):
                 status_reporter.report(format_operator_status("WAITING_FOR_2P",
                     (time.monotonic_ns() - gate_camera_anchor) / 1e9 if gate_camera_anchor else None,
                     planned_total_sec))
-                telemetry_state_reporter.report_state(
-                    build_telemetry_state_payload(
-                        "WAITING_FOR_2P", total_trials=len(trials),
-                        total_blocks=n_blocks, eta_sec=planned_total_sec,
-                        water_accounting=water_accounting,
-                    )
+                safe_report_telemetry_state(
+                    telemetry_state_reporter, "WAITING_FOR_2P",
+                    total_trials=len(trials), total_blocks=n_blocks,
+                    eta_sec=planned_total_sec,
+                    water_accounting=water_accounting,
                 )
 
             gate_wait_sec = wait_for_two_photon_gate(
@@ -2935,13 +3011,12 @@ def main(argv=None):
             )
 
             metadata["pre_start_monotonic_ns"] = time.monotonic_ns()
-            telemetry_state_reporter.report_state(
-                build_telemetry_state_payload(
-                    "PRE", total_trials=len(trials), total_blocks=n_blocks,
-                    eta_sec=pre_background_min * 60.0 + planned_task_sec
-                    + post_background_min * 60.0,
-                    water_accounting=water_accounting,
-                ),
+            safe_report_telemetry_state(
+                telemetry_state_reporter, "PRE",
+                total_trials=len(trials), total_blocks=n_blocks,
+                eta_sec=pre_background_min * 60.0 + planned_task_sec
+                + post_background_min * 60.0,
+                water_accounting=water_accounting,
                 force=True,
             )
 
@@ -2950,12 +3025,11 @@ def main(argv=None):
                     (time.monotonic_ns() - gate_camera_anchor) / 1e9 if gate_camera_anchor else None,
                     remaining,
                     protocol_remaining_sec=(remaining + planned_task_sec + post_background_min * 60.0)))
-                telemetry_state_reporter.report_state(
-                    build_telemetry_state_payload(
-                        "PRE", total_trials=len(trials), total_blocks=n_blocks,
-                        eta_sec=remaining + planned_task_sec + post_background_min * 60.0,
-                        water_accounting=water_accounting,
-                    )
+                safe_report_telemetry_state(
+                    telemetry_state_reporter, "PRE",
+                    total_trials=len(trials), total_blocks=n_blocks,
+                    eta_sec=remaining + planned_task_sec + post_background_min * 60.0,
+                    water_accounting=water_accounting,
                 )
 
             pre_actual = hold_background(
@@ -3021,12 +3095,11 @@ def main(argv=None):
             )
 
             metadata["post_start_monotonic_ns"] = time.monotonic_ns()
-            telemetry_state_reporter.report_state(
-                build_telemetry_state_payload(
-                    "POST", total_trials=len(trials), total_blocks=n_blocks,
-                    eta_sec=post_background_min * 60.0,
-                    water_accounting=water_accounting,
-                ),
+            safe_report_telemetry_state(
+                telemetry_state_reporter, "POST",
+                total_trials=len(trials), total_blocks=n_blocks,
+                eta_sec=post_background_min * 60.0,
+                water_accounting=water_accounting,
                 force=True,
             )
 
@@ -3034,11 +3107,10 @@ def main(argv=None):
                 status_reporter.report(format_operator_status("POST",
                     (time.monotonic_ns() - gate_camera_anchor) / 1e9 if gate_camera_anchor else None,
                     remaining))
-                telemetry_state_reporter.report_state(
-                    build_telemetry_state_payload(
-                        "POST", total_trials=len(trials), total_blocks=n_blocks,
-                        eta_sec=remaining, water_accounting=water_accounting,
-                    )
+                safe_report_telemetry_state(
+                    telemetry_state_reporter, "POST",
+                    total_trials=len(trials), total_blocks=n_blocks,
+                    eta_sec=remaining, water_accounting=water_accounting,
                 )
 
             def final_trial_telemetry_callback():
@@ -3075,11 +3147,10 @@ def main(argv=None):
             metadata["post_elapsed_sec"] = post_actual
             metadata["post_background_actual_sec"] = post_actual
             post_background_completed = True
-            telemetry_state_reporter.report_state(
-                build_telemetry_state_payload(
-                    "COMPLETE", total_trials=len(trials), total_blocks=n_blocks,
-                    eta_sec=0.0, water_accounting=water_accounting,
-                ),
+            safe_report_telemetry_state(
+                telemetry_state_reporter, "COMPLETE",
+                total_trials=len(trials), total_blocks=n_blocks,
+                eta_sec=0.0, water_accounting=water_accounting,
                 force=True,
             )
 
@@ -3253,6 +3324,7 @@ def main(argv=None):
         metadata.update(reward_volume_tracker.summary())
         metadata.update(_telemetry_water_fields(water_accounting))
         metadata["telemetry_queue_dropped_count"] = telemetry_publisher.dropped_count
+        metadata["telemetry_parent_error_count"] = telemetry_publisher.parent_error_count
         if task_completed and post_background_completed:
             try:
                 validate_operational_timing_metadata(
@@ -3305,12 +3377,11 @@ def main(argv=None):
         session_completed = completion_state["session_completed"]
 
         if not session_completed:
-            telemetry_state_reporter.report_state(
-                build_telemetry_state_payload(
-                    "INTERRUPTED" if interrupted else "ERROR",
-                    total_trials=len(trials), total_blocks=n_blocks,
-                    eta_sec=None, water_accounting=water_accounting,
-                ),
+            safe_report_telemetry_state(
+                telemetry_state_reporter,
+                "INTERRUPTED" if interrupted else "ERROR",
+                total_trials=len(trials), total_blocks=n_blocks,
+                eta_sec=None, water_accounting=water_accounting,
                 force=True,
             )
         telemetry_publisher.close()

@@ -82,6 +82,7 @@ class TelemetryPublisher(object):
         self.message_queue = None
         self.process = None
         self.dropped_count = 0
+        self.parent_error_count = 0
         self.start_error = None
 
     @property
@@ -103,15 +104,22 @@ class TelemetryPublisher(object):
             return True
         except Exception as exc:
             self.start_error = "%s: %s" % (type(exc).__name__, exc)
+            self.parent_error_count += 1
+            if self.process is not None:
+                try:
+                    if self.process.is_alive():
+                        self.process.terminate()
+                except Exception:
+                    pass
             self.enabled = False
             self.process = None
             self.message_queue = None
             return False
 
     def _publish(self, message_type, payload):
-        if not self.available:
-            return False
         try:
+            if not self.available:
+                return False
             self.message_queue.put_nowait({
                 "type": str(message_type),
                 "payload": dict(payload or {}),
@@ -122,6 +130,9 @@ class TelemetryPublisher(object):
             return False
         except (OSError, ValueError, TypeError):
             self.dropped_count += 1
+            return False
+        except Exception:
+            self.parent_error_count += 1
             return False
 
     def publish_session(self, payload):
@@ -149,7 +160,11 @@ class TelemetryPublisher(object):
             process.join(self.join_timeout_sec)
         except Exception:
             pass
-        if process.is_alive():
+        try:
+            process_alive = process.is_alive()
+        except Exception:
+            process_alive = False
+        if process_alive:
             try:
                 process.terminate()
                 process.join(0.05)
@@ -160,4 +175,3 @@ class TelemetryPublisher(object):
         except Exception:
             pass
         self.process = None
-
