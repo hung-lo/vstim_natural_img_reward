@@ -340,3 +340,14 @@ onset, gray begins at 1.5 s, and suction begins at 3.5 s after onset on both
 rewarded and omitted conditioned-cue trials. Suction and reward are open-loop
 and never depend on licking. Lick onset and offset events remain in the main
 event log and are also exported to `<session>_lick_events.csv`.
+## Spout training
+
+Run the separate gray-screen spout-training session with:
+
+```bash
+python3 run_spout_training.py --hardware-config spout_training_config.json
+```
+
+Spout training shows no experimental natural images. Water delivery is open-loop: the current setting is one approximately 5 uL reward pulse (`0.208 s`), with continuous lick recording and suction 2.5 s after each reward. Rewards are scheduled from a prewritten random 8–12 s interval sequence, with up to 60 scheduled rewards. The criterion is at least 16 successful retrieval episodes in the most recent 20.
+
+One training session is the goal, not a requirement. If the mouse does not meet criterion, repeat spout training before image conditioning; this runner never launches the natural-image task automatically.

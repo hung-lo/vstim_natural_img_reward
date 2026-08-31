@@ -1,0 +1,11 @@
+{
+  "reward_pin_bcm": 19,
+  "suction_pin_bcm": 25,
+  "lick_pin_bcm": 26,
+  "reward_num_pulses": 1,
+  "reward_pulse_on_sec": 0.208,
+  "reward_pulse_off_sec": 0.01,
+  "reward_volume_ul": 5.0,
+  "suction_duration_sec": 0.1,
+  "lick_bounce_time_sec": null
+}
