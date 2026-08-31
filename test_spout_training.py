@@ -28,12 +28,15 @@ class SpoutTrainingTests(unittest.TestCase):
             "phase": "REWARD", "maximum_training_rewards": 3,
             "criterion_window_rewards": 20, "criterion_success_fraction": 0.8,
             "reward_volume_ul": 5.0, "reward_to_suction_delay_sec": 2.5,
-            "training_reward_index": 2, "training_passed": False,
+            "training_reward_index": 2, "training_pass_reward_index": None,
+            "training_passed": False,
         }
         session = training.build_spout_session_payload("s1", "m1", state)
         trial = training.build_spout_trial_payload(
             "s1", "m1", {"training_reward_index": 2, "retrieval_success": True}, state)
         self.assertEqual(session["protocol_name"], "spout_training")
+        self.assertEqual(session["training_reward_index"], 2)
+        self.assertIsNone(session["training_pass_reward_index"])
         self.assertIsNone(session["image"])
         self.assertIsNone(session["image_role"])
         self.assertEqual(trial["message_type"], "trial_complete")
