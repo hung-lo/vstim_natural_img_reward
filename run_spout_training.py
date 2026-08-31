@@ -290,7 +290,8 @@ def build_training_qc(reward_rows, events, training_passed, criterion,
         for command_id in suction_ids
     }
     checks = {
-        "planned_scheduled_training_reward_count": len(reward_rows),
+        "planned_scheduled_training_reward_count": expected_pulses,
+        "attempted_training_reward_count": expected_pulses,
         "reward_command_received_count": count({"reward_command_received"}, reward_ids),
         "reward_complete_count": count({"reward_complete"}, reward_ids),
         "reward_valve_on_count": count({"reward_valve_on"}, reward_ids),
@@ -582,6 +583,14 @@ def run_training(args):
                     time.sleep(EPISODE_POLL_SEC)
                 if bait_suction_complete:
                     completed_bait_suction_count += 1
+                else:
+                    raise RuntimeError(
+                        "Bait suction %d did not complete" % bait_index
+                    )
+                if not bait_reward_complete:
+                    raise RuntimeError(
+                        "Bait reward %d did not complete" % bait_index
+                    )
                 if bait_index < requested_bait_reward_count:
                     time.sleep(max(0.0, BAIT_INTERVAL_SEC - (time.monotonic() - bait_start)))
         client.set_context(_context("spout_training_settle"))
@@ -646,6 +655,12 @@ def run_training(args):
                 time.sleep(EPISODE_POLL_SEC)
             if reward_on_ns is None or suction_on_ns is None:
                 raise RuntimeError("Incomplete reward/suction episode %d" % index)
+            reward_complete = first_command_event(
+                all_events, "reward_complete", command_id)
+            suction_complete = first_command_event(
+                all_events, "suction_complete", suction_id)
+            if reward_complete is None or suction_complete is None:
+                raise RuntimeError("Incomplete reward/suction episode %d" % index)
             metrics = compute_reward_lick_metrics(all_events, reward_on_ns, suction_on_ns)
             previous_actual_reward_on_ns = reward_on_ns
             successes.append(metrics["retrieval_success"])
@@ -659,16 +674,12 @@ def run_training(args):
                 all_events, "reward_valve_on", command_id)
             reward_off = first_command_event(
                 all_events, "reward_valve_off", command_id)
-            reward_complete = first_command_event(
-                all_events, "reward_complete", command_id)
             suction_received = first_command_event(
                 all_events, "suction_command_received", suction_id)
             suction_on = first_command_event(
                 all_events, "suction_on", suction_id)
             suction_off = first_command_event(
                 all_events, "suction_off", suction_id)
-            suction_complete = first_command_event(
-                all_events, "suction_complete", suction_id)
             reward_rows.append(dict(
                 plan, **metrics,
                 reward_command_id=command_id,
@@ -742,13 +753,27 @@ def run_training(args):
     )
     qc.update({"operator_interrupted": interrupted,
                "session_completed": not interrupted and failure_exc is None,
-               "training_passed": training_passed})
+               "training_passed": training_passed,
+               "requested_bait_reward_count": requested_bait_reward_count,
+               "attempted_bait_reward_count": attempted_bait_reward_count,
+               "completed_bait_reward_count": completed_bait_reward_count,
+               "attempted_bait_suction_count": len(attempted_bait_suction_command_ids),
+               "completed_bait_suction_count": completed_bait_suction_count,
+               "bait_hardware_complete": (
+                   attempted_bait_reward_count == completed_bait_reward_count
+                   and len(attempted_bait_suction_command_ids) == completed_bait_suction_count
+               )})
     qc_path.write_text(json.dumps(qc, indent=2, sort_keys=True))
     metadata.update({
         "requested_bait_reward_count": requested_bait_reward_count,
         "attempted_bait_reward_count": attempted_bait_reward_count,
         "completed_bait_reward_count": completed_bait_reward_count,
+        "attempted_bait_suction_count": len(attempted_bait_suction_command_ids),
         "completed_bait_suction_count": completed_bait_suction_count,
+        "bait_hardware_complete": (
+            attempted_bait_reward_count == completed_bait_reward_count
+            and len(attempted_bait_suction_command_ids) == completed_bait_suction_count
+        ),
         "planned_schedule_length": len(schedule) or len(interval_plan),
         "attempted_training_reward_count": attempted_training_reward_count,
         "completed_training_reward_count": len(completed_training_reward_command_ids),
