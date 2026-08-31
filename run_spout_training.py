@@ -14,6 +14,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from reward_conditioning_gpio import BehaviorGPIOClient
+from rig_telemetry import (
+    DEFAULT_HOST as DEFAULT_TELEMETRY_HOST,
+    DEFAULT_PORT as DEFAULT_TELEMETRY_PORT,
+    TelemetryPublisher,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -34,6 +39,7 @@ DEFAULT_CRITERION_FRACTION = 0.80
 DEFAULT_BAIT_DROPS = 2
 BAIT_INTERVAL_SEC = 5.0
 EPISODE_POLL_SEC = 0.02
+TELEMETRY_HEARTBEAT_SEC = 1.0
 
 REWARD_EVENT_TYPES = (
     "reward_command_received", "reward_valve_on", "reward_valve_off",
@@ -410,6 +416,9 @@ def parse_args(argv=None):
     parser.add_argument("--settle-sec", type=float, default=DEFAULT_SETTLE_SEC)
     parser.add_argument("--criterion-window", type=int, default=DEFAULT_CRITERION_WINDOW)
     parser.add_argument("--criterion-fraction", type=float, default=DEFAULT_CRITERION_FRACTION)
+    parser.add_argument("--telemetry-host", default=DEFAULT_TELEMETRY_HOST)
+    parser.add_argument("--telemetry-port", type=int, default=DEFAULT_TELEMETRY_PORT)
+    parser.add_argument("--no-telemetry", action="store_true")
     parser.add_argument("--no-bait", action="store_true")
     parser.add_argument("--bait-drops", type=int, default=DEFAULT_BAIT_DROPS)
     args = parser.parse_args(argv)
@@ -464,6 +473,82 @@ def _context(phase, index="", reward_command_id="", suction_command_id=""):
         "reward_command_id": reward_command_id,
         "suction_command_id": suction_command_id,
     }
+
+
+def _spout_cumulative_fields(state):
+    return {
+        "training_reward_index": state.get("training_reward_index"),
+        "attempted_training_reward_count": state.get("attempted_training_reward_count", 0),
+        "completed_training_reward_count": state.get("completed_training_reward_count", 0),
+        "retrieval_success_count_session": state.get("retrieval_success_count_session", 0),
+        "retrieval_failure_count_session": state.get("retrieval_failure_count_session", 0),
+        "recent_20_success_count": state.get("recent_20_success_count"),
+        "recent_20_success_fraction": state.get("recent_20_success_fraction"),
+        "criterion_evaluable": bool(state.get("criterion_evaluable", False)),
+        "training_passed": bool(state.get("training_passed", False)),
+        "reward_volume_ul": state.get("reward_volume_ul"),
+        "task_water_delivered_ul_session": state.get("task_water_delivered_ul_session", 0.0),
+        "bait_water_ul_session": state.get("bait_water_ul_session", 0.0),
+        "total_water_ul_session": state.get("total_water_ul_session", 0.0),
+        "total_lick_onset_count_session": state.get("total_lick_onset_count_session", 0),
+    }
+
+
+def build_spout_session_payload(session_id, mouse_id, state):
+    payload = {
+        "protocol_name": "spout_training",
+        "session_id": session_id,
+        "mouse_id": mouse_id,
+        "phase": state.get("phase", "STARTING"),
+        "maximum_training_rewards": state.get("maximum_training_rewards"),
+        "criterion_window_rewards": state.get("criterion_window_rewards"),
+        "criterion_success_fraction": state.get("criterion_success_fraction"),
+        "reward_volume_ul": state.get("reward_volume_ul"),
+        "reward_to_suction_delay_sec": state.get("reward_to_suction_delay_sec"),
+        "requested_bait_reward_count": state.get("requested_bait_reward_count", 0),
+        "planned_training_water_ul": state.get("planned_training_water_ul"),
+        "telemetry_enabled": bool(state.get("telemetry_enabled", False)),
+        "image": None,
+        "image_role": None,
+    }
+    payload.update(_spout_cumulative_fields(state))
+    return payload
+
+
+def build_spout_state_payload(session_id, mouse_id, state):
+    payload = build_spout_session_payload(session_id, mouse_id, state)
+    payload["message_type"] = "state"
+    payload["next_reward_in_sec"] = state.get("next_reward_in_sec")
+    payload["planned_remaining_eta_sec"] = state.get("planned_remaining_eta_sec")
+    payload["bait_index"] = state.get("bait_index")
+    payload["bait_total"] = state.get("bait_total")
+    payload["completed_bait_reward_count"] = state.get("completed_bait_reward_count", 0)
+    payload["completed_bait_suction_count"] = state.get("completed_bait_suction_count", 0)
+    payload["failure_summary"] = state.get("failure_summary", "")
+    return payload
+
+
+def build_spout_trial_payload(session_id, mouse_id, row, state):
+    payload = build_spout_state_payload(session_id, mouse_id, state)
+    payload.update({
+        "message_type": "trial_complete",
+        "training_reward_index": row.get("training_reward_index"),
+        "maximum_training_rewards": state.get("maximum_training_rewards"),
+        "trial": row.get("training_reward_index"),
+        "trial_total": state.get("maximum_training_rewards"),
+        "reward_delivered": True,
+        "reward_contacted": bool(row.get("retrieval_success")),
+        "retrieval_success": bool(row.get("retrieval_success")),
+    })
+    for field in (
+        "first_lick_latency_sec", "lick_count_pre_reward_1p0_sec",
+        "lick_count_reward_to_0p5_sec", "lick_count_reward_to_1p0_sec",
+        "lick_count_reward_to_2p5_sec", "recent_20_success_count",
+        "recent_20_success_fraction", "criterion_evaluable", "training_passed",
+    ):
+        payload[field] = row.get(field, state.get(field))
+    payload.update({"block": None, "block_total": None, "image": None, "image_role": None})
+    return payload
 
 
 def run_training(args):
@@ -524,6 +609,70 @@ def run_training(args):
 
     client = BehaviorGPIOClient(config)
     screen = None
+    telemetry = TelemetryPublisher(
+        host=getattr(args, "telemetry_host", DEFAULT_TELEMETRY_HOST),
+        port=getattr(args, "telemetry_port", DEFAULT_TELEMETRY_PORT),
+        session_id=session_id, protocol="spout_training",
+        enabled=not getattr(args, "no_telemetry", False),
+    )
+    telemetry_started = False
+    telemetry_last_publish = None
+
+    def telemetry_state(phase, training_index=None, next_reward_in_sec=None,
+                        bait_index=None, bait_total=None, force=False):
+        nonlocal telemetry_last_publish
+        if not telemetry.enabled:
+            return False
+        now = time.monotonic()
+        if not force and telemetry_last_publish is not None \
+                and now - telemetry_last_publish < TELEMETRY_HEARTBEAT_SEC:
+            return False
+        completed_training_ids = completed_command_ids(
+            all_events, attempted_training_reward_command_ids, "reward_complete")
+        criterion = evaluate_training_criterion(
+            successes, window=args.criterion_window,
+            fraction=args.criterion_fraction,
+        )
+        state = {
+            "phase": phase, "training_reward_index": training_index,
+            "maximum_training_rewards": args.max_rewards,
+            "criterion_window_rewards": args.criterion_window,
+            "criterion_success_fraction": args.criterion_fraction,
+            "reward_volume_ul": config["reward_volume_ul"],
+            "reward_to_suction_delay_sec": DEFAULT_SUCTION_DELAY_SEC,
+            "requested_bait_reward_count": requested_bait_reward_count,
+            "planned_training_water_ul": len(interval_plan) * config["reward_volume_ul"],
+            "telemetry_enabled": telemetry_started,
+            "attempted_training_reward_count": attempted_training_reward_count,
+            "completed_training_reward_count": len(completed_training_ids),
+            "retrieval_success_count_session": sum(bool(value) for value in successes),
+            "retrieval_failure_count_session": len(successes) - sum(bool(value) for value in successes),
+            "recent_20_success_count": criterion["recent_success_count"],
+            "recent_20_success_fraction": criterion["recent_success_fraction"],
+            "criterion_evaluable": criterion["criterion_evaluable"],
+            "training_passed": training_passed,
+            "task_water_delivered_ul_session": len(completed_training_ids) * config["reward_volume_ul"],
+            "bait_water_ul_session": len(completed_command_ids(
+                all_events, attempted_bait_reward_command_ids, "reward_complete")) * config["reward_volume_ul"],
+            "total_water_ul_session": (
+                len(completed_training_ids) + len(completed_command_ids(
+                    all_events, attempted_bait_reward_command_ids, "reward_complete"))
+                ) * config["reward_volume_ul"],
+            "total_lick_onset_count_session": sum(
+                event.get("event_type") == "lick_onset" for event in all_events
+            ),
+            "next_reward_in_sec": next_reward_in_sec,
+            "bait_index": bait_index, "bait_total": bait_total,
+        }
+        try:
+            published = telemetry.publish_state(
+                build_spout_state_payload(session_id, args.mouse_id, state)
+            )
+            telemetry_last_publish = now
+            return published
+        except Exception:
+            return False
+
     try:
         event_path.touch()
         lick_path.touch()
@@ -557,11 +706,23 @@ def run_training(args):
             "output_root": str(root), "gpio_worker_ready": bool(ready),
         }
         metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True))
+        telemetry_started = telemetry.start()
+        try:
+            telemetry.publish_session(build_spout_session_payload(
+                session_id, args.mouse_id, {
+                    **metadata, "phase": "STARTING",
+                    "telemetry_enabled": telemetry_started,
+                }
+            ))
+        except Exception:
+            pass
         client.set_context(_context("spout_training_settle"))
+        telemetry_state("STARTING", force=True)
         if not args.no_bait:
             for bait_index in range(1, requested_bait_reward_count + 1):
                 bait_start = time.monotonic()
                 attempted_bait_reward_count += 1
+                telemetry_state("BAIT", bait_index, bait_index, requested_bait_reward_count, force=True)
                 client.set_context(_context("spout_training_bait", bait_index))
                 bait_context = _context("spout_training_bait", bait_index)
                 bait_reward_id = client.trigger_reward(bait_context)
@@ -582,6 +743,7 @@ def run_training(args):
                         if (event.get("command_id") == bait_reward_id
                                 and event.get("event_type") == "reward_complete"):
                             bait_reward_complete = True
+                    telemetry_state("BAIT", bait_index, bait_index, requested_bait_reward_count)
                     time.sleep(EPISODE_POLL_SEC)
                 if bait_reward_on_ns is None:
                     raise RuntimeError(
@@ -596,6 +758,7 @@ def run_training(args):
                         event.setdefault("training_reward_index", "")
                         event.setdefault("reward_command_id", bait_reward_id)
                         write_event(event)
+                    telemetry_state("WAITING_SUCTION", bait_index, None, requested_bait_reward_count)
                     time.sleep(EPISODE_POLL_SEC)
                 bait_suction_id = client.trigger_suction(bait_context)
                 attempted_bait_suction_command_ids.append(bait_suction_id)
@@ -611,6 +774,7 @@ def run_training(args):
                         if (event.get("command_id") == bait_suction_id
                                 and event.get("event_type") == "suction_complete"):
                             bait_suction_complete = True
+                    telemetry_state("SUCTION", bait_index, None, requested_bait_reward_count)
                     time.sleep(EPISODE_POLL_SEC)
                 if bait_suction_complete:
                     completed_bait_suction_count += 1
@@ -625,11 +789,13 @@ def run_training(args):
                 if bait_index < requested_bait_reward_count:
                     time.sleep(max(0.0, BAIT_INTERVAL_SEC - (time.monotonic() - bait_start)))
         client.set_context(_context("spout_training_settle"))
+        telemetry_state("SETTLE", force=True)
         settle_deadline = time.monotonic() + max(0.0, float(args.settle_sec))
         while time.monotonic() < settle_deadline:
             for event in client.drain_events():
                 event.setdefault("phase", "spout_training_settle")
                 write_event(event)
+            telemetry_state("SETTLE")
             time.sleep(EPISODE_POLL_SEC)
         schedule = anchor_training_schedule(time.monotonic_ns(), interval_plan)
         write_rows(planned_path, schedule, [
@@ -647,10 +813,23 @@ def run_training(args):
                     previous_actual_reward_on_ns
                     + int(round(plan["planned_interval_sec"] * 1e9)),
                 )
+            telemetry_state(
+                "WAITING_REWARD", plan["training_reward_index"],
+                max(0.0, (target - time.monotonic_ns()) / 1e9),
+                force=True,
+            )
             while time.monotonic_ns() < target:
                 time.sleep(min(EPISODE_POLL_SEC, max(0.0, (target - time.monotonic_ns()) / 1e9)))
                 for event in client.drain_events():
                     write_event(event)
+                remaining_sec = max(0.0, (target - time.monotonic_ns()) / 1e9)
+                # Keep the trigger boundary free of telemetry work.  The next
+                # heartbeat will be emitted after the reward command instead.
+                if remaining_sec > 0.05:
+                    telemetry_state(
+                        "WAITING_REWARD", plan["training_reward_index"],
+                        remaining_sec,
+                    )
             index = plan["training_reward_index"]
             context = _context("spout_training", index)
             attempted_training_reward_count += 1
@@ -659,6 +838,7 @@ def run_training(args):
             attempted_training_reward_command_ids.append(command_id)
             command_ns = time.monotonic_ns()
             client.set_context(_context("spout_training_reward", index, command_id))
+            telemetry_state("REWARD", index, force=True)
             reward_on_ns = None
             suction_on_ns = None
             suction_id = ""
@@ -679,10 +859,12 @@ def run_training(args):
                     attempted_training_suction_command_ids.append(suction_id)
                     suction_command_ns = time.monotonic_ns()
                     client.set_context(_context("spout_training_suction", index, command_id, suction_id))
+                    telemetry_state("SUCTION", index, force=True)
                 if suction_id and any(e.get("event_type") == "suction_on" and e.get("command_id") == suction_id for e in episode_events):
                     suction_on_ns = next(e.get("monotonic_ns") for e in episode_events if e.get("event_type") == "suction_on" and e.get("command_id") == suction_id)
                 if suction_id and any(e.get("event_type") == "suction_complete" and e.get("command_id") == suction_id for e in episode_events):
                     break
+                telemetry_state("SUCTION" if suction_id else "REWARD", index)
                 time.sleep(EPISODE_POLL_SEC)
             if reward_on_ns is None or suction_on_ns is None:
                 raise RuntimeError("Incomplete reward/suction episode %d" % index)
@@ -744,6 +926,36 @@ def run_training(args):
                 index, args.max_rewards,
                 "%.0f%%" % (100 * criterion["recent_success_fraction"]) if criterion["criterion_evaluable"] else "not yet evaluable",
             ))
+            try:
+                telemetry.publish_trial(
+                    build_spout_trial_payload(
+                        session_id, args.mouse_id, reward_rows[-1],
+                        {
+                            "phase": "REWARD", "maximum_training_rewards": args.max_rewards,
+                            "criterion_window_rewards": args.criterion_window,
+                            "criterion_success_fraction": args.criterion_fraction,
+                            "reward_volume_ul": config["reward_volume_ul"],
+                            "reward_to_suction_delay_sec": DEFAULT_SUCTION_DELAY_SEC,
+                            "attempted_training_reward_count": attempted_training_reward_count,
+                            "completed_training_reward_count": len(completed_command_ids(
+                                all_events, attempted_training_reward_command_ids, "reward_complete")),
+                            "retrieval_success_count_session": sum(bool(value) for value in successes),
+                            "retrieval_failure_count_session": len(successes) - sum(bool(value) for value in successes),
+                            "task_water_delivered_ul_session": len(completed_command_ids(
+                                all_events, attempted_training_reward_command_ids, "reward_complete")) * config["reward_volume_ul"],
+                            "bait_water_ul_session": len(completed_command_ids(
+                                all_events, attempted_bait_reward_command_ids, "reward_complete")) * config["reward_volume_ul"],
+                            "total_water_ul_session": (len(completed_command_ids(
+                                all_events, attempted_training_reward_command_ids, "reward_complete"))
+                                + len(completed_command_ids(all_events, attempted_bait_reward_command_ids, "reward_complete"))) * config["reward_volume_ul"],
+                            "total_lick_onset_count_session": sum(
+                                event.get("event_type") == "lick_onset" for event in all_events),
+                            "training_passed": training_passed,
+                        },
+                    )
+                )
+            except Exception:
+                pass
             if training_passed:
                 print("Training criterion reached.")
                 break
@@ -829,8 +1041,35 @@ def run_training(args):
         "lick_events_csv": str(lick_path),
         "qc_pass": qc["qc_pass"],
         "qc_fail_reasons": qc["qc_fail_reasons"],
+        "telemetry_enabled": telemetry_started,
+        "telemetry_host": getattr(args, "telemetry_host", DEFAULT_TELEMETRY_HOST),
+        "telemetry_port": getattr(args, "telemetry_port", DEFAULT_TELEMETRY_PORT),
     })
     metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True))
+    final_phase = "COMPLETE"
+    if interrupted:
+        final_phase = "INTERRUPTED"
+    elif failure_exc is not None:
+        final_phase = "FAILED"
+    final_payload = build_spout_state_payload(
+        session_id, args.mouse_id, {
+            **metadata, "phase": final_phase,
+            "training_reward_index": pass_index,
+            "maximum_training_rewards": args.max_rewards,
+            "criterion_window_rewards": args.criterion_window,
+            "criterion_success_fraction": args.criterion_fraction,
+            "reward_to_suction_delay_sec": DEFAULT_SUCTION_DELAY_SEC,
+            "failure_summary": failure_summary,
+        },
+    )
+    try:
+        telemetry.publish_state(final_payload)
+    except Exception:
+        pass
+    try:
+        telemetry.close()
+    except Exception:
+        pass
     if not training_passed:
         print("Training criterion not reached.\nRepeat spout training before image conditioning.")
     if failure_exc is not None:

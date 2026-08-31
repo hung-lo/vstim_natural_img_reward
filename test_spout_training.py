@@ -5,6 +5,7 @@ import csv
 import json
 import tempfile
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -13,6 +14,75 @@ import run_spout_training as training
 
 
 class SpoutTrainingTests(unittest.TestCase):
+    def test_telemetry_cli_options(self):
+        args = training.parse_args([
+            "--simulate-gpio", "--telemetry-host", "monitor",
+            "--telemetry-port", "6000", "--no-telemetry",
+        ])
+        self.assertEqual(args.telemetry_host, "monitor")
+        self.assertEqual(args.telemetry_port, 6000)
+        self.assertTrue(args.no_telemetry)
+
+    def test_spout_telemetry_payloads_are_gray_screen_safe(self):
+        state = {
+            "phase": "REWARD", "maximum_training_rewards": 3,
+            "criterion_window_rewards": 20, "criterion_success_fraction": 0.8,
+            "reward_volume_ul": 5.0, "reward_to_suction_delay_sec": 2.5,
+            "training_reward_index": 2, "training_passed": False,
+        }
+        session = training.build_spout_session_payload("s1", "m1", state)
+        trial = training.build_spout_trial_payload(
+            "s1", "m1", {"training_reward_index": 2, "retrieval_success": True}, state)
+        self.assertEqual(session["protocol_name"], "spout_training")
+        self.assertIsNone(session["image"])
+        self.assertIsNone(session["image_role"])
+        self.assertEqual(trial["message_type"], "trial_complete")
+        self.assertTrue(trial["reward_delivered"])
+        self.assertTrue(trial["reward_contacted"])
+        self.assertIsNone(trial["image"])
+
+    def test_spout_telemetry_payload_preserves_failed_retrieval(self):
+        trial = training.build_spout_trial_payload(
+            "s1", "m1",
+            {"training_reward_index": 1, "retrieval_success": False},
+            {"maximum_training_rewards": 3},
+        )
+        self.assertFalse(trial["reward_contacted"])
+        self.assertFalse(trial["retrieval_success"])
+
+    def test_spout_telemetry_payload_reports_authoritative_cumulative_water(self):
+        payload = training.build_spout_state_payload(
+            "s1", "m1", {
+                "maximum_training_rewards": 3,
+                "reward_volume_ul": 5.0,
+                "completed_training_reward_count": 3,
+                "retrieval_success_count_session": 2,
+                "retrieval_failure_count_session": 1,
+                "task_water_delivered_ul_session": 15.0,
+                "bait_water_ul_session": 10.0,
+                "total_water_ul_session": 25.0,
+            },
+        )
+        self.assertEqual(payload["completed_training_reward_count"], 3)
+        self.assertEqual(payload["task_water_delivered_ul_session"], 15.0)
+        self.assertEqual(payload["bait_water_ul_session"], 10.0)
+        self.assertEqual(payload["total_water_ul_session"], 25.0)
+
+    def test_spout_telemetry_payload_reports_recent_criterion(self):
+        payload = training.build_spout_trial_payload(
+            "s1", "m1", {"training_reward_index": 20,
+                         "retrieval_success": True,
+                         "recent_20_success_count": 16,
+                         "recent_20_success_fraction": 0.8,
+                         "criterion_evaluable": True,
+                         "training_passed": True},
+            {"maximum_training_rewards": 60},
+        )
+        self.assertEqual(payload["recent_20_success_count"], 16)
+        self.assertEqual(payload["recent_20_success_fraction"], 0.8)
+        self.assertTrue(payload["criterion_evaluable"])
+        self.assertTrue(payload["training_passed"])
+
     def test_default_schedule_is_60_and_intervals_are_in_range(self):
         schedule = training.build_training_schedule(
             1_000_000_000, seed=1234,
@@ -145,7 +215,8 @@ class SpoutTrainingTests(unittest.TestCase):
         self.assertTrue(qc["qc_pass"])
         self.assertEqual(qc["unexpected_reward_command_ids"], [])
 
-    def _run_fake_session(self, mode="normal", bait=True, max_rewards=1):
+    def _run_fake_session(self, mode="normal", bait=True, max_rewards=1,
+                          telemetry_failure=False):
         class Clock(object):
             def __init__(self):
                 self.now = 100.0
@@ -245,11 +316,24 @@ class SpoutTrainingTests(unittest.TestCase):
                 interval_max_sec=0.01, settle_sec=0.0,
                 criterion_window=20, criterion_fraction=0.8,
                 no_bait=not bait, bait_drops=1 if bait else 0,
+                telemetry_host="127.0.0.1", telemetry_port=5055,
+                no_telemetry=not telemetry_failure,
             )
             clock = Clock()
             client = FakeGPIO(clock, mode)
-            with mock.patch.object(training, "BehaviorGPIOClient", return_value=client), \
-                    mock.patch.object(training, "time", clock):
+            with ExitStack() as stack:
+                stack.enter_context(mock.patch.object(
+                    training, "BehaviorGPIOClient", return_value=client))
+                stack.enter_context(mock.patch.object(training, "time", clock))
+                if telemetry_failure:
+                    publisher = mock.Mock()
+                    publisher.enabled = True
+                    publisher.start.return_value = True
+                    publisher.publish_session.side_effect = RuntimeError("telemetry down")
+                    publisher.publish_state.side_effect = RuntimeError("telemetry down")
+                    publisher.publish_trial.side_effect = RuntimeError("telemetry down")
+                    stack.enter_context(mock.patch.object(
+                        training, "TelemetryPublisher", return_value=publisher))
                 error = None
                 try:
                     result = training.run_training(args)
@@ -270,6 +354,16 @@ class SpoutTrainingTests(unittest.TestCase):
                 "reward_summary": summary_path.read_text(),
             }
             return result, error, client, metadata, qc, artifacts
+
+    def test_integration_telemetry_failure_does_not_change_training_outputs(self):
+        result, error, client, metadata, qc, artifacts = self._run_fake_session(
+            bait=False, telemetry_failure=True)
+        self.assertIsNone(error)
+        self.assertIsNotNone(result)
+        self.assertEqual(client.reward_count, 1)
+        self.assertTrue(metadata["session_completed"])
+        self.assertTrue(qc["qc_pass"])
+        self.assertIn("reward_summary", artifacts)
 
     def test_integration_bait_reward_failure_finalizes_and_does_not_train(self):
         _, error, client, metadata, qc, artifacts = self._run_fake_session("bait_reward")
