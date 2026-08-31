@@ -22,6 +22,16 @@ class SpoutTrainingTests(unittest.TestCase):
             training.build_training_schedule(100, 5, seed=42),
         )
 
+    def test_schedule_can_be_anchored_after_baiting(self):
+        intervals = training.build_training_intervals(3, seed=42)
+        schedule = training.anchor_training_schedule(50_000_000_000, intervals)
+        self.assertEqual(schedule[0]["planned_reward_target_monotonic_ns"], 50_000_000_000)
+        self.assertEqual(
+            schedule[1]["planned_reward_target_monotonic_ns"]
+            - schedule[0]["planned_reward_target_monotonic_ns"],
+            round(intervals[1] * 1e9),
+        )
+
     def test_criterion_boundaries_and_recent_window(self):
         self.assertFalse(training.evaluate_training_criterion([True] * 19)["criterion_evaluable"])
         self.assertTrue(training.evaluate_training_criterion([True] * 16 + [False] * 4)["criterion_passed"])

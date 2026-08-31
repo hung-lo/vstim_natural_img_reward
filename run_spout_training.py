@@ -127,11 +127,11 @@ def write_rows(path, rows, fields):
             writer.writerow({field: row.get(field, "") for field in fields})
 
 
-def build_training_schedule(start_monotonic_ns, max_rewards=DEFAULT_MAX_REWARDS,
-                            interval_min_sec=DEFAULT_INTERVAL_MIN_SEC,
-                            interval_max_sec=DEFAULT_INTERVAL_MAX_SEC,
-                            seed=None):
-    """Generate all reward targets before any scheduled reward is delivered."""
+def build_training_intervals(max_rewards=DEFAULT_MAX_REWARDS,
+                             interval_min_sec=DEFAULT_INTERVAL_MIN_SEC,
+                             interval_max_sec=DEFAULT_INTERVAL_MAX_SEC,
+                             seed=None):
+    """Generate the full random interval sequence before training starts."""
     max_rewards = int(max_rewards)
     low, high = float(interval_min_sec), float(interval_max_sec)
     if max_rewards < 1:
@@ -139,20 +139,33 @@ def build_training_schedule(start_monotonic_ns, max_rewards=DEFAULT_MAX_REWARDS,
     if low <= 0 or high < low:
         raise ValueError("Require 0 < interval_min_sec <= interval_max_sec")
     rng = random.Random(seed)
+    return [0.0] + [rng.uniform(low, high) for _ in range(max_rewards - 1)]
+
+
+def anchor_training_schedule(start_monotonic_ns, intervals):
+    """Anchor absolute targets after baiting and settling have completed."""
     target_ns = int(start_monotonic_ns)
     rows = []
-    previous_target_ns = None
-    for index in range(1, max_rewards + 1):
-        interval = 0.0 if previous_target_ns is None else rng.uniform(low, high)
-        if previous_target_ns is not None:
+    for index, interval in enumerate(intervals, start=1):
+        if index > 1:
             target_ns += int(round(interval * 1_000_000_000.0))
         rows.append({
             "training_reward_index": index,
             "planned_interval_sec": interval,
             "planned_reward_target_monotonic_ns": target_ns,
         })
-        previous_target_ns = target_ns
     return rows
+
+
+def build_training_schedule(start_monotonic_ns, max_rewards=DEFAULT_MAX_REWARDS,
+                            interval_min_sec=DEFAULT_INTERVAL_MIN_SEC,
+                            interval_max_sec=DEFAULT_INTERVAL_MAX_SEC,
+                            seed=None):
+    """Backward-compatible convenience wrapper for an already-known anchor."""
+    return anchor_training_schedule(
+        start_monotonic_ns,
+        build_training_intervals(max_rewards, interval_min_sec, interval_max_sec, seed),
+    )
 
 
 def evaluate_training_criterion(successes, minimum_rewards=DEFAULT_CRITERION_MIN_REWARDS,
@@ -180,6 +193,23 @@ def _event_ns(event):
         return int(event.get("monotonic_ns"))
     except (TypeError, ValueError):
         return None
+
+
+def first_command_event(events, event_type, command_id):
+    for event in events:
+        if (event.get("event_type") == event_type
+                and event.get("command_id") == command_id):
+            return event
+    return None
+
+
+def _event_timestamp_fields(event):
+    if event is None:
+        return {}
+    return {
+        "unix_ns": event.get("unix_time_ns", ""),
+        "monotonic_ns": event.get("monotonic_ns", ""),
+    }
 
 
 def _events_between(events, event_type, lower_ns, upper_ns):
@@ -372,21 +402,17 @@ def run_training(args):
     qc_path = root / (session_id + "_session_qc.json")
     planned_path = root / (session_id + "_planned_rewards.csv")
     seed = random.SystemRandom().randrange(0, 2 ** 63)
-    session_start_ns = time.monotonic_ns()
-    schedule = build_training_schedule(
-        session_start_ns + int(float(args.settle_sec) * 1e9), args.max_rewards,
-        args.interval_min_sec, args.interval_max_sec, seed,
+    interval_plan = build_training_intervals(
+        args.max_rewards, args.interval_min_sec, args.interval_max_sec, seed,
     )
-    write_rows(planned_path, schedule, [
-        "training_reward_index", "planned_interval_sec",
-        "planned_reward_target_monotonic_ns",
-    ])
+    schedule = []
     all_events, reward_rows, successes = [], [], []
     bait_count = 0
     interrupted = False
     training_passed = False
     pass_index = None
     old_handler = signal.getsignal(signal.SIGINT)
+    metadata = {}
 
     def write_event(event):
         all_events.append(dict(event))
@@ -460,11 +486,29 @@ def run_training(args):
                     time.sleep(EPISODE_POLL_SEC)
                 if bait_index < bait_count:
                     time.sleep(max(0.0, BAIT_INTERVAL_SEC - (time.monotonic() - bait_start)))
-        time.sleep(max(0.0, float(args.settle_sec)))
+        client.set_context(_context("spout_training_settle"))
+        settle_deadline = time.monotonic() + max(0.0, float(args.settle_sec))
+        while time.monotonic() < settle_deadline:
+            for event in client.drain_events():
+                event.setdefault("phase", "spout_training_settle")
+                write_event(event)
+            time.sleep(EPISODE_POLL_SEC)
+        schedule = anchor_training_schedule(time.monotonic_ns(), interval_plan)
+        write_rows(planned_path, schedule, [
+            "training_reward_index", "planned_interval_sec",
+            "planned_reward_target_monotonic_ns",
+        ])
+        previous_actual_reward_on_ns = None
         for plan in schedule:
             if interrupted:
                 break
             target = plan["planned_reward_target_monotonic_ns"]
+            if previous_actual_reward_on_ns is not None:
+                target = max(
+                    target,
+                    previous_actual_reward_on_ns
+                    + int(round(plan["planned_interval_sec"] * 1e9)),
+                )
             while time.monotonic_ns() < target:
                 time.sleep(min(EPISODE_POLL_SEC, max(0.0, (target - time.monotonic_ns()) / 1e9)))
                 for event in client.drain_events():
@@ -501,20 +545,57 @@ def run_training(args):
                 time.sleep(EPISODE_POLL_SEC)
             if reward_on_ns is None or suction_on_ns is None:
                 raise RuntimeError("Incomplete reward/suction episode %d" % index)
-            metrics = compute_reward_lick_metrics(episode_events, reward_on_ns, suction_on_ns)
+            metrics = compute_reward_lick_metrics(all_events, reward_on_ns, suction_on_ns)
+            previous_actual_reward_on_ns = reward_on_ns
             successes.append(metrics["retrieval_success"])
             criterion = evaluate_training_criterion(successes, window=args.criterion_window, fraction=args.criterion_fraction)
             training_passed = criterion["criterion_passed"]
             if training_passed and pass_index is None:
                 pass_index = index
-            reward_rows.append(dict(plan, **metrics, reward_command_id=command_id,
-                                    reward_command_monotonic_ns=command_ns,
-                                    suction_command_id=suction_id,
-                                    suction_target_monotonic_ns=suction_target_ns,
-                                    recent_20_success_count=criterion["recent_success_count"],
-                                    recent_20_success_fraction=criterion["recent_success_fraction"],
-                                    criterion_evaluable=criterion["criterion_evaluable"],
-                                    criterion_passed_after_this_reward=training_passed))
+            reward_received = first_command_event(
+                all_events, "reward_command_received", command_id)
+            reward_on = first_command_event(
+                all_events, "reward_valve_on", command_id)
+            reward_off = first_command_event(
+                all_events, "reward_valve_off", command_id)
+            reward_complete = first_command_event(
+                all_events, "reward_complete", command_id)
+            suction_received = first_command_event(
+                all_events, "suction_command_received", suction_id)
+            suction_on = first_command_event(
+                all_events, "suction_on", suction_id)
+            suction_off = first_command_event(
+                all_events, "suction_off", suction_id)
+            suction_complete = first_command_event(
+                all_events, "suction_complete", suction_id)
+            reward_rows.append(dict(
+                plan, **metrics,
+                reward_command_id=command_id,
+                reward_command_unix_ns=_event_timestamp_fields(reward_received).get("unix_ns", ""),
+                reward_command_monotonic_ns=_event_timestamp_fields(reward_received).get("monotonic_ns", command_ns),
+                reward_on_unix_ns=_event_timestamp_fields(reward_on).get("unix_ns", ""),
+                reward_on_monotonic_ns=_event_timestamp_fields(reward_on).get("monotonic_ns", reward_on_ns),
+                reward_off_unix_ns=_event_timestamp_fields(reward_off).get("unix_ns", ""),
+                reward_off_monotonic_ns=_event_timestamp_fields(reward_off).get("monotonic_ns", ""),
+                reward_complete_unix_ns=_event_timestamp_fields(reward_complete).get("unix_ns", ""),
+                reward_complete_monotonic_ns=_event_timestamp_fields(reward_complete).get("monotonic_ns", ""),
+                software_reward_timing_error_sec=(
+                    (reward_on_ns - plan["planned_reward_target_monotonic_ns"]) / 1e9
+                ),
+                suction_command_id=suction_id,
+                suction_target_monotonic_ns=suction_target_ns,
+                suction_on_unix_ns=_event_timestamp_fields(suction_on).get("unix_ns", ""),
+                suction_on_monotonic_ns=_event_timestamp_fields(suction_on).get("monotonic_ns", suction_on_ns),
+                suction_off_unix_ns=_event_timestamp_fields(suction_off).get("unix_ns", ""),
+                suction_off_monotonic_ns=_event_timestamp_fields(suction_off).get("monotonic_ns", ""),
+                suction_complete_unix_ns=_event_timestamp_fields(suction_complete).get("unix_ns", ""),
+                suction_complete_monotonic_ns=_event_timestamp_fields(suction_complete).get("monotonic_ns", ""),
+                software_suction_delay_sec=(suction_on_ns - reward_on_ns) / 1e9,
+                recent_20_success_count=criterion["recent_success_count"],
+                recent_20_success_fraction=criterion["recent_success_fraction"],
+                criterion_evaluable=criterion["criterion_evaluable"],
+                criterion_passed_after_this_reward=training_passed,
+            ))
             print("Reward %d/%d | recent20: %s" % (
                 index, args.max_rewards,
                 "%.0f%%" % (100 * criterion["recent_success_fraction"]) if criterion["criterion_evaluable"] else "not yet evaluable",
