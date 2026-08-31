@@ -50,7 +50,7 @@ REWARD_SUMMARY_FIELDS = [
     "reward_on_unix_ns", "reward_on_monotonic_ns",
     "reward_off_unix_ns", "reward_off_monotonic_ns",
     "reward_complete_unix_ns", "reward_complete_monotonic_ns",
-    "software_reward_timing_error_sec", "suction_command_id",
+    "effective_reward_target_monotonic_ns", "software_reward_timing_error_sec", "suction_command_id",
     "suction_target_monotonic_ns", "suction_on_unix_ns",
     "suction_on_monotonic_ns", "suction_off_unix_ns",
     "suction_off_monotonic_ns", "suction_complete_unix_ns",
@@ -203,6 +203,18 @@ def first_command_event(events, event_type, command_id):
     return None
 
 
+def completed_command_ids(events, command_ids, complete_event_type):
+    """Return unique command IDs with exactly one completion event."""
+    return {
+        command_id for command_id in set(command_ids)
+        if sum(
+            1 for event in events
+            if event.get("command_id") == command_id
+            and event.get("event_type") == complete_event_type
+        ) == 1
+    }
+
+
 def _event_timestamp_fields(event):
     if event is None:
         return {}
@@ -243,13 +255,22 @@ def compute_reward_lick_metrics(events, reward_on_monotonic_ns, suction_on_monot
     }
 
 
-def build_training_qc(reward_rows, events, training_passed, criterion):
+def build_training_qc(reward_rows, events, training_passed, criterion,
+                      attempted_reward_command_ids=None,
+                      attempted_suction_command_ids=None):
     """Return system QC separately from the mouse's behavioral outcome."""
-    reward_ids = {row.get("reward_command_id") for row in reward_rows if row.get("reward_command_id")}
-    suction_ids = {row.get("suction_command_id") for row in reward_rows if row.get("suction_command_id")}
+    reward_ids = set(attempted_reward_command_ids or {
+        row.get("reward_command_id") for row in reward_rows
+        if row.get("reward_command_id")
+    })
+    suction_ids = set(attempted_suction_command_ids or {
+        row.get("suction_command_id") for row in reward_rows
+        if row.get("suction_command_id")
+    })
     def count(types, ids):
         return sum(1 for event in events if event.get("command_id") in ids and event.get("event_type") in types)
-    expected_pulses = len(reward_rows)
+    expected_pulses = len(reward_ids)
+    expected_suctions = len(suction_ids)
     observed_reward_ids = {
         event.get("command_id") for event in events
         if event.get("event_type") in REWARD_EVENT_TYPES and event.get("command_id")
@@ -274,7 +295,7 @@ def build_training_qc(reward_rows, events, training_passed, criterion):
         "reward_complete_count": count({"reward_complete"}, reward_ids),
         "reward_valve_on_count": count({"reward_valve_on"}, reward_ids),
         "reward_valve_off_count": count({"reward_valve_off"}, reward_ids),
-        "planned_suction_count": len(reward_rows),
+        "planned_suction_count": expected_suctions,
         "suction_command_received_count": count({"suction_command_received"}, suction_ids),
         "suction_on_count": count({"suction_on"}, suction_ids),
         "suction_off_count": count({"suction_off"}, suction_ids),
@@ -306,10 +327,10 @@ def build_training_qc(reward_rows, events, training_passed, criterion):
         and checks["reward_complete_count"] == expected_pulses
         and checks["reward_valve_on_count"] == expected_pulses
         and checks["reward_valve_off_count"] == expected_pulses
-        and checks["suction_command_received_count"] == expected_pulses
-        and checks["suction_on_count"] == expected_pulses
-        and checks["suction_off_count"] == expected_pulses
-        and checks["suction_complete_count"] == expected_pulses
+        and checks["suction_command_received_count"] == expected_suctions
+        and checks["suction_on_count"] == expected_suctions
+        and checks["suction_off_count"] == expected_suctions
+        and checks["suction_complete_count"] == expected_suctions
         and not checks["missing_reward_command_ids"]
         and not checks["unexpected_reward_command_ids"]
         and not checks["duplicate_reward_command_ids"]
@@ -319,6 +340,29 @@ def build_training_qc(reward_rows, events, training_passed, criterion):
         and not checks["duplicate_suction_command_ids"]
         and not checks["incomplete_suction_command_ids"]
     )
+    checks["qc_fail_reasons"] = []
+    for field, expected in (
+        ("reward_command_received_count", expected_pulses),
+        ("reward_complete_count", expected_pulses),
+        ("reward_valve_on_count", expected_pulses),
+        ("reward_valve_off_count", expected_pulses),
+        ("suction_command_received_count", expected_suctions),
+        ("suction_on_count", expected_suctions),
+        ("suction_off_count", expected_suctions),
+        ("suction_complete_count", expected_suctions),
+    ):
+        if checks[field] != expected:
+            checks["qc_fail_reasons"].append(
+                "%s %s != expected %s" % (field, checks[field], expected)
+            )
+    for field in (
+        "missing_reward_command_ids", "unexpected_reward_command_ids",
+        "duplicate_reward_command_ids", "incomplete_reward_command_ids",
+        "missing_suction_command_ids", "unexpected_suction_command_ids",
+        "duplicate_suction_command_ids", "incomplete_suction_command_ids",
+    ):
+        if checks[field]:
+            checks["qc_fail_reasons"].append("%s: %s" % (field, checks[field]))
     return checks
 
 
@@ -407,14 +451,32 @@ def run_training(args):
     )
     schedule = []
     all_events, reward_rows, successes = [], [], []
-    bait_count = 0
+    requested_bait_reward_count = 0 if args.no_bait else int(args.bait_drops)
+    attempted_bait_reward_count = 0
+    completed_bait_reward_count = 0
+    completed_bait_suction_count = 0
+    attempted_bait_reward_command_ids = []
+    attempted_bait_suction_command_ids = []
+    attempted_training_reward_command_ids = []
+    attempted_training_suction_command_ids = []
+    attempted_training_reward_count = 0
     interrupted = False
     training_passed = False
     pass_index = None
     old_handler = signal.getsignal(signal.SIGINT)
     metadata = {}
+    failure_exc = None
+    failure_summary = ""
+    seen_event_keys = set()
 
     def write_event(event):
+        event_key = (
+            event.get("event_type"), event.get("command_id"),
+            event.get("monotonic_ns"), event.get("unix_time_ns"),
+        )
+        if event_key in seen_event_keys:
+            return
+        seen_event_keys.add(event_key)
         all_events.append(dict(event))
         with event_path.open("a", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=EVENT_FIELDS, extrasaction="ignore")
@@ -447,7 +509,11 @@ def run_training(args):
             "reward_volume_ul": config["reward_volume_ul"],
             "reward_to_suction_delay_sec": DEFAULT_SUCTION_DELAY_SEC,
             "suction_duration_sec": config["suction_duration_sec"],
-            "bait_reward_count": 0, "bait_reward_volume_ul": 0.0,
+            "requested_bait_reward_count": requested_bait_reward_count,
+            "attempted_bait_reward_count": 0,
+            "completed_bait_reward_count": 0,
+            "completed_bait_suction_count": 0,
+            "bait_reward_volume_ul": 0.0,
             "training_settle_sec": args.settle_sec,
             "reward_interval_min_sec": args.interval_min_sec,
             "reward_interval_max_sec": args.interval_max_sec, "schedule_seed": seed,
@@ -461,13 +527,38 @@ def run_training(args):
         metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True))
         client.set_context(_context("spout_training_settle"))
         if not args.no_bait:
-            bait_count = args.bait_drops
-            for bait_index in range(1, bait_count + 1):
+            for bait_index in range(1, requested_bait_reward_count + 1):
                 bait_start = time.monotonic()
+                attempted_bait_reward_count += 1
                 client.set_context(_context("spout_training_bait", bait_index))
                 bait_context = _context("spout_training_bait", bait_index)
                 bait_reward_id = client.trigger_reward(bait_context)
-                while time.monotonic() < bait_start + DEFAULT_SUCTION_DELAY_SEC:
+                attempted_bait_reward_command_ids.append(bait_reward_id)
+                bait_reward_on_ns = None
+                bait_reward_complete = False
+                bait_reward_deadline = time.monotonic() + 5.0
+                while time.monotonic() < bait_reward_deadline and (
+                        bait_reward_on_ns is None or not bait_reward_complete):
+                    for event in client.drain_events():
+                        event.setdefault("phase", "spout_training_bait")
+                        event.setdefault("training_reward_index", "")
+                        event.setdefault("reward_command_id", bait_reward_id)
+                        write_event(event)
+                        if (event.get("command_id") == bait_reward_id
+                                and event.get("event_type") == "reward_valve_on"):
+                            bait_reward_on_ns = _event_ns(event)
+                        if (event.get("command_id") == bait_reward_id
+                                and event.get("event_type") == "reward_complete"):
+                            bait_reward_complete = True
+                    time.sleep(EPISODE_POLL_SEC)
+                if bait_reward_on_ns is None:
+                    raise RuntimeError(
+                        "Bait reward %d did not produce reward_valve_on" % bait_index
+                    )
+                if bait_reward_complete:
+                    completed_bait_reward_count += 1
+                bait_suction_target_ns = bait_reward_on_ns + int(DEFAULT_SUCTION_DELAY_SEC * 1e9)
+                while time.monotonic_ns() < bait_suction_target_ns:
                     for event in client.drain_events():
                         event.setdefault("phase", "spout_training_bait")
                         event.setdefault("training_reward_index", "")
@@ -475,7 +566,9 @@ def run_training(args):
                         write_event(event)
                     time.sleep(EPISODE_POLL_SEC)
                 bait_suction_id = client.trigger_suction(bait_context)
+                attempted_bait_suction_command_ids.append(bait_suction_id)
                 bait_deadline = time.monotonic() + float(config["suction_duration_sec"]) + 0.5
+                bait_suction_complete = False
                 while time.monotonic() < bait_deadline:
                     for event in client.drain_events():
                         event.setdefault("phase", "spout_training_bait")
@@ -483,8 +576,13 @@ def run_training(args):
                         event.setdefault("reward_command_id", bait_reward_id)
                         event.setdefault("suction_command_id", bait_suction_id)
                         write_event(event)
+                        if (event.get("command_id") == bait_suction_id
+                                and event.get("event_type") == "suction_complete"):
+                            bait_suction_complete = True
                     time.sleep(EPISODE_POLL_SEC)
-                if bait_index < bait_count:
+                if bait_suction_complete:
+                    completed_bait_suction_count += 1
+                if bait_index < requested_bait_reward_count:
                     time.sleep(max(0.0, BAIT_INTERVAL_SEC - (time.monotonic() - bait_start)))
         client.set_context(_context("spout_training_settle"))
         settle_deadline = time.monotonic() + max(0.0, float(args.settle_sec))
@@ -515,8 +613,10 @@ def run_training(args):
                     write_event(event)
             index = plan["training_reward_index"]
             context = _context("spout_training", index)
+            attempted_training_reward_count += 1
             client.set_context(context)
             command_id = client.trigger_reward(context)
+            attempted_training_reward_command_ids.append(command_id)
             command_ns = time.monotonic_ns()
             client.set_context(_context("spout_training_reward", index, command_id))
             reward_on_ns = None
@@ -536,6 +636,7 @@ def run_training(args):
                 if reward_on_ns is not None and suction_id == "" and time.monotonic_ns() >= reward_on_ns + int(DEFAULT_SUCTION_DELAY_SEC * 1e9):
                     suction_target_ns = reward_on_ns + int(DEFAULT_SUCTION_DELAY_SEC * 1e9)
                     suction_id = client.trigger_suction(_context("spout_training", index, command_id))
+                    attempted_training_suction_command_ids.append(suction_id)
                     suction_command_ns = time.monotonic_ns()
                     client.set_context(_context("spout_training_suction", index, command_id, suction_id))
                 if suction_id and any(e.get("event_type") == "suction_on" and e.get("command_id") == suction_id for e in episode_events):
@@ -580,8 +681,9 @@ def run_training(args):
                 reward_complete_unix_ns=_event_timestamp_fields(reward_complete).get("unix_ns", ""),
                 reward_complete_monotonic_ns=_event_timestamp_fields(reward_complete).get("monotonic_ns", ""),
                 software_reward_timing_error_sec=(
-                    (reward_on_ns - plan["planned_reward_target_monotonic_ns"]) / 1e9
+                    (reward_on_ns - target) / 1e9
                 ),
+                effective_reward_target_monotonic_ns=target,
                 suction_command_id=suction_id,
                 suction_target_monotonic_ns=suction_target_ns,
                 suction_on_unix_ns=_event_timestamp_fields(suction_on).get("unix_ns", ""),
@@ -603,39 +705,65 @@ def run_training(args):
             if training_passed:
                 print("Training criterion reached.")
                 break
+            client.set_context(_context("spout_training_inter_reward", index))
     except KeyboardInterrupt:
         interrupted = True
+        failure_summary = "operator interrupted"
+    except Exception as exc:
+        failure_exc = exc
+        failure_summary = "%s: %s" % (type(exc).__name__, str(exc))
     finally:
         signal.signal(signal.SIGINT, old_handler)
         try:
             for event in client.drain_events():
                 write_event(event)
         finally:
-            client.shutdown()
+            for event in client.shutdown():
+                write_event(event)
             if screen is not None:
                 close = getattr(screen, "close", None)
                 if close is not None:
                     close()
     criterion = evaluate_training_criterion(successes, window=args.criterion_window, fraction=args.criterion_fraction)
     write_rows(summary_path, reward_rows, REWARD_SUMMARY_FIELDS)
-    qc = build_training_qc(reward_rows, all_events, training_passed, dict(criterion, window=args.criterion_window))
-    qc.update({"operator_interrupted": interrupted, "session_completed": not interrupted,
+    completed_bait_reward_count = len(completed_command_ids(
+        all_events, attempted_bait_reward_command_ids, "reward_complete"))
+    completed_bait_suction_count = len(completed_command_ids(
+        all_events, attempted_bait_suction_command_ids, "suction_complete"))
+    completed_training_reward_command_ids = completed_command_ids(
+        all_events, attempted_training_reward_command_ids, "reward_complete")
+    completed_training_suction_command_ids = completed_command_ids(
+        all_events, attempted_training_suction_command_ids, "suction_complete")
+    qc = build_training_qc(
+        reward_rows, all_events, training_passed,
+        dict(criterion, window=args.criterion_window),
+        attempted_reward_command_ids=attempted_training_reward_command_ids,
+        attempted_suction_command_ids=attempted_training_suction_command_ids,
+    )
+    qc.update({"operator_interrupted": interrupted,
+               "session_completed": not interrupted and failure_exc is None,
                "training_passed": training_passed})
     qc_path.write_text(json.dumps(qc, indent=2, sort_keys=True))
     metadata.update({
-        "bait_reward_count": bait_count, "scheduled_training_reward_count": len(schedule),
-        "completed_training_reward_count": len(reward_rows),
-        "completed_suction_count": sum(1 for row in reward_rows if row.get("suction_command_id")),
+        "requested_bait_reward_count": requested_bait_reward_count,
+        "attempted_bait_reward_count": attempted_bait_reward_count,
+        "completed_bait_reward_count": completed_bait_reward_count,
+        "completed_bait_suction_count": completed_bait_suction_count,
+        "planned_schedule_length": len(schedule) or len(interval_plan),
+        "attempted_training_reward_count": attempted_training_reward_count,
+        "completed_training_reward_count": len(completed_training_reward_command_ids),
+        "completed_suction_count": len(completed_training_suction_command_ids),
         "total_lick_onset_count": sum(1 for event in all_events if event.get("event_type") == "lick_onset"),
         "training_passed": training_passed, "training_pass_reward_index": pass_index,
         "final_recent_20_success_count": criterion["recent_success_count"],
         "final_recent_20_success_fraction": criterion["recent_success_fraction"],
-        "planned_training_water_ul": len(schedule) * config["reward_volume_ul"],
-        "actual_training_water_ul": len(reward_rows) * config["reward_volume_ul"],
-        "bait_water_ul": bait_count * config["reward_volume_ul"],
-        "total_water_ul": (len(reward_rows) + bait_count) * config["reward_volume_ul"],
-        "session_completed": not interrupted, "operator_interrupted": interrupted,
-        "failure_summary": "" if not interrupted else "operator interrupted",
+        "planned_training_water_ul": len(interval_plan) * config["reward_volume_ul"],
+        "actual_training_water_ul": len(completed_training_reward_command_ids) * config["reward_volume_ul"],
+        "bait_water_ul": completed_bait_reward_count * config["reward_volume_ul"],
+        "total_water_ul": (len(completed_training_reward_command_ids) + completed_bait_reward_count) * config["reward_volume_ul"],
+        "session_completed": not interrupted and failure_exc is None,
+        "operator_interrupted": interrupted,
+        "failure_summary": failure_summary,
         "session_qc_json": str(qc_path), "reward_summary_csv": str(summary_path),
         "planned_rewards_csv": str(planned_path), "event_log_csv": str(event_path),
         "lick_events_csv": str(lick_path),
@@ -644,6 +772,8 @@ def run_training(args):
     metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True))
     if not training_passed:
         print("Training criterion not reached.\nRepeat spout training before image conditioning.")
+    if failure_exc is not None:
+        raise failure_exc
     return metadata, qc
 
 
