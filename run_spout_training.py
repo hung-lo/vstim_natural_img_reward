@@ -367,6 +367,37 @@ def build_training_qc(reward_rows, events, training_passed, criterion,
     return checks
 
 
+def finalize_training_qc(qc, session_completed,
+                         attempted_bait_reward_count,
+                         completed_bait_reward_count,
+                         attempted_bait_suction_count,
+                         completed_bait_suction_count):
+    """Apply session-level completion and bait hardware requirements."""
+    bait_hardware_complete = (
+        int(attempted_bait_reward_count) == int(completed_bait_reward_count)
+        and int(attempted_bait_suction_count) == int(completed_bait_suction_count)
+    )
+    bait_qc_required = (
+        int(attempted_bait_reward_count) > 0
+        or int(attempted_bait_suction_count) > 0
+    )
+    bait_qc_pass = not bait_qc_required or bait_hardware_complete
+    qc["training_hardware_qc_pass"] = bool(qc.get("qc_pass", False))
+    qc["bait_hardware_complete"] = bait_hardware_complete
+    qc["bait_qc_pass"] = bait_qc_pass
+    qc["session_completed"] = bool(session_completed)
+    if not bait_qc_pass and "bait hardware incomplete" not in qc["qc_fail_reasons"]:
+        qc["qc_fail_reasons"].append("bait hardware incomplete")
+    if not session_completed and "session did not complete normally" not in qc["qc_fail_reasons"]:
+        qc["qc_fail_reasons"].append("session did not complete normally")
+    qc["qc_pass"] = bool(
+        qc["training_hardware_qc_pass"]
+        and bait_qc_pass
+        and session_completed
+    )
+    return qc
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--hardware-config", default=str(DEFAULT_CONFIG))
@@ -752,7 +783,6 @@ def run_training(args):
         attempted_suction_command_ids=attempted_training_suction_command_ids,
     )
     qc.update({"operator_interrupted": interrupted,
-               "session_completed": not interrupted and failure_exc is None,
                "training_passed": training_passed,
                "requested_bait_reward_count": requested_bait_reward_count,
                "attempted_bait_reward_count": attempted_bait_reward_count,
@@ -763,6 +793,11 @@ def run_training(args):
                    attempted_bait_reward_count == completed_bait_reward_count
                    and len(attempted_bait_suction_command_ids) == completed_bait_suction_count
                )})
+    finalize_training_qc(
+        qc, not interrupted and failure_exc is None,
+        attempted_bait_reward_count, completed_bait_reward_count,
+        len(attempted_bait_suction_command_ids), completed_bait_suction_count,
+    )
     qc_path.write_text(json.dumps(qc, indent=2, sort_keys=True))
     metadata.update({
         "requested_bait_reward_count": requested_bait_reward_count,
@@ -793,6 +828,7 @@ def run_training(args):
         "planned_rewards_csv": str(planned_path), "event_log_csv": str(event_path),
         "lick_events_csv": str(lick_path),
         "qc_pass": qc["qc_pass"],
+        "qc_fail_reasons": qc["qc_fail_reasons"],
     })
     metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True))
     if not training_passed:

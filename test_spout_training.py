@@ -91,6 +91,21 @@ class SpoutTrainingTests(unittest.TestCase):
         self.assertTrue(qc["qc_pass"])
         self.assertFalse(qc["training_passed"])
 
+    def test_final_qc_requires_normal_completion_and_bait_hardware(self):
+        hardware_qc = {"qc_pass": True, "qc_fail_reasons": []}
+        failed = training.finalize_training_qc(
+            hardware_qc, False, 1, 0, 1, 1,
+        )
+        self.assertFalse(failed["qc_pass"])
+        self.assertFalse(failed["bait_hardware_complete"])
+        self.assertIn("bait hardware incomplete", failed["qc_fail_reasons"])
+        self.assertIn("session did not complete normally", failed["qc_fail_reasons"])
+
+        normal_behavior_failure = training.finalize_training_qc(
+            {"qc_pass": True, "qc_fail_reasons": []}, True, 0, 0, 0, 0,
+        )
+        self.assertTrue(normal_behavior_failure["qc_pass"])
+
     def test_qc_excludes_bait_commands(self):
         rows = [{"reward_command_id": "r1", "suction_command_id": "s1"}]
         events = [
