@@ -833,7 +833,7 @@ def run_training(args):
                 "Last %s | %s"
             ) % (
                 completed_bait_reward_count, completed_bait_reward_count * config["reward_volume_ul"],
-                manual_bait_stats["bait_contacted_count_session"], bait_number,
+                manual_bait_stats["bait_contacted_count_session"], completed_bait_reward_count,
                 len(recent_licks), "—" if last_age is None else "%.2f s" % last_age,
                 "LICKING" if active else "not licking",
             )
@@ -1002,21 +1002,24 @@ def run_training(args):
                 interrupted = True
                 failure_summary = "manual bait aborted by operator"
             else:
-                manual_delay_deadline = time.monotonic() + float(args.manual_start_delay_sec)
+                manual_delay_deadline = time.monotonic() + float(
+                    getattr(args, "manual_start_delay_sec", 0.0)
+                )
                 while time.monotonic() < manual_delay_deadline:
                     for event in client.drain_events():
-                        event.setdefault("phase", MANUAL_BAIT_PHASE)
+                        event.setdefault("phase", "spout_training_manual_start_delay")
                         event.setdefault("training_reward_index", "")
                         write_event(event)
+                    remaining = max(0.0, manual_delay_deadline - time.monotonic())
                     telemetry_state(
                         "MANUAL_START_DELAY", training_index=None,
-                        next_reward_in_sec=max(0.0, manual_delay_deadline - time.monotonic()),
+                        next_reward_in_sec=remaining,
                         extra_state={
-                            "bait_mode": "manual", "manual_bait_active": True,
+                            "bait_mode": "manual", "manual_bait_active": False,
                             "manual_bait_max_water_ul": manual_bait_max_water_ul,
                         },
                     )
-                    time.sleep(min(EPISODE_POLL_SEC, manual_delay_deadline - time.monotonic()))
+                    time.sleep(min(EPISODE_POLL_SEC, remaining))
         elif bait_mode == "auto":
             for bait_index in range(1, requested_bait_reward_count + 1):
                 bait_start = time.monotonic()
