@@ -43,6 +43,57 @@ class SpoutTrainingTests(unittest.TestCase):
             context["phase"] for context in client.contexts
         ])
 
+    def test_manual_busy_enter_is_consumed_and_not_queued(self):
+        _, error, client, metadata, _, _ = self._run_fake_session(
+            bait=False, manual=True,
+            key_script=[(100.0, "\r"), (100.02, "\r"),
+                         (100.04, "\r"), (103.0, "s")],
+        )
+        self.assertIsNone(error)
+        self.assertEqual(client.reward_count, 2)
+        self.assertEqual(client.suction_count, 2)
+        self.assertEqual(metadata["completed_bait_reward_count"], 1)
+
+    def test_manual_second_enter_after_ready_runs_second_cycle(self):
+        _, error, client, metadata, _, _ = self._run_fake_session(
+            bait=False, manual=True,
+            key_script=[(100.0, "\r"), (102.8, "\r"), (105.5, "s")],
+        )
+        self.assertIsNone(error)
+        self.assertEqual(client.reward_count, 3)
+        self.assertEqual(client.suction_count, 3)
+        self.assertEqual(metadata["completed_bait_reward_count"], 2)
+        self.assertEqual(metadata["completed_bait_suction_count"], 2)
+
+    def test_manual_q_while_ready_aborts_without_water(self):
+        _, error, client, metadata, _, _ = self._run_fake_session(
+            bait=False, manual=True, key_script=[(100.0, "q")],
+        )
+        self.assertIsNone(error)
+        self.assertEqual(client.reward_count, 0)
+        self.assertEqual(client.suction_count, 0)
+        self.assertTrue(metadata["operator_interrupted"])
+        self.assertEqual(metadata["failure_summary"], "manual bait aborted by operator")
+
+    def test_manual_q_has_priority_over_s(self):
+        _, error, client, metadata, _, _ = self._run_fake_session(
+            bait=False, manual=True,
+            key_script=[(100.0, "\r"), (100.5, "s"), (100.5, "q")],
+        )
+        self.assertIsNone(error)
+        self.assertEqual(client.reward_count, 1)
+        self.assertTrue(metadata["operator_interrupted"])
+
+    def test_manual_non_tty_fails_before_reward(self):
+        _, error, client, _, _, _ = self._run_fake_session(
+            bait=False, manual=True, key_script=[(100.0, "\r")],
+            tty_available=False,
+        )
+        self.assertIsNotNone(error)
+        self.assertIn("Manual bait requires an interactive terminal", str(error))
+        self.assertEqual(client.reward_count, 0)
+        self.assertEqual(client.suction_count, 0)
+
     def test_terminal_key_reader_restores_terminal(self):
         stream = mock.Mock()
         stream.fileno.return_value = 7
@@ -54,6 +105,20 @@ class SpoutTrainingTests(unittest.TestCase):
             with reader:
                 pass
             restore.assert_called_once_with(7, training.termios.TCSADRAIN, [1, 2])
+
+    def test_terminal_key_reader_restores_on_exceptions(self):
+        for raised in (RuntimeError, KeyboardInterrupt):
+            stream = mock.Mock()
+            stream.fileno.return_value = 7
+            stream.isatty.return_value = True
+            with mock.patch.object(training.termios, "tcgetattr", return_value=[1, 2]), \
+                    mock.patch.object(training.tty, "setcbreak"), \
+                    mock.patch.object(training.termios, "tcsetattr") as restore:
+                reader = training.TerminalKeyReader(stream)
+                with self.assertRaises(raised):
+                    with reader:
+                        raise raised("test")
+                restore.assert_called_once_with(7, training.termios.TCSADRAIN, [1, 2])
 
     def test_telemetry_cli_options(self):
         args = training.parse_args([
@@ -259,9 +324,39 @@ class SpoutTrainingTests(unittest.TestCase):
         self.assertTrue(qc["qc_pass"])
         self.assertEqual(qc["unexpected_reward_command_ids"], [])
 
+    def test_qc_excludes_manual_bait_commands(self):
+        rows = [{"reward_command_id": "r1", "suction_command_id": "s1"}]
+        events = [
+            {"phase": "spout_training_manual_bait", "command_id": "manual-bait-r",
+             "event_type": event_type}
+            for event_type in ("reward_command_received", "reward_valve_on",
+                               "reward_valve_off", "reward_complete")
+        ] + [
+            {"phase": "spout_training_manual_bait", "command_id": "manual-bait-s",
+             "event_type": event_type}
+            for event_type in ("suction_command_received", "suction_on",
+                               "suction_off", "suction_complete")
+        ] + [
+            {"phase": "spout_training", "command_id": "r1",
+             "event_type": event_type}
+            for event_type in ("reward_command_received", "reward_valve_on",
+                               "reward_valve_off", "reward_complete")
+        ] + [
+            {"phase": "spout_training", "command_id": "s1",
+             "event_type": event_type}
+            for event_type in ("suction_command_received", "suction_on",
+                               "suction_off", "suction_complete")
+        ]
+        qc = training.build_training_qc(
+            rows, events, False, {"window": 20, "recent_success_fraction": 0.0},
+        )
+        self.assertTrue(qc["qc_pass"])
+        self.assertEqual(qc["unexpected_reward_command_ids"], [])
+        self.assertEqual(qc["unexpected_suction_command_ids"], [])
+
     def _run_fake_session(self, mode="normal", bait=True, max_rewards=1,
                           telemetry_failure=False, manual=False,
-                          key_script=None):
+                          key_script=None, tty_available=True):
         class Clock(object):
             def __init__(self):
                 self.now = 100.0
@@ -393,7 +488,8 @@ class SpoutTrainingTests(unittest.TestCase):
                 stack.enter_context(mock.patch.object(
                     training, "BehaviorGPIOClient", return_value=client))
                 stack.enter_context(mock.patch.object(training, "time", clock))
-                stack.enter_context(mock.patch.object(training.sys.stdin, "isatty", return_value=True))
+                stack.enter_context(mock.patch.object(
+                    training.sys.stdin, "isatty", return_value=tty_available))
                 if telemetry_failure:
                     publisher = mock.Mock()
                     publisher.enabled = True
