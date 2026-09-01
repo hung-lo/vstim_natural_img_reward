@@ -155,21 +155,15 @@ def git_dirty():
 
 
 def prepare_gray_display(output_root):
-    """Initialize one static gray frame; no experimental image is loaded."""
+    """Open the RPG screen and leave a static gray field visible."""
     import run_stringer_vstim as base
     import rpg
-    display_dir = Path(output_root) / "display_cache"
-    display_dir.mkdir(parents=True, exist_ok=True)
-    gray_path = display_dir / "spout_training_gray.raw"
-    canvas = base.build_canvas(None, base.SCREEN_RESOLUTION, photodiode_on=False)
-    base.convert_canvas_to_rpg_raw(
-        rpg, canvas, gray_path, 1.0 / float(base.REFRESH_RATE_HZ),
-    )
     screen = rpg.Screen(
-        base.SCREEN_RESOLUTION[0], base.SCREEN_RESOLUTION[1],
-        base.SCREEN_COLORMODE, base.REFRESH_RATE_HZ,
+        base.SCREEN_RESOLUTION,
+        background=base.SCREEN_BACKGROUND_GRAY,
+        colormode=base.SCREEN_COLORMODE,
     )
-    screen.display_raw(gray_path)
+    screen.display_greyscale(base.SCREEN_BACKGROUND_GRAY)
     return screen
 
 
@@ -1419,7 +1413,7 @@ def run_training(args):
         telemetry.close()
     except Exception:
         pass
-    if not training_passed:
+    if failure_exc is None and not interrupted and not training_passed:
         print("Training criterion not reached.\nRepeat spout training before image conditioning.")
     if failure_exc is not None:
         raise failure_exc

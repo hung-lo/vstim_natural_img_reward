@@ -2,9 +2,12 @@
 """Tests for the gray-screen spout-training protocol."""
 
 import csv
+import io
 import json
+import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +17,33 @@ import run_spout_training as training
 
 
 class SpoutTrainingTests(unittest.TestCase):
+    def test_prepare_gray_display_uses_supported_rpg_api(self):
+        class FakeScreen(object):
+            calls = []
+
+            def __init__(self, *args, **kwargs):
+                self.calls.append((args, kwargs))
+
+            def display_greyscale(self, value):
+                self.greyscale = value
+
+        fake_rpg = SimpleNamespace(Screen=FakeScreen)
+        fake_base = SimpleNamespace(
+            SCREEN_RESOLUTION=(800, 600), SCREEN_BACKGROUND_GRAY=17,
+            SCREEN_COLORMODE="RGB",
+        )
+        with mock.patch.dict(sys.modules, {
+            "rpg": fake_rpg, "run_stringer_vstim": fake_base,
+        }):
+            screen = training.prepare_gray_display("unused")
+        self.assertIsInstance(screen, FakeScreen)
+        self.assertEqual(FakeScreen.calls[-1], (
+            (fake_base.SCREEN_RESOLUTION,),
+            {"background": fake_base.SCREEN_BACKGROUND_GRAY,
+             "colormode": fake_base.SCREEN_COLORMODE},
+        ))
+        self.assertEqual(screen.greyscale, fake_base.SCREEN_BACKGROUND_GRAY)
+
     def test_manual_bait_mode_is_default_and_legacy_modes_parse(self):
         self.assertEqual(training.parse_args(["--simulate-gpio"]).bait_mode, "manual")
         self.assertEqual(
@@ -178,6 +208,32 @@ class SpoutTrainingTests(unittest.TestCase):
                     with reader:
                         raise raised("test")
                 restore.assert_called_once_with(7, training.termios.TCSADRAIN, [1, 2])
+
+    def test_startup_failure_does_not_print_behavioral_failure(self):
+        with tempfile.TemporaryDirectory(prefix="spout_screen_failure_") as directory:
+            root = Path(directory)
+            config = root / "hardware.json"
+            config.write_text(json.dumps({"suction_duration_sec": 0.1}))
+            args = SimpleNamespace(
+                hardware_config=str(config), mouse_id="screen_failure",
+                output_root=str(root), simulate_gpio=False, max_rewards=1,
+                interval_min_sec=0.01, interval_max_sec=0.01, settle_sec=0.0,
+                criterion_window=20, criterion_fraction=0.8, no_bait=True,
+                bait_drops=0, bait_mode="none", no_telemetry=True,
+                telemetry_host="127.0.0.1", telemetry_port=5055,
+                manual_start_delay_sec=0.0,
+            )
+            client = mock.Mock()
+            client.drain_events.return_value = []
+            client.shutdown.return_value = []
+            output = io.StringIO()
+            with mock.patch.object(training, "BehaviorGPIOClient", return_value=client), \
+                    mock.patch.object(training, "prepare_gray_display",
+                                       side_effect=RuntimeError("screen unavailable")), \
+                    redirect_stdout(output):
+                with self.assertRaises(RuntimeError):
+                    training.run_training(args)
+            self.assertNotIn("Training criterion not reached", output.getvalue())
 
     def test_telemetry_cli_options(self):
         args = training.parse_args([
