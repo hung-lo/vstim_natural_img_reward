@@ -786,10 +786,15 @@ def run_training(args):
         reward_complete = False
         suction_complete = False
         suction_target_ns = None
+        reward_deadline = None
+        suction_deadline = None
+        last_lick_monotonic_ns = None
         bait_number = 0
+        previous_status_width = 0
 
         def service_events():
             nonlocal reward_on_ns, reward_complete, suction_complete
+            nonlocal last_lick_monotonic_ns
             now_ns = time.monotonic_ns()
             while recent_licks and recent_licks[0] < now_ns - 2_000_000_000:
                 recent_licks.popleft()
@@ -801,6 +806,7 @@ def run_training(args):
                 write_event(event)
                 event_ns = _event_ns(event)
                 if event.get("event_type") == "lick_onset":
+                    last_lick_monotonic_ns = event_ns
                     recent_licks.append(event_ns)
                 if event.get("command_id") == reward_id:
                     if event.get("event_type") == "reward_valve_on":
@@ -812,28 +818,29 @@ def run_training(args):
                     suction_complete = True
 
         def show_status(state, force=False):
-            nonlocal status_at
+            nonlocal status_at, previous_status_width
             now = time.monotonic()
             if not force and now - status_at < MANUAL_STATUS_REFRESH_SEC:
                 return
             status_at = now
             while recent_licks and recent_licks[0] < time.monotonic_ns() - 2_000_000_000:
                 recent_licks.popleft()
-            last_age = None
-            if recent_licks:
-                last_age = max(0.0, (time.monotonic_ns() - recent_licks[-1]) / 1e9)
+            last_age = None if last_lick_monotonic_ns is None else max(
+                0.0, (time.monotonic_ns() - last_lick_monotonic_ns) / 1e9)
             active = bool(recent_licks)
             text = (
-                "MANUAL BAIT | Drops: %d | Bait water: %.1f uL | Contacted: %d | "
-                "Licks last 2 s: %d | Last lick: %s | %s\n"
-                "ENTER = water   S = start training   Q = abort"
+                "Drops %d | Water %.1f uL | Contacted %d/%d | Licks 2s %d | "
+                "Last %s | %s"
             ) % (
                 completed_bait_reward_count, completed_bait_reward_count * config["reward_volume_ul"],
-                manual_bait_stats["bait_contacted_count_session"], len(recent_licks),
-                "—" if last_age is None else "%.2f s ago" % last_age,
-                ">>> LICKING <<<" if active else "not licking",
+                manual_bait_stats["bait_contacted_count_session"], bait_number,
+                len(recent_licks), "—" if last_age is None else "%.2f s" % last_age,
+                "LICKING" if active else "not licking",
             )
-            print(text)
+            padded = text.ljust(previous_status_width)
+            sys.stdout.write("\r" + padded)
+            sys.stdout.flush()
+            previous_status_width = len(text)
             telemetry_state("MANUAL_BAIT", training_index=None,
                             bait_index=(bait_number or None), bait_total=None,
                             force=force, extra_state={
@@ -850,14 +857,22 @@ def run_training(args):
                                 "bait_reward_ready": state == "READY",
                                 "manual_start_requested": start_requested,
                                 "manual_abort_requested": abort_requested,
-                                "manual_bait_max_water_ul": manual_bait_max_water_ul,
-                            })
+                "manual_bait_max_water_ul": manual_bait_max_water_ul,
+            })
+
+        def permanent_message(message):
+            nonlocal previous_status_width
+            if previous_status_width:
+                sys.stdout.write("\r" + (" " * previous_status_width) + "\r")
+                sys.stdout.flush()
+                previous_status_width = 0
+            print(message)
 
         try:
             with key_reader:
-                print("MANUAL BAIT: ENTER = water, S = start training, Q = abort")
+                permanent_message("MANUAL BAIT — ENTER=water | S=start training | Q=abort")
                 if manual_bait_max_water_ul is None:
-                    print("No manual bait water cap configured.")
+                    permanent_message("No manual bait water cap configured.")
                 show_status("READY", force=True)
                 while True:
                     key = key_reader.poll()
@@ -870,13 +885,15 @@ def run_training(args):
                             if (manual_bait_max_water_ul is not None
                                     and (completed_bait_reward_count + 1) * config["reward_volume_ul"] > manual_bait_max_water_ul):
                                 if not cap_message_shown:
-                                    print("bait water cap reached")
+                                    permanent_message("bait water cap reached")
                                     cap_message_shown = True
                             else:
                                 bait_number += 1
                                 attempted_bait_reward_count += 1
                                 reward_id = client.trigger_reward(_context(MANUAL_BAIT_PHASE, ""))
                                 attempted_bait_reward_command_ids.append(reward_id)
+                                reward_deadline = time.monotonic() + 5.0
+                                suction_deadline = None
                                 reward_on_ns = None
                                 reward_complete = False
                                 suction_id = None
@@ -884,11 +901,25 @@ def run_training(args):
                                 suction_target_ns = None
                         key = key_reader.poll()
                     service_events()
+                    if reward_id is not None and reward_deadline is not None \
+                            and time.monotonic() >= reward_deadline \
+                            and (reward_on_ns is None or not reward_complete):
+                        raise RuntimeError(
+                            "Manual bait %d reward timeout (command %s)" %
+                            (bait_number, reward_id)
+                        )
                     if reward_id is not None and reward_on_ns is not None and suction_id is None \
                             and time.monotonic_ns() >= reward_on_ns + int(DEFAULT_SUCTION_DELAY_SEC * 1e9):
                         suction_target_ns = reward_on_ns + int(DEFAULT_SUCTION_DELAY_SEC * 1e9)
                         suction_id = client.trigger_suction(_context(MANUAL_BAIT_PHASE, "", reward_id))
                         attempted_bait_suction_command_ids.append(suction_id)
+                        suction_deadline = time.monotonic() + float(config["suction_duration_sec"]) + 0.5
+                    if suction_id is not None and suction_deadline is not None \
+                            and time.monotonic() >= suction_deadline and not suction_complete:
+                        raise RuntimeError(
+                            "Manual bait %d suction timeout (command %s)" %
+                            (bait_number, suction_id)
+                        )
                     if reward_id is not None and suction_id is not None and suction_complete:
                         if not reward_complete:
                             raise RuntimeError(
@@ -902,16 +933,18 @@ def run_training(args):
                             manual_bait_stats["bait_contacted_count_session"] += 1
                         manual_bait_stats["last_bait_contacted"] = metrics["retrieval_success"]
                         manual_bait_stats["last_bait_first_lick_latency_sec"] = metrics["first_lick_latency_sec"]
-                        print("Bait #%d contacted %s" % (bait_number, "YES" if metrics["retrieval_success"] else "NO"))
+                        permanent_message("Bait #%d contacted %s" % (
+                            bait_number, "YES" if metrics["retrieval_success"] else "NO"))
                         reward_id = suction_id = None
                         reward_on_ns = suction_target_ns = None
+                        reward_deadline = suction_deadline = None
                         reward_complete = suction_complete = False
                     show_status("BUSY" if reward_id is not None else "READY")
                     if reward_id is None and abort_requested:
-                        print("Aborting")
+                        permanent_message("Aborting")
                         return False
                     if reward_id is None and start_requested:
-                        print("Starting training")
+                        permanent_message("Starting training")
                         return True
                     time.sleep(EPISODE_POLL_SEC)
         finally:
@@ -971,6 +1004,18 @@ def run_training(args):
             else:
                 manual_delay_deadline = time.monotonic() + float(args.manual_start_delay_sec)
                 while time.monotonic() < manual_delay_deadline:
+                    for event in client.drain_events():
+                        event.setdefault("phase", MANUAL_BAIT_PHASE)
+                        event.setdefault("training_reward_index", "")
+                        write_event(event)
+                    telemetry_state(
+                        "MANUAL_START_DELAY", training_index=None,
+                        next_reward_in_sec=max(0.0, manual_delay_deadline - time.monotonic()),
+                        extra_state={
+                            "bait_mode": "manual", "manual_bait_active": True,
+                            "manual_bait_max_water_ul": manual_bait_max_water_ul,
+                        },
+                    )
                     time.sleep(min(EPISODE_POLL_SEC, manual_delay_deadline - time.monotonic()))
         elif bait_mode == "auto":
             for bait_index in range(1, requested_bait_reward_count + 1):

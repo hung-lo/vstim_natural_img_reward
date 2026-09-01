@@ -14,6 +14,30 @@ import run_spout_training as training
 
 
 class SpoutTrainingTests(unittest.TestCase):
+    def test_manual_bait_mode_is_default_and_legacy_modes_parse(self):
+        self.assertEqual(training.parse_args(["--simulate-gpio"]).bait_mode, "manual")
+        self.assertEqual(
+            training.parse_args(["--simulate-gpio", "--bait-drops", "4"]).bait_mode,
+            "auto",
+        )
+        self.assertEqual(
+            training.parse_args(["--simulate-gpio", "--no-bait"]).bait_mode,
+            "none",
+        )
+        self.assertEqual(training.parse_args(["--simulate-gpio"]).manual_start_delay_sec, 0.0)
+
+    def test_terminal_key_reader_restores_terminal(self):
+        stream = mock.Mock()
+        stream.fileno.return_value = 7
+        stream.isatty.return_value = True
+        with mock.patch.object(training.termios, "tcgetattr", return_value=[1, 2]), \
+                mock.patch.object(training.tty, "setcbreak"), \
+                mock.patch.object(training.termios, "tcsetattr") as restore:
+            reader = training.TerminalKeyReader(stream)
+            with reader:
+                pass
+            restore.assert_called_once_with(7, training.termios.TCSADRAIN, [1, 2])
+
     def test_telemetry_cli_options(self):
         args = training.parse_args([
             "--simulate-gpio", "--telemetry-host", "monitor",

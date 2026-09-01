@@ -362,4 +362,7 @@ The default workflow is interactive manual baiting on Box151:
 Manual bait is operator-controlled and does not count toward the training
 criterion. Bait water is tracked separately. Use `--bait-mode auto` for the
 legacy fixed bait sequence, or `--no-bait` to skip baiting. The monitor remains
-read-only.
+read-only. Repeated `ENTER` during an active bait cycle is ignored; `S` and
+`Q` wait for that cycle to finish. Last-lick feedback remains visible after
+the 2-second rolling window expires, and `--max-bait-water-ul` optionally caps
+manual bait water.
