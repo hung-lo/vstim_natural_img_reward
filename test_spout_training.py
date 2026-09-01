@@ -84,6 +84,65 @@ class SpoutTrainingTests(unittest.TestCase):
         self.assertEqual(client.reward_count, 1)
         self.assertTrue(metadata["operator_interrupted"])
 
+    def test_manual_s_while_busy_waits_for_cycle_then_starts(self):
+        _, error, client, metadata, _, _ = self._run_fake_session(
+            bait=False, manual=True, key_script=[(100.0, "\r"), (100.5, "s")]
+        )
+        self.assertIsNone(error)
+        self.assertEqual(client.reward_count, 2)
+        self.assertEqual(client.suction_count, 2)
+        self.assertEqual(metadata["completed_bait_reward_count"], 1)
+        self.assertEqual(metadata["completed_bait_suction_count"], 1)
+
+    def test_manual_q_while_busy_finishes_cycle_then_aborts(self):
+        _, error, client, metadata, _, _ = self._run_fake_session(
+            bait=False, manual=True, key_script=[(100.0, "\r"), (100.5, "q")]
+        )
+        self.assertIsNone(error)
+        self.assertEqual(client.reward_count, 1)
+        self.assertEqual(client.suction_count, 1)
+        self.assertEqual(metadata["completed_bait_reward_count"], 1)
+        self.assertEqual(metadata["completed_bait_suction_count"], 1)
+        self.assertTrue(metadata["operator_interrupted"])
+
+    def test_manual_bait_suction_uses_actual_reward_on_timestamp(self):
+        _, error, client, _, _, _ = self._run_fake_session(
+            bait=False, manual=True, key_script=[(100.0, "\r"), (103.0, "s")]
+        )
+        self.assertIsNone(error)
+        manual_suction_time = next(
+            timestamp for timestamp, phase in client.suction_calls
+            if phase == "spout_training_manual_bait"
+        )
+        self.assertAlmostEqual(manual_suction_time - 100.1, 2.5, places=1)
+
+    def test_manual_bait_reward_timeout_fails_safely(self):
+        _, error, client, metadata, qc, _ = self._run_fake_session(
+            "manual_bait_reward", bait=False, manual=True,
+            key_script=[(100.0, "\r")],
+        )
+        self.assertIsNotNone(error)
+        self.assertIn("Manual bait", str(error))
+        self.assertIn("reward", str(error).lower())
+        self.assertEqual(client.suction_count, 0)
+        self.assertEqual(metadata["completed_bait_reward_count"], 0)
+        self.assertFalse(metadata["session_completed"])
+        self.assertFalse(qc["qc_pass"])
+
+    def test_manual_bait_suction_timeout_fails_safely(self):
+        _, error, client, metadata, qc, _ = self._run_fake_session(
+            "manual_bait_suction", bait=False, manual=True,
+            key_script=[(100.0, "\r")],
+        )
+        self.assertIsNotNone(error)
+        self.assertIn("Manual bait", str(error))
+        self.assertIn("suction", str(error).lower())
+        self.assertEqual(client.suction_count, 1)
+        self.assertEqual(metadata["completed_bait_reward_count"], 1)
+        self.assertEqual(metadata["completed_bait_suction_count"], 0)
+        self.assertFalse(metadata["session_completed"])
+        self.assertFalse(qc["qc_pass"])
+
     def test_manual_non_tty_fails_before_reward(self):
         _, error, client, _, _, _ = self._run_fake_session(
             bait=False, manual=True, key_script=[(100.0, "\r")],
@@ -401,13 +460,17 @@ class SpoutTrainingTests(unittest.TestCase):
                 self.reward_count += 1
                 command_id = "reward_%d" % self.reward_count
                 phase = context.get("phase", "")
-                self.events.extend([
-                    self._event("reward_command_received", command_id, phase),
-                    self._event("reward_valve_on", command_id, phase, 0.1),
-                    self._event("reward_valve_off", command_id, phase, 0.2),
-                ])
+                self.events.append(self._event("reward_command_received", command_id, phase))
+                if not (self.failure_mode == "manual_bait_reward"
+                        and phase == "spout_training_manual_bait"):
+                    self.events.extend([
+                        self._event("reward_valve_on", command_id, phase, 0.1),
+                        self._event("reward_valve_off", command_id, phase, 0.2),
+                    ])
                 omit = (
                     (self.failure_mode == "bait_reward" and phase == "spout_training_bait")
+                    or (self.failure_mode == "manual_bait_reward"
+                        and phase == "spout_training_manual_bait")
                     or (self.failure_mode == "training_reward" and phase == "spout_training")
                 )
                 if not omit:
@@ -426,6 +489,8 @@ class SpoutTrainingTests(unittest.TestCase):
                 ])
                 omit = (
                     (self.failure_mode == "bait_suction" and phase == "spout_training_bait")
+                    or (self.failure_mode == "manual_bait_suction"
+                        and phase == "spout_training_manual_bait")
                     or (self.failure_mode == "training_suction" and phase == "spout_training")
                 )
                 if not omit:
