@@ -47,6 +47,9 @@ EPISODE_POLL_SEC = 0.02
 TELEMETRY_HEARTBEAT_SEC = 1.0
 MANUAL_STATUS_REFRESH_SEC = 0.25
 MANUAL_BAIT_PHASE = "spout_training_manual_bait"
+NON_TRAINING_BAIT_PHASES = {
+    "spout_training_bait", MANUAL_BAIT_PHASE,
+}
 
 
 class TerminalKeyReader(object):
@@ -326,12 +329,12 @@ def build_training_qc(reward_rows, events, training_passed, criterion,
     observed_reward_ids = {
         event.get("command_id") for event in events
         if event.get("event_type") in REWARD_EVENT_TYPES and event.get("command_id")
-        and event.get("phase") != "spout_training_bait"
+        and event.get("phase") not in NON_TRAINING_BAIT_PHASES
     }
     observed_suction_ids = {
         event.get("command_id") for event in events
         if event.get("event_type") in SUCTION_EVENT_TYPES and event.get("command_id")
-        and event.get("phase") != "spout_training_bait"
+        and event.get("phase") not in NON_TRAINING_BAIT_PHASES
     }
     reward_received_counts = {
         command_id: count({"reward_command_received"}, {command_id})
@@ -998,6 +1001,7 @@ def run_training(args):
         client.set_context(_context("spout_training_settle"))
         telemetry_state("STARTING", force=True)
         if bait_mode == "manual":
+            client.set_context(_context(MANUAL_BAIT_PHASE))
             if not run_manual_bait():
                 interrupted = True
                 failure_summary = "manual bait aborted by operator"
@@ -1005,6 +1009,7 @@ def run_training(args):
                 manual_delay_deadline = time.monotonic() + float(
                     getattr(args, "manual_start_delay_sec", 0.0)
                 )
+                client.set_context(_context("spout_training_manual_start_delay"))
                 while time.monotonic() < manual_delay_deadline:
                     for event in client.drain_events():
                         event.setdefault("phase", "spout_training_manual_start_delay")

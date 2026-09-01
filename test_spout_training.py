@@ -26,6 +26,23 @@ class SpoutTrainingTests(unittest.TestCase):
         )
         self.assertEqual(training.parse_args(["--simulate-gpio"]).manual_start_delay_sec, 0.0)
 
+    def test_manual_enter_runs_one_cycle_then_s_starts_training(self):
+        result, error, client, metadata, qc, _ = self._run_fake_session(
+            bait=False, manual=True, key_script=[(100.0, "\r"), (100.5, "s")]
+        )
+        self.assertIsNone(error)
+        self.assertIsNotNone(result)
+        self.assertEqual(client.reward_count, 2)  # one bait, one training reward
+        self.assertEqual(client.suction_count, 2)
+        self.assertEqual(metadata["attempted_bait_reward_count"], 1)
+        self.assertEqual(metadata["completed_bait_reward_count"], 1)
+        self.assertEqual(metadata["completed_bait_suction_count"], 1)
+        self.assertTrue(metadata["session_completed"])
+        self.assertTrue(qc["qc_pass"])
+        self.assertIn("spout_training_manual_bait", [
+            context["phase"] for context in client.contexts
+        ])
+
     def test_terminal_key_reader_restores_terminal(self):
         stream = mock.Mock()
         stream.fileno.return_value = 7
@@ -243,7 +260,8 @@ class SpoutTrainingTests(unittest.TestCase):
         self.assertEqual(qc["unexpected_reward_command_ids"], [])
 
     def _run_fake_session(self, mode="normal", bait=True, max_rewards=1,
-                          telemetry_failure=False):
+                          telemetry_failure=False, manual=False,
+                          key_script=None):
         class Clock(object):
             def __init__(self):
                 self.now = 100.0
@@ -329,6 +347,24 @@ class SpoutTrainingTests(unittest.TestCase):
             def shutdown(self):
                 return [self._event("gpio_worker_stopped", "shutdown-final", "shutdown")]
 
+        class ScriptedKeyReader(object):
+            def __init__(self):
+                self.script = list(key_script or [])
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *unused):
+                return False
+
+            def poll(self):
+                if self.script and clock.now >= self.script[0][0]:
+                    return self.script.pop(0)[1]
+                return None
+
+            def close(self):
+                pass
+
         with tempfile.TemporaryDirectory(prefix="spout_integration_") as directory:
             root = Path(directory)
             config_path = root / "hardware.json"
@@ -343,15 +379,21 @@ class SpoutTrainingTests(unittest.TestCase):
                 interval_max_sec=0.01, settle_sec=0.0,
                 criterion_window=20, criterion_fraction=0.8,
                 no_bait=not bait, bait_drops=1 if bait else 0,
+                bait_mode="manual" if manual else None,
+                manual_start_delay_sec=0.0,
                 telemetry_host="127.0.0.1", telemetry_port=5055,
                 no_telemetry=not telemetry_failure,
             )
+            if manual:
+                args.no_bait = False
+                args.key_reader_factory = ScriptedKeyReader
             clock = Clock()
             client = FakeGPIO(clock, mode)
             with ExitStack() as stack:
                 stack.enter_context(mock.patch.object(
                     training, "BehaviorGPIOClient", return_value=client))
                 stack.enter_context(mock.patch.object(training, "time", clock))
+                stack.enter_context(mock.patch.object(training.sys.stdin, "isatty", return_value=True))
                 if telemetry_failure:
                     publisher = mock.Mock()
                     publisher.enabled = True
