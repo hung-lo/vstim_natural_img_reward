@@ -4,12 +4,17 @@
 from __future__ import print_function
 
 import argparse
+from collections import deque
 import csv
 import json
 import math
 import random
+import select
 import signal
+import sys
+import termios
 import time
+import tty
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -40,6 +45,47 @@ DEFAULT_BAIT_DROPS = 2
 BAIT_INTERVAL_SEC = 5.0
 EPISODE_POLL_SEC = 0.02
 TELEMETRY_HEARTBEAT_SEC = 1.0
+MANUAL_STATUS_REFRESH_SEC = 0.25
+MANUAL_BAIT_PHASE = "spout_training_manual_bait"
+
+
+class TerminalKeyReader(object):
+    """Nonblocking cbreak-mode reader that always restores the terminal."""
+
+    def __init__(self, stream=None):
+        self.stream = stream or sys.stdin
+        self.fd = self.stream.fileno()
+        self._settings = None
+
+    def __enter__(self):
+        if not self.stream.isatty():
+            raise RuntimeError(
+                "Manual bait requires an interactive terminal.\n"
+                "Use --bait-mode auto or --no-bait for non-interactive runs."
+            )
+        self._settings = termios.tcgetattr(self.fd)
+        tty.setcbreak(self.fd)
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+        return False
+
+    def poll(self):
+        try:
+            readable, _, _ = select.select([self.stream], [], [], 0)
+            if readable:
+                return self.stream.read(1)
+        except (OSError, IOError, ValueError):
+            return None
+        return None
+
+    def close(self):
+        if self._settings is not None:
+            try:
+                termios.tcsetattr(self.fd, termios.TCSADRAIN, self._settings)
+            finally:
+                self._settings = None
 
 REWARD_EVENT_TYPES = (
     "reward_command_received", "reward_valve_on", "reward_valve_off",
@@ -420,12 +466,25 @@ def parse_args(argv=None):
     parser.add_argument("--telemetry-port", type=int, default=DEFAULT_TELEMETRY_PORT)
     parser.add_argument("--no-telemetry", action="store_true")
     parser.add_argument("--no-bait", action="store_true")
-    parser.add_argument("--bait-drops", type=int, default=DEFAULT_BAIT_DROPS)
+    parser.add_argument("--bait-mode", choices=("manual", "auto", "none"), default=None)
+    parser.add_argument("--bait-drops", type=int, default=None)
+    parser.add_argument("--manual-start-delay-sec", type=float, default=0.0)
+    parser.add_argument("--max-bait-water-ul", type=float, default=None)
     args = parser.parse_args(argv)
     if not args.simulate_gpio and not Path(args.hardware_config).exists():
         parser.error("hardware config does not exist: %s" % args.hardware_config)
-    if args.max_rewards < 1 or args.bait_drops < 0:
+    if args.max_rewards < 1 or (args.bait_drops is not None and args.bait_drops < 0):
         parser.error("reward counts must be nonnegative, with max-rewards at least 1")
+    if args.manual_start_delay_sec < 0:
+        parser.error("manual-start-delay-sec must be nonnegative")
+    if args.max_bait_water_ul is not None and args.max_bait_water_ul < 0:
+        parser.error("max-bait-water-ul must be nonnegative")
+    if args.no_bait:
+        args.bait_mode = "none"
+    elif args.bait_mode is None:
+        args.bait_mode = "auto" if args.bait_drops is not None else "manual"
+    if args.bait_drops is None:
+        args.bait_drops = DEFAULT_BAIT_DROPS
     return args
 
 
@@ -492,6 +551,18 @@ def _spout_cumulative_fields(state):
         "bait_water_ul_session": state.get("bait_water_ul_session", 0.0),
         "total_water_ul_session": state.get("total_water_ul_session", 0.0),
         "total_lick_onset_count_session": state.get("total_lick_onset_count_session", 0),
+        "bait_contacted_count_session": state.get("bait_contacted_count_session", 0),
+        "last_bait_contacted": state.get("last_bait_contacted"),
+        "last_bait_first_lick_latency_sec": state.get("last_bait_first_lick_latency_sec"),
+        "recent_lick_count_2s": state.get("recent_lick_count_2s", 0),
+        "last_lick_age_sec": state.get("last_lick_age_sec"),
+        "licking_active": bool(state.get("licking_active", False)),
+        "bait_reward_ready": bool(state.get("bait_reward_ready", False)),
+        "manual_start_requested": bool(state.get("manual_start_requested", False)),
+        "manual_abort_requested": bool(state.get("manual_abort_requested", False)),
+        "manual_bait_max_water_ul": state.get("manual_bait_max_water_ul"),
+        "bait_mode": state.get("bait_mode"),
+        "manual_bait_active": bool(state.get("manual_bait_active", False)),
     }
 
 
@@ -569,7 +640,16 @@ def run_training(args):
     )
     schedule = []
     all_events, reward_rows, successes = [], [], []
-    requested_bait_reward_count = 0 if args.no_bait else int(args.bait_drops)
+    bait_mode = getattr(args, "bait_mode", None)
+    if bait_mode is None:
+        bait_mode = "none" if getattr(args, "no_bait", False) else "auto"
+    requested_bait_reward_count = (
+        0 if bait_mode == "none" or bait_mode == "manual"
+        else int(getattr(args, "bait_drops", DEFAULT_BAIT_DROPS))
+    )
+    manual_bait_max_water_ul = getattr(args, "max_bait_water_ul", None)
+    if manual_bait_max_water_ul is None:
+        manual_bait_max_water_ul = config.get("manual_bait_max_water_ul")
     attempted_bait_reward_count = 0
     completed_bait_reward_count = 0
     completed_bait_suction_count = 0
@@ -621,7 +701,8 @@ def run_training(args):
     telemetry_last_publish = None
 
     def telemetry_state(phase, training_index=None, next_reward_in_sec=None,
-                        bait_index=None, bait_total=None, force=False):
+                        bait_index=None, bait_total=None, force=False,
+                        extra_state=None):
         nonlocal telemetry_last_publish
         if not telemetry.enabled:
             return False
@@ -666,6 +747,8 @@ def run_training(args):
             "next_reward_in_sec": next_reward_in_sec,
             "bait_index": bait_index, "bait_total": bait_total,
         }
+        if extra_state:
+            state.update(extra_state)
         try:
             published = telemetry.publish_state(
                 build_spout_state_payload(session_id, args.mouse_id, state)
@@ -674,6 +757,165 @@ def run_training(args):
             return published
         except Exception:
             return False
+
+    manual_bait_stats = {
+        "bait_contacted_count_session": 0,
+        "last_bait_contacted": None,
+        "last_bait_first_lick_latency_sec": None,
+    }
+
+    def run_manual_bait():
+        """Run the operator-controlled bait state machine; return start/abort."""
+        nonlocal attempted_bait_reward_count, completed_bait_reward_count
+        nonlocal completed_bait_suction_count
+        if not sys.stdin.isatty():
+            raise RuntimeError(
+                "Manual bait requires an interactive terminal.\n"
+                "Use --bait-mode auto or --no-bait for non-interactive runs."
+            )
+        recent_licks = deque()
+        key_reader_factory = getattr(args, "key_reader_factory", TerminalKeyReader)
+        key_reader = key_reader_factory()
+        start_requested = False
+        abort_requested = False
+        status_at = 0.0
+        cap_message_shown = False
+        reward_id = None
+        suction_id = None
+        reward_on_ns = None
+        reward_complete = False
+        suction_complete = False
+        suction_target_ns = None
+        bait_number = 0
+
+        def service_events():
+            nonlocal reward_on_ns, reward_complete, suction_complete
+            now_ns = time.monotonic_ns()
+            while recent_licks and recent_licks[0] < now_ns - 2_000_000_000:
+                recent_licks.popleft()
+            for event in client.drain_events():
+                event.setdefault("phase", MANUAL_BAIT_PHASE)
+                event.setdefault("training_reward_index", "")
+                event.setdefault("reward_command_id", reward_id or "")
+                event.setdefault("suction_command_id", suction_id or "")
+                write_event(event)
+                event_ns = _event_ns(event)
+                if event.get("event_type") == "lick_onset":
+                    recent_licks.append(event_ns)
+                if event.get("command_id") == reward_id:
+                    if event.get("event_type") == "reward_valve_on":
+                        reward_on_ns = event_ns
+                    elif event.get("event_type") == "reward_complete":
+                        reward_complete = True
+                if event.get("command_id") == suction_id \
+                        and event.get("event_type") == "suction_complete":
+                    suction_complete = True
+
+        def show_status(state, force=False):
+            nonlocal status_at
+            now = time.monotonic()
+            if not force and now - status_at < MANUAL_STATUS_REFRESH_SEC:
+                return
+            status_at = now
+            while recent_licks and recent_licks[0] < time.monotonic_ns() - 2_000_000_000:
+                recent_licks.popleft()
+            last_age = None
+            if recent_licks:
+                last_age = max(0.0, (time.monotonic_ns() - recent_licks[-1]) / 1e9)
+            active = bool(recent_licks)
+            text = (
+                "MANUAL BAIT | Drops: %d | Bait water: %.1f uL | Contacted: %d | "
+                "Licks last 2 s: %d | Last lick: %s | %s\n"
+                "ENTER = water   S = start training   Q = abort"
+            ) % (
+                completed_bait_reward_count, completed_bait_reward_count * config["reward_volume_ul"],
+                manual_bait_stats["bait_contacted_count_session"], len(recent_licks),
+                "—" if last_age is None else "%.2f s ago" % last_age,
+                ">>> LICKING <<<" if active else "not licking",
+            )
+            print(text)
+            telemetry_state("MANUAL_BAIT", training_index=None,
+                            bait_index=(bait_number or None), bait_total=None,
+                            force=force, extra_state={
+                                "bait_mode": "manual", "manual_bait_active": True,
+                                "completed_bait_reward_count": completed_bait_reward_count,
+                                "completed_bait_suction_count": completed_bait_suction_count,
+                                "bait_water_ul_session": completed_bait_reward_count * config["reward_volume_ul"],
+                                "bait_contacted_count_session": manual_bait_stats["bait_contacted_count_session"],
+                                "last_bait_contacted": manual_bait_stats["last_bait_contacted"],
+                                "last_bait_first_lick_latency_sec": manual_bait_stats["last_bait_first_lick_latency_sec"],
+                                "recent_lick_count_2s": len(recent_licks),
+                                "last_lick_age_sec": last_age,
+                                "licking_active": active,
+                                "bait_reward_ready": state == "READY",
+                                "manual_start_requested": start_requested,
+                                "manual_abort_requested": abort_requested,
+                                "manual_bait_max_water_ul": manual_bait_max_water_ul,
+                            })
+
+        try:
+            with key_reader:
+                print("MANUAL BAIT: ENTER = water, S = start training, Q = abort")
+                if manual_bait_max_water_ul is None:
+                    print("No manual bait water cap configured.")
+                show_status("READY", force=True)
+                while True:
+                    key = key_reader.poll()
+                    while key is not None:
+                        if key in ("q", "Q"):
+                            abort_requested = True
+                        elif key in ("s", "S"):
+                            start_requested = True
+                        elif key in ("\r", "\n") and reward_id is None:
+                            if (manual_bait_max_water_ul is not None
+                                    and (completed_bait_reward_count + 1) * config["reward_volume_ul"] > manual_bait_max_water_ul):
+                                if not cap_message_shown:
+                                    print("bait water cap reached")
+                                    cap_message_shown = True
+                            else:
+                                bait_number += 1
+                                attempted_bait_reward_count += 1
+                                reward_id = client.trigger_reward(_context(MANUAL_BAIT_PHASE, ""))
+                                attempted_bait_reward_command_ids.append(reward_id)
+                                reward_on_ns = None
+                                reward_complete = False
+                                suction_id = None
+                                suction_complete = False
+                                suction_target_ns = None
+                        key = key_reader.poll()
+                    service_events()
+                    if reward_id is not None and reward_on_ns is not None and suction_id is None \
+                            and time.monotonic_ns() >= reward_on_ns + int(DEFAULT_SUCTION_DELAY_SEC * 1e9):
+                        suction_target_ns = reward_on_ns + int(DEFAULT_SUCTION_DELAY_SEC * 1e9)
+                        suction_id = client.trigger_suction(_context(MANUAL_BAIT_PHASE, "", reward_id))
+                        attempted_bait_suction_command_ids.append(suction_id)
+                    if reward_id is not None and suction_id is not None and suction_complete:
+                        if not reward_complete:
+                            raise RuntimeError(
+                                "Manual bait reward did not complete"
+                            )
+                        completed_bait_reward_count += 1
+                        completed_bait_suction_count += 1
+                        metrics = compute_reward_lick_metrics(all_events, reward_on_ns, _event_ns(
+                            first_command_event(all_events, "suction_on", suction_id)))
+                        if metrics["retrieval_success"]:
+                            manual_bait_stats["bait_contacted_count_session"] += 1
+                        manual_bait_stats["last_bait_contacted"] = metrics["retrieval_success"]
+                        manual_bait_stats["last_bait_first_lick_latency_sec"] = metrics["first_lick_latency_sec"]
+                        print("Bait #%d contacted %s" % (bait_number, "YES" if metrics["retrieval_success"] else "NO"))
+                        reward_id = suction_id = None
+                        reward_on_ns = suction_target_ns = None
+                        reward_complete = suction_complete = False
+                    show_status("BUSY" if reward_id is not None else "READY")
+                    if reward_id is None and abort_requested:
+                        print("Aborting")
+                        return False
+                    if reward_id is None and start_requested:
+                        print("Starting training")
+                        return True
+                    time.sleep(EPISODE_POLL_SEC)
+        finally:
+            key_reader.close()
 
     try:
         event_path.touch()
@@ -692,6 +934,8 @@ def run_training(args):
             "reward_volume_ul": config["reward_volume_ul"],
             "reward_to_suction_delay_sec": DEFAULT_SUCTION_DELAY_SEC,
             "suction_duration_sec": config["suction_duration_sec"],
+            "bait_mode": bait_mode,
+            "manual_bait_max_water_ul": manual_bait_max_water_ul,
             "requested_bait_reward_count": requested_bait_reward_count,
             "attempted_bait_reward_count": 0,
             "completed_bait_reward_count": 0,
@@ -720,7 +964,15 @@ def run_training(args):
             pass
         client.set_context(_context("spout_training_settle"))
         telemetry_state("STARTING", force=True)
-        if not args.no_bait:
+        if bait_mode == "manual":
+            if not run_manual_bait():
+                interrupted = True
+                failure_summary = "manual bait aborted by operator"
+            else:
+                manual_delay_deadline = time.monotonic() + float(args.manual_start_delay_sec)
+                while time.monotonic() < manual_delay_deadline:
+                    time.sleep(min(EPISODE_POLL_SEC, manual_delay_deadline - time.monotonic()))
+        elif bait_mode == "auto":
             for bait_index in range(1, requested_bait_reward_count + 1):
                 bait_start = time.monotonic()
                 attempted_bait_reward_count += 1
@@ -802,15 +1054,16 @@ def run_training(args):
                     )
                 if bait_index < requested_bait_reward_count:
                     time.sleep(max(0.0, BAIT_INTERVAL_SEC - (time.monotonic() - bait_start)))
-        client.set_context(_context("spout_training_settle"))
-        telemetry_state("SETTLE", force=True)
-        settle_deadline = time.monotonic() + max(0.0, float(args.settle_sec))
-        while time.monotonic() < settle_deadline:
-            for event in client.drain_events():
-                event.setdefault("phase", "spout_training_settle")
-                write_event(event)
-            telemetry_state("SETTLE")
-            time.sleep(EPISODE_POLL_SEC)
+        if bait_mode == "auto":
+            client.set_context(_context("spout_training_settle"))
+            telemetry_state("SETTLE", force=True)
+            settle_deadline = time.monotonic() + max(0.0, float(args.settle_sec))
+            while time.monotonic() < settle_deadline:
+                for event in client.drain_events():
+                    event.setdefault("phase", "spout_training_settle")
+                    write_event(event)
+                telemetry_state("SETTLE")
+                time.sleep(EPISODE_POLL_SEC)
         schedule = anchor_training_schedule(time.monotonic_ns(), interval_plan)
         write_rows(planned_path, schedule, [
             "training_reward_index", "planned_interval_sec",
@@ -1059,6 +1312,10 @@ def run_training(args):
         "telemetry_enabled": telemetry_started,
         "telemetry_host": getattr(args, "telemetry_host", DEFAULT_TELEMETRY_HOST),
         "telemetry_port": getattr(args, "telemetry_port", DEFAULT_TELEMETRY_PORT),
+        "bait_contacted_count_session": manual_bait_stats["bait_contacted_count_session"],
+        "last_bait_contacted": manual_bait_stats["last_bait_contacted"],
+        "last_bait_first_lick_latency_sec": manual_bait_stats["last_bait_first_lick_latency_sec"],
+        "bait_water_ul": completed_bait_reward_count * config["reward_volume_ul"],
     })
     metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True))
     final_phase = "COMPLETE"

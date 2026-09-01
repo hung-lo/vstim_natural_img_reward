@@ -351,3 +351,15 @@ python3 run_spout_training.py --hardware-config spout_training_config.json
 Spout training shows no experimental natural images. Water delivery is open-loop: the current setting is one approximately 5 uL reward pulse (`0.208 s`), with continuous lick recording and suction 2.5 s after each reward. Rewards are scheduled from a prewritten random 8–12 s interval sequence, with up to 60 scheduled rewards. The criterion is at least 16 successful retrieval episodes in the most recent 20.
 
 One training session is the goal, not a requirement. If the mouse does not meet criterion, repeat spout training before image conditioning; this runner never launches the natural-image task automatically.
+## Manual bait controls
+
+The default workflow is interactive manual baiting on Box151:
+
+- `ENTER` delivers one bait reward and its timed suction cycle.
+- `S` starts scheduled training (default start delay is 0 seconds).
+- `Q` cleanly aborts before scheduled training.
+
+Manual bait is operator-controlled and does not count toward the training
+criterion. Bait water is tracked separately. Use `--bait-mode auto` for the
+legacy fixed bait sequence, or `--no-bait` to skip baiting. The monitor remains
+read-only.
