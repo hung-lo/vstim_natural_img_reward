@@ -1173,7 +1173,7 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
     def test_behavior_counters_use_explicit_protocol_role_categories(self):
         accounting = reward.TaskWaterTelemetryAccounting(3.0)
         rewarded_high_lick = {"trial_index": 1, "image_role": "high_R_to_R", "exposure_level": "high", "reward_eligible": True}
-        rewarded_high_omission = {"trial_index": 2, "image_role": "high_R_to_U", "exposure_level": "high", "reward_eligible": True}
+        rewarded_high_omission = {"trial_index": 2, "image_role": "high_R_to_U", "exposure_level": "high", "reward_eligible": True, "reward_omission_scheduled": True}
         rewarded_high_no_lick = {"trial_index": 3, "image_role": "high_R_to_R", "exposure_level": "high", "reward_eligible": True}
         unrewarded_high_lick = {"trial_index": 4, "image_role": "high_U_to_R", "exposure_level": "high", "reward_eligible": False}
         unrewarded_high_no_lick = {"trial_index": 5, "image_role": "high_U_to_U", "exposure_level": "high", "reward_eligible": False}
@@ -1193,6 +1193,8 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
         summary = accounting.summary()
         self.assertEqual(summary["task_rewarded_high_cue_trials_completed_session"], 3)
         self.assertEqual(summary["task_rewarded_high_cue_anticipatory_lick_trials_session"], 2)
+        self.assertEqual(summary["task_r_plus_omission_trials_completed_session"], 1)
+        self.assertEqual(summary["task_r_plus_omission_anticipatory_lick_trials_session"], 1)
         self.assertEqual(summary["task_unrewarded_high_cue_trials_completed_session"], 2)
         self.assertEqual(summary["task_unrewarded_high_cue_anticipatory_lick_trials_session"], 1)
         self.assertEqual(summary["task_low_probability_cue_trials_completed_session"], 2)
@@ -1211,6 +1213,123 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
         self.assertEqual(
             trial_payload["task_low_probability_cue_anticipatory_lick_trials_session"], 1
         )
+
+    def test_protocol_telemetry_counters_match_both_full_phase_plans(self):
+        with tempfile.TemporaryDirectory(prefix="reward_telemetry_plan_") as temp_dir:
+            image_files = [Path("image_%04d.png" % index) for index in range(100)]
+            assignment_rows, _, _, _ = protocol.create_or_load_assignment(
+                "TELEMETRY", image_files, Path(temp_dir)
+            )
+            for phase in ("acquisition", "reversal"):
+                trials, _ = protocol.make_trial_plan(
+                    assignment_rows, 10, sequence_seed=12345,
+                    mouse_id="TELEMETRY", contingency_phase=phase,
+                )
+                accounting = reward.TaskWaterTelemetryAccounting(1.0)
+                for trial in trials:
+                    accounting.record_completed_behavior_trial(trial, False)
+                    accounting.record_trial(
+                        trial["trial_index"], trial["reward_scheduled"], False
+                    )
+                summary = accounting.summary()
+                self.assertEqual(summary["task_r_plus_cue_trials_completed_session"], 220)
+                self.assertEqual(summary["task_r_minus_cue_trials_completed_session"], 280)
+                self.assertEqual(summary["task_high_r_plus_cue_trials_completed_session"], 160)
+                self.assertEqual(summary["task_high_r_minus_cue_trials_completed_session"], 160)
+                self.assertEqual(summary["task_medium_r_plus_cue_trials_completed_session"], 60)
+                self.assertEqual(summary["task_medium_r_minus_cue_trials_completed_session"], 60)
+                self.assertEqual(summary["task_low_r_minus_cue_trials_completed_session"], 60)
+                self.assertEqual(summary["task_r_plus_omission_trials_completed_session"], 22)
+                self.assertEqual(summary["task_reward_trains_verified_session"], 198)
+                self.assertEqual(summary["task_low_probability_cue_trials_completed_session"], 60)
+
+                rows = []
+                events = []
+                for trial in trials:
+                    row = reward._blank_trial_summary(trial)
+                    row.update({
+                        "trial_executed": True,
+                        "stim_presented": True,
+                        "trial_completed": True,
+                    })
+                    if trial["reward_scheduled"]:
+                        command_id = "reward_%d" % trial["trial_index"]
+                        row["reward_command_id"] = command_id
+                        events.append({
+                            "event_type": "reward_complete",
+                            "command_id": command_id,
+                        })
+                    rows.append(row)
+                qc = reward.build_protocol_qc(trials, rows, events, phase)
+                self.assertEqual(qc["full_session_qc"], "pass")
+                self.assertTrue(qc["qc_pass"])
+                self.assertEqual(qc["expected"]["reward_delivery_count"], 198)
+                self.assertEqual(qc["actual"]["reward_delivery_count"], 198)
+                self.assertEqual(qc["low_r_plus_actual_count"], 0)
+
+    def test_protocol_telemetry_counters_reject_invalid_low_plus_and_r_minus_reward(self):
+        accounting = reward.TaskWaterTelemetryAccounting()
+        with self.assertRaisesRegex(ValueError, "low R\\+"):
+            accounting.record_completed_behavior_trial({
+                "trial_index": 1, "image_role": "low_U_to_U_01",
+                "exposure_level": "low", "reward_eligible": True,
+            }, False)
+        with self.assertRaisesRegex(ValueError, "R- trial has a reward schedule"):
+            accounting.record_completed_behavior_trial({
+                "trial_index": 2, "image_role": "high_U_to_R",
+                "exposure_level": "high", "reward_eligible": False,
+                "reward_scheduled": True,
+            }, False)
+
+    def test_protocol_trial_payload_contains_v2_identity_and_cumulative_counters(self):
+        accounting = reward.TaskWaterTelemetryAccounting()
+        trial = {
+            "trial_index": 7, "trial_number": 8, "block_index": 1,
+            "block_number": 2, "protocol_version": protocol.PROTOCOL_VERSION,
+            "contingency_phase": "reversal", "image_filename": "img.png",
+            "image_role": "high_R_to_U", "exposure_level": "high",
+            "reward_trajectory": "R_to_U", "reward_eligible": False,
+            "reward_scheduled": False, "reward_omission_scheduled": False,
+        }
+        accounting.record_completed_behavior_trial(trial, True)
+        payload = reward.build_trial_telemetry_payload(
+            trial, {"stim_request_monotonic_ns": ""}, [], 500, 10, 1,
+            water_accounting=accounting, mouse_id="M", session_id="S",
+        )
+        self.assertEqual(payload["telemetry_schema_version"], 2)
+        self.assertEqual(payload["protocol_version"], protocol.PROTOCOL_VERSION)
+        self.assertEqual(payload["contingency_phase"], "reversal")
+        self.assertEqual(payload["mouse_id"], "M")
+        self.assertEqual(payload["session_id"], "S")
+        self.assertEqual(payload["trial_index"], 7)
+        self.assertEqual(payload["block_index"], 1)
+        self.assertFalse(payload["reward_eligible"])
+        self.assertEqual(payload["task_r_minus_cue_trials_completed_session"], 1)
+        self.assertEqual(payload["task_r_minus_cue_anticipatory_lick_trials_session"], 1)
+
+    def test_protocol_qc_rejects_low_plus_and_r_minus_delivery(self):
+        trials = [{
+            "protocol_version": protocol.PROTOCOL_VERSION,
+            "contingency_phase": "acquisition", "trial_index": 0,
+            "reward_eligible": True, "reward_scheduled": False,
+            "reward_omission_scheduled": True, "image_role": "low_U_to_U_01",
+            "exposure_level": "low",
+        }, {
+            "protocol_version": protocol.PROTOCOL_VERSION,
+            "contingency_phase": "acquisition", "trial_index": 1,
+            "reward_eligible": False, "reward_scheduled": False,
+            "reward_omission_scheduled": False, "image_role": "high_U_to_R",
+            "exposure_level": "high",
+        }]
+        rows = [dict(trials[0], trial_completed=True),
+                dict(trials[1], trial_completed=True, reward_command_id="rogue")]
+        qc = reward.build_protocol_qc(
+            trials, rows, [{"event_type": "reward_complete", "command_id": "rogue"}],
+            "acquisition",
+        )
+        self.assertFalse(qc["qc_pass"])
+        self.assertIn("low cue is R+", qc["errors"])
+        self.assertIn("R- trial has a delivered reward", qc["errors"])
 
     def test_behavior_counters_reject_unknown_protocol_role(self):
         accounting = reward.TaskWaterTelemetryAccounting(3.0)

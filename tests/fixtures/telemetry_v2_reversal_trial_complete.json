@@ -1,0 +1,63 @@
+{
+  "type": "trial_complete",
+  "telemetry_schema_version": 2,
+  "protocol_version": "exposure_reward_partial_reversal_v1",
+  "contingency_phase": "reversal",
+  "mouse_id": "fixture_mouse",
+  "session_id": "fixture_reversal",
+  "trial_index": 42,
+  "block_index": 0,
+  "trial": 43,
+  "total_trials": 500,
+  "block": 1,
+  "total_blocks": 10,
+  "image_filename": "natural_image_0001.png",
+  "stimulus_role": "high_R_to_U",
+  "exposure_level": "high",
+  "reward_trajectory": "R_to_U",
+  "reward_eligible": false,
+  "reward_scheduled": false,
+  "reward_omission": false,
+  "reward_delivered": false,
+  "reward_contacted": null,
+  "anticipatory_lick": false,
+  "lick_times_sec": [],
+  "lick_time_reference": "estimated_physical_stim_onset",
+  "eta_sec": 1234.5,
+  "task_reward_trains_verified_session": 18,
+  "task_reward_trains_contacted_session": 17,
+  "task_water_delivered_ul_session": null,
+  "task_water_likely_consumed_ul_session": null,
+  "task_r_plus_cue_trials_completed_session": 20,
+  "task_r_plus_cue_anticipatory_lick_trials_session": 18,
+  "task_r_minus_cue_trials_completed_session": 23,
+  "task_r_minus_cue_anticipatory_lick_trials_session": 4,
+  "task_r_plus_omission_trials_completed_session": 2,
+  "task_r_plus_omission_anticipatory_lick_trials_session": 1,
+  "task_high_r_plus_cue_trials_completed_session": 14,
+  "task_high_r_plus_cue_anticipatory_lick_trials_session": 13,
+  "task_high_r_minus_cue_trials_completed_session": 15,
+  "task_high_r_minus_cue_anticipatory_lick_trials_session": 3,
+  "task_medium_r_plus_cue_trials_completed_session": 6,
+  "task_medium_r_plus_cue_anticipatory_lick_trials_session": 5,
+  "task_medium_r_minus_cue_trials_completed_session": 6,
+  "task_medium_r_minus_cue_anticipatory_lick_trials_session": 1,
+  "task_low_r_minus_cue_trials_completed_session": 3,
+  "task_low_r_minus_cue_anticipatory_lick_trials_session": 0,
+  "representative_examples": {
+    "omission": {
+      "reward_eligible": true,
+      "reward_scheduled": false,
+      "reward_omission": true,
+      "reward_delivered": false
+    },
+    "medium_r_plus": {
+      "exposure_level": "medium",
+      "reward_eligible": true
+    },
+    "low_r_minus": {
+      "exposure_level": "low",
+      "reward_eligible": false
+    }
+  }
+}

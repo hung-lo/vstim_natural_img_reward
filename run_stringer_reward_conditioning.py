@@ -85,6 +85,21 @@ BACKGROUND_POLL_SEC = 0.10
 STATUS_TTY_INTERVAL_SEC = 1.0
 STATUS_NON_TTY_INTERVAL_SEC = 30.0
 REWARD_VERIFICATION_MARGIN_SEC = 0.25
+TELEMETRY_SCHEMA_VERSION = 2
+EXPECTED_PROTOCOL_COMPLETE_COUNTS = {
+    "total_trials": 500,
+    "r_plus_cue_trials": 220,
+    "r_minus_cue_trials": 280,
+    "high_r_plus_cue_trials": 160,
+    "high_r_minus_cue_trials": 160,
+    "medium_r_plus_cue_trials": 60,
+    "medium_r_minus_cue_trials": 60,
+    "low_r_plus_cue_trials": 0,
+    "low_r_minus_cue_trials": 60,
+    "scheduled_reward_count": 198,
+    "scheduled_omission_count": 22,
+    "reward_delivery_count": 198,
+}
 QC_SCHEMA_VERSION = 1
 SESSION_OUTPUT_SCHEMA_VERSION = 2
 EVENT_LOG_SCHEMA_VERSION = 1
@@ -437,12 +452,13 @@ class StatusReporter(object):
 class TelemetryStateReporter(object):
     """One-second state heartbeat layered onto existing wait callbacks."""
 
-    def __init__(self, publisher, interval_sec=1.0, monotonic_fn=None):
+    def __init__(self, publisher, interval_sec=1.0, monotonic_fn=None, context=None):
         self.publisher = publisher
         self.interval_sec = float(interval_sec)
         self.monotonic_fn = monotonic_fn or time.monotonic
         self.last_report = None
         self.parent_error_count = 0
+        self.context = dict(context or {})
 
     def report_state(self, payload, force=False):
         try:
@@ -452,7 +468,9 @@ class TelemetryStateReporter(object):
             if (not force and self.last_report is not None
                     and now - self.last_report < self.interval_sec):
                 return False
-            published = self.publisher.publish_state(payload)
+            packet = dict(payload or {})
+            packet.update(self.context)
+            published = self.publisher.publish_state(packet)
             self.last_report = now
             return published
         except Exception:
@@ -974,6 +992,84 @@ class RewardVolumeTracker(object):
         }
 
 
+def init_reward_behavior_counters():
+    return {
+        "behavior_recorded_trial_indices": set(),
+        "r_plus_cue_trials_completed": set(),
+        "r_plus_cue_anticipatory_lick_trials": set(),
+        "r_minus_cue_trials_completed": set(),
+        "r_minus_cue_anticipatory_lick_trials": set(),
+        "r_plus_omission_trials_completed": set(),
+        "r_plus_omission_anticipatory_lick_trials": set(),
+        "high_r_plus_cue_trials_completed": set(),
+        "high_r_plus_cue_anticipatory_lick_trials": set(),
+        "high_r_minus_cue_trials_completed": set(),
+        "high_r_minus_cue_anticipatory_lick_trials": set(),
+        "medium_r_plus_cue_trials_completed": set(),
+        "medium_r_plus_cue_anticipatory_lick_trials": set(),
+        "medium_r_minus_cue_trials_completed": set(),
+        "medium_r_minus_cue_anticipatory_lick_trials": set(),
+        "low_r_minus_cue_trials_completed": set(),
+        "low_r_minus_cue_anticipatory_lick_trials": set(),
+        "rewarded_high_cue_trials_completed": set(),
+        "rewarded_high_cue_anticipatory_lick_trials": set(),
+        "unrewarded_high_cue_trials_completed": set(),
+        "unrewarded_high_cue_anticipatory_lick_trials": set(),
+        "low_probability_cue_trials_completed": set(),
+        "low_probability_cue_anticipatory_lick_trials": set(),
+        "medium_exposure_cue_trials_completed": set(),
+        "medium_exposure_cue_anticipatory_lick_trials": set(),
+    }
+
+
+def update_reward_behavior_counters(counters, trial, anticipatory_lick):
+    trial_index = int(trial["trial_index"])
+    recorded = counters["behavior_recorded_trial_indices"]
+    if trial_index in recorded:
+        return counters
+    exposure = trial.get("exposure_level")
+    role = trial.get("image_role")
+    if exposure not in ("high", "medium", "low"):
+        raise ValueError("Unknown trial image role for behavior counters: %r" % role)
+    eligible = trial.get("reward_eligible")
+    if not isinstance(eligible, bool):
+        raise ValueError("Behavior counters require resolved reward eligibility.")
+    omission = bool(trial.get("reward_omission_scheduled"))
+    if exposure == "low" and eligible:
+        raise ValueError("Protocol QC error: low R+ trial is not allowed.")
+    if not eligible and (trial.get("reward_scheduled") or omission):
+        raise ValueError("Protocol QC error: R- trial has a reward schedule.")
+    if omission and not eligible:
+        raise ValueError("Protocol QC error: omission is only valid on R+ trials.")
+
+    reward_group = "r_plus" if eligible else "r_minus"
+    counters["%s_cue_trials_completed" % reward_group].add(trial_index)
+    if anticipatory_lick:
+        counters["%s_cue_anticipatory_lick_trials" % reward_group].add(trial_index)
+    if omission:
+        counters["r_plus_omission_trials_completed"].add(trial_index)
+        if anticipatory_lick:
+            counters["r_plus_omission_anticipatory_lick_trials"].add(trial_index)
+
+    if exposure == "high":
+        prefix = "high_%s" % reward_group
+        legacy_prefix = "rewarded_high" if eligible else "unrewarded_high"
+    elif exposure == "medium":
+        prefix = "medium_%s" % reward_group
+        legacy_prefix = "medium_exposure"
+    else:
+        prefix = "low_r_minus"
+        legacy_prefix = "low_probability"
+    counters["%s_cue_trials_completed" % prefix].add(trial_index)
+    if anticipatory_lick:
+        counters["%s_cue_anticipatory_lick_trials" % prefix].add(trial_index)
+    counters["%s_cue_trials_completed" % legacy_prefix].add(trial_index)
+    if anticipatory_lick:
+        counters["%s_cue_anticipatory_lick_trials" % legacy_prefix].add(trial_index)
+    recorded.add(trial_index)
+    return counters
+
+
 class TaskWaterTelemetryAccounting(object):
     """Cumulative task-only accounting independent of UDP packet delivery."""
 
@@ -981,15 +1077,19 @@ class TaskWaterTelemetryAccounting(object):
         self.reward_volume_ul_per_train = reward_volume_ul_per_train
         self.verified_trial_indices = set()
         self.contacted_trial_indices = set()
-        self.behavior_recorded_trial_indices = set()
-        self.rewarded_high_cue_trials_completed = set()
-        self.rewarded_high_cue_anticipatory_lick_trials = set()
-        self.unrewarded_high_cue_trials_completed = set()
-        self.unrewarded_high_cue_anticipatory_lick_trials = set()
-        self.low_probability_cue_trials_completed = set()
-        self.low_probability_cue_anticipatory_lick_trials = set()
-        self.medium_exposure_cue_trials_completed = set()
-        self.medium_exposure_cue_anticipatory_lick_trials = set()
+        self.behavior_counters = init_reward_behavior_counters()
+        for name in (
+            "behavior_recorded_trial_indices",
+            "rewarded_high_cue_trials_completed",
+            "rewarded_high_cue_anticipatory_lick_trials",
+            "unrewarded_high_cue_trials_completed",
+            "unrewarded_high_cue_anticipatory_lick_trials",
+            "low_probability_cue_trials_completed",
+            "low_probability_cue_anticipatory_lick_trials",
+            "medium_exposure_cue_trials_completed",
+            "medium_exposure_cue_anticipatory_lick_trials",
+        ):
+            setattr(self, name, self.behavior_counters[name])
 
     def record_trial(self, trial_index, reward_delivered, reward_contacted):
         if reward_delivered:
@@ -999,28 +1099,9 @@ class TaskWaterTelemetryAccounting(object):
 
     def record_completed_behavior_trial(self, trial, anticipatory_lick):
         """Record one completed protocol-role trial, idempotently."""
-        trial_index = int(trial["trial_index"])
-        if trial_index in self.behavior_recorded_trial_indices:
-            return
-        role = trial.get("image_role")
-        if trial.get("exposure_level") == "high" and trial.get("reward_eligible"):
-            completed = self.rewarded_high_cue_trials_completed
-            anticipatory = self.rewarded_high_cue_anticipatory_lick_trials
-        elif trial.get("exposure_level") == "high":
-            completed = self.unrewarded_high_cue_trials_completed
-            anticipatory = self.unrewarded_high_cue_anticipatory_lick_trials
-        elif trial.get("exposure_level") == "medium":
-            completed = self.medium_exposure_cue_trials_completed
-            anticipatory = self.medium_exposure_cue_anticipatory_lick_trials
-        elif trial.get("exposure_level") == "low":
-            completed = self.low_probability_cue_trials_completed
-            anticipatory = self.low_probability_cue_anticipatory_lick_trials
-        else:
-            raise ValueError("Unknown trial image role for behavior counters: %r" % role)
-        self.behavior_recorded_trial_indices.add(trial_index)
-        completed.add(trial_index)
-        if anticipatory_lick:
-            anticipatory.add(trial_index)
+        update_reward_behavior_counters(
+            self.behavior_counters, trial, anticipatory_lick
+        )
 
     def summary(self):
         volume = self.reward_volume_ul_per_train
@@ -1034,6 +1115,22 @@ class TaskWaterTelemetryAccounting(object):
             "task_water_likely_consumed_ul_session": (
                 None if volume is None else len(self.contacted_trial_indices) * volume
             ),
+            "task_r_plus_cue_trials_completed_session": len(self.behavior_counters["r_plus_cue_trials_completed"]),
+            "task_r_plus_cue_anticipatory_lick_trials_session": len(self.behavior_counters["r_plus_cue_anticipatory_lick_trials"]),
+            "task_r_minus_cue_trials_completed_session": len(self.behavior_counters["r_minus_cue_trials_completed"]),
+            "task_r_minus_cue_anticipatory_lick_trials_session": len(self.behavior_counters["r_minus_cue_anticipatory_lick_trials"]),
+            "task_r_plus_omission_trials_completed_session": len(self.behavior_counters["r_plus_omission_trials_completed"]),
+            "task_r_plus_omission_anticipatory_lick_trials_session": len(self.behavior_counters["r_plus_omission_anticipatory_lick_trials"]),
+            "task_high_r_plus_cue_trials_completed_session": len(self.behavior_counters["high_r_plus_cue_trials_completed"]),
+            "task_high_r_plus_cue_anticipatory_lick_trials_session": len(self.behavior_counters["high_r_plus_cue_anticipatory_lick_trials"]),
+            "task_high_r_minus_cue_trials_completed_session": len(self.behavior_counters["high_r_minus_cue_trials_completed"]),
+            "task_high_r_minus_cue_anticipatory_lick_trials_session": len(self.behavior_counters["high_r_minus_cue_anticipatory_lick_trials"]),
+            "task_medium_r_plus_cue_trials_completed_session": len(self.behavior_counters["medium_r_plus_cue_trials_completed"]),
+            "task_medium_r_plus_cue_anticipatory_lick_trials_session": len(self.behavior_counters["medium_r_plus_cue_anticipatory_lick_trials"]),
+            "task_medium_r_minus_cue_trials_completed_session": len(self.behavior_counters["medium_r_minus_cue_trials_completed"]),
+            "task_medium_r_minus_cue_anticipatory_lick_trials_session": len(self.behavior_counters["medium_r_minus_cue_anticipatory_lick_trials"]),
+            "task_low_r_minus_cue_trials_completed_session": len(self.behavior_counters["low_r_minus_cue_trials_completed"]),
+            "task_low_r_minus_cue_anticipatory_lick_trials_session": len(self.behavior_counters["low_r_minus_cue_anticipatory_lick_trials"]),
             "task_rewarded_high_cue_trials_completed_session": len(self.rewarded_high_cue_trials_completed),
             "task_rewarded_high_cue_anticipatory_lick_trials_session": len(self.rewarded_high_cue_anticipatory_lick_trials),
             "task_unrewarded_high_cue_trials_completed_session": len(self.unrewarded_high_cue_trials_completed),
@@ -1053,6 +1150,22 @@ def _telemetry_water_fields(water_accounting):
             "task_reward_trains_contacted_session": 0,
             "task_water_delivered_ul_session": None,
             "task_water_likely_consumed_ul_session": None,
+            "task_r_plus_cue_trials_completed_session": 0,
+            "task_r_plus_cue_anticipatory_lick_trials_session": 0,
+            "task_r_minus_cue_trials_completed_session": 0,
+            "task_r_minus_cue_anticipatory_lick_trials_session": 0,
+            "task_r_plus_omission_trials_completed_session": 0,
+            "task_r_plus_omission_anticipatory_lick_trials_session": 0,
+            "task_high_r_plus_cue_trials_completed_session": 0,
+            "task_high_r_plus_cue_anticipatory_lick_trials_session": 0,
+            "task_high_r_minus_cue_trials_completed_session": 0,
+            "task_high_r_minus_cue_anticipatory_lick_trials_session": 0,
+            "task_medium_r_plus_cue_trials_completed_session": 0,
+            "task_medium_r_plus_cue_anticipatory_lick_trials_session": 0,
+            "task_medium_r_minus_cue_trials_completed_session": 0,
+            "task_medium_r_minus_cue_anticipatory_lick_trials_session": 0,
+            "task_low_r_minus_cue_trials_completed_session": 0,
+            "task_low_r_minus_cue_anticipatory_lick_trials_session": 0,
             "task_rewarded_high_cue_trials_completed_session": 0,
             "task_rewarded_high_cue_anticipatory_lick_trials_session": 0,
             "task_unrewarded_high_cue_trials_completed_session": 0,
@@ -1067,9 +1180,15 @@ def _telemetry_water_fields(water_accounting):
 
 def build_telemetry_state_payload(phase, trial=None, total_trials=0,
                                   total_blocks=0, eta_sec=None,
-                                  water_accounting=None):
+                                  water_accounting=None, contingency_phase=None,
+                                  mouse_id=None, session_id=None):
     trial = trial or {}
     payload = {
+        "telemetry_schema_version": TELEMETRY_SCHEMA_VERSION,
+        "protocol_version": PROTOCOL_VERSION,
+        "contingency_phase": contingency_phase or trial.get("contingency_phase"),
+        "mouse_id": mouse_id,
+        "session_id": session_id,
         "phase": str(phase),
         "trial": trial.get("trial_number") if trial else None,
         "total_trials": int(total_trials),
@@ -1203,7 +1322,8 @@ def build_trial_telemetry_payload(trial, runtime, all_gpio_events,
                                   reward_num_pulses,
                                   stimulus_onset_compensation_sec=0.0,
                                   eta_sec=None, water_accounting=None,
-                                  reward_fields=None):
+                                  reward_fields=None, mouse_id=None,
+                                  session_id=None):
     reward_fields = reward_fields or derive_telemetry_reward_fields(
         trial, runtime, all_gpio_events, reward_num_pulses)
     lick_times = telemetry_lick_times_sec(
@@ -1212,12 +1332,23 @@ def build_trial_telemetry_payload(trial, runtime, all_gpio_events,
         stimulus_onset_compensation_sec,
     )
     payload = {
+        "telemetry_schema_version": TELEMETRY_SCHEMA_VERSION,
+        "protocol_version": trial.get("protocol_version", PROTOCOL_VERSION),
+        "contingency_phase": trial.get("contingency_phase"),
+        "mouse_id": mouse_id,
+        "session_id": session_id,
+        "trial_index": trial.get("trial_index"),
         "trial": trial.get("trial_number"),
         "total_trials": int(total_trials),
+        "block_index": trial.get("block_index"),
         "block": trial.get("block_number"),
         "total_blocks": int(total_blocks),
         "image": trial.get("image_filename"),
+        "image_filename": trial.get("image_filename"),
         "stimulus_role": trial.get("image_role"),
+        "exposure_level": trial.get("exposure_level"),
+        "reward_trajectory": trial.get("reward_trajectory"),
+        "reward_eligible": trial.get("reward_eligible"),
         "reward_scheduled": reward_fields["reward_scheduled"],
         "reward_omission": reward_fields["reward_omission"],
         "reward_delivered": reward_fields["reward_delivered"],
@@ -1235,7 +1366,8 @@ def publish_completed_trial_telemetry(publisher, trial, runtime,
                                       all_gpio_events, total_trials,
                                       total_blocks, reward_num_pulses,
                                       stimulus_onset_compensation_sec=0.0,
-                                      eta_sec=None, water_accounting=None):
+                                      eta_sec=None, water_accounting=None,
+                                      mouse_id=None, session_id=None):
     try:
         recent_events = recent_trial_gpio_events(
             all_gpio_events,
@@ -1267,7 +1399,8 @@ def publish_completed_trial_telemetry(publisher, trial, runtime,
         publisher.publish_trial(build_trial_telemetry_payload(
             trial, runtime, recent_events, total_trials, total_blocks,
             reward_num_pulses, stimulus_onset_compensation_sec,
-            eta_sec, water_accounting, reward_fields=reward_fields))
+            eta_sec, water_accounting, reward_fields=reward_fields,
+            mouse_id=mouse_id, session_id=session_id))
         return reward_fields
     except Exception:
         _record_telemetry_parent_error(publisher)
@@ -1507,6 +1640,31 @@ def get_git_commit(
         return result.stdout.strip()
     except Exception:
         return ""
+
+
+def get_git_provenance():
+    """Read Git provenance once per session without making it a hard dependency."""
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(PROJECT_ROOT),
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        ).stdout.strip() or None
+        dirty = bool(subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=str(PROJECT_ROOT),
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        ).stdout.strip())
+        return {"git_commit": commit, "git_worktree_dirty": dirty}
+    except Exception as exc:
+        print("WARNING: Git provenance unavailable: %s" % exc, file=sys.stderr)
+        return {"git_commit": None, "git_worktree_dirty": None}
 
 
 def build_background_raw(rpg_module, raw_cache_root):
@@ -1782,6 +1940,8 @@ def run_trials(
     runtime_by_trial=None,
     simulate_water_test=False,
     simulate_behavior_test=False,
+    mouse_id=None,
+    session_id=None,
 ):
     if runtime_by_trial is None:
         runtime_by_trial = {}
@@ -2183,6 +2343,8 @@ def run_trials(
             planned_task_remaining_seconds(trials, completed_count)
             + float(post_background_sec),
             water_accounting,
+            mouse_id=mouse_id,
+            session_id=session_id,
         )
 
         if not status_callback:
@@ -2490,6 +2652,122 @@ def _series_stat(values, name, statistic_name):
     raise ValueError("Unknown statistic: %s" % statistic_name)
 
 
+def _protocol_behavior_counts(rows, completed_only=False):
+    rows = [row for row in rows if not completed_only or row.get("trial_completed")]
+    counts = {
+        "total_trials": len(rows),
+        "r_plus_cue_trials": 0,
+        "r_minus_cue_trials": 0,
+        "high_r_plus_cue_trials": 0,
+        "high_r_minus_cue_trials": 0,
+        "medium_r_plus_cue_trials": 0,
+        "medium_r_minus_cue_trials": 0,
+        "low_r_plus_cue_trials": 0,
+        "low_r_minus_cue_trials": 0,
+        "scheduled_reward_count": 0,
+        "scheduled_omission_count": 0,
+    }
+    for row in rows:
+        eligible = row.get("reward_eligible") is True
+        reward_group = "r_plus" if eligible else "r_minus"
+        counts["%s_cue_trials" % reward_group] += 1
+        exposure = row.get("exposure_level")
+        if exposure in ("high", "medium"):
+            counts["%s_%s_cue_trials" % (exposure, reward_group)] += 1
+        elif exposure == "low":
+            counts["low_r_plus_cue_trials" if eligible else "low_r_minus_cue_trials"] += 1
+        if row.get("reward_scheduled"):
+            counts["scheduled_reward_count"] += 1
+        if row.get("reward_omission_scheduled"):
+            counts["scheduled_omission_count"] += 1
+    return counts
+
+
+def build_protocol_qc(trials, trial_summary_rows, all_gpio_events,
+                      contingency_phase):
+    """Return protocol-specific counts/invariants for longitudinal analysis."""
+    expected = _protocol_behavior_counts(trials)
+    actual = _protocol_behavior_counts(trial_summary_rows, completed_only=True)
+    completed_reward_ids = {
+        row.get("reward_command_id") for row in trial_summary_rows
+        if row.get("trial_completed") and row.get("reward_command_id")
+    }
+    actual["reward_delivery_count"] = sum(
+        event.get("event_type") == "reward_complete"
+        and event.get("command_id") in completed_reward_ids
+        for event in all_gpio_events
+    )
+    expected["reward_delivery_count"] = expected["scheduled_reward_count"]
+
+    errors = []
+    rewarded_roles = set(REWARDED_ROLES_BY_PHASE.get(contingency_phase, ()))
+    if contingency_phase not in CONTINGENCY_PHASES:
+        errors.append("invalid contingency phase")
+    for row in trials:
+        if row.get("contingency_phase") != contingency_phase:
+            errors.append("mixed contingency phases in plan")
+        if not isinstance(row.get("reward_eligible"), bool):
+            errors.append("reward eligibility is not boolean")
+        if (row.get("reward_eligible") is True) != (row.get("image_role") in rewarded_roles):
+            errors.append("reward eligibility does not match phase mapping")
+    for row in trial_summary_rows:
+        if row.get("contingency_phase") != contingency_phase:
+            errors.append("mixed contingency phases in completed rows")
+        if not isinstance(row.get("reward_eligible"), bool):
+            errors.append("completed-row reward eligibility is not boolean")
+    errors = list(dict.fromkeys(errors))
+    if any(row.get("exposure_level") == "low" and row.get("reward_eligible") is True
+           for row in trials + trial_summary_rows):
+        errors.append("low cue is R+")
+    if any(row.get("reward_eligible") is False and row.get("reward_scheduled")
+           for row in trials + trial_summary_rows):
+        errors.append("R- trial has a reward schedule")
+    if any(row.get("reward_eligible") is False and row.get("reward_omission_scheduled")
+           for row in trials + trial_summary_rows):
+        errors.append("omission is scheduled on an R- trial")
+    reward_command_rows = {
+        row.get("reward_command_id"): row for row in trial_summary_rows
+        if row.get("reward_command_id")
+    }
+    if any(
+        event.get("event_type") in ("reward_command_received", "reward_complete")
+        and event.get("command_id") in reward_command_rows
+        and reward_command_rows[event.get("command_id")].get("reward_eligible") is False
+        for event in all_gpio_events
+    ):
+        errors.append("R- trial has a delivered reward")
+
+    full_session = actual["total_trials"] == expected["total_trials"]
+    if full_session:
+        for key, expected_value in EXPECTED_PROTOCOL_COMPLETE_COUNTS.items():
+            if expected.get(key) != expected_value:
+                errors.append(
+                    "protocol target %s expected=%s actual=%s"
+                    % (key, expected_value, expected.get(key))
+                )
+        for key, expected_value in expected.items():
+            if actual.get(key) != expected_value:
+                errors.append(
+                    "%s expected=%s actual=%s"
+                    % (key, expected_value, actual.get(key))
+                )
+        full_session_qc = "fail" if errors else "pass"
+        qc_pass = not errors
+    else:
+        full_session_qc = "partial"
+        qc_pass = None
+    return {
+        "protocol_version": PROTOCOL_VERSION,
+        "contingency_phase": contingency_phase,
+        "full_session_qc": full_session_qc,
+        "qc_pass": qc_pass,
+        "expected": expected,
+        "actual": actual,
+        "low_r_plus_actual_count": actual["low_r_plus_cue_trials"],
+        "errors": errors,
+    }
+
+
 def build_session_qc(
     session_id,
     trials,
@@ -2498,6 +2776,7 @@ def build_session_qc(
     reward_num_pulses,
     reward_volume_summary=None,
     camera_data_secured=None,
+    contingency_phase=None,
 ):
     planned_trial_count = len(trials)
     executed_trial_count = sum(1 for row in trial_summary_rows if row.get("trial_executed"))
@@ -2623,6 +2902,16 @@ def build_session_qc(
         if row.get("actual_reward_delay_from_software_stim_request_sec") not in ("", None)
     ]
 
+    protocol_qc = None
+    if all(trial.get("protocol_version") == PROTOCOL_VERSION for trial in trials):
+        protocol_qc = build_protocol_qc(
+            trials, trial_summary_rows, all_gpio_events,
+            contingency_phase or (
+                trial_summary_rows[0].get("contingency_phase", "acquisition")
+                if trial_summary_rows else "acquisition"
+            ),
+        )
+
     qc_fail_reasons = []
     if executed_trial_count != planned_trial_count:
         qc_fail_reasons.append(
@@ -2666,6 +2955,10 @@ def build_session_qc(
         )
     if missing_suction_command_ids or duplicate_suction_command_ids or incomplete_suction_command_ids:
         qc_fail_reasons.append("suction_command_integrity_failure")
+    if protocol_qc:
+        qc_fail_reasons.extend(
+            "protocol_qc: %s" % error for error in protocol_qc["errors"]
+        )
 
     qc_pass = not qc_fail_reasons
     reward_volume_summary = dict(reward_volume_summary or {})
@@ -2687,6 +2980,7 @@ def build_session_qc(
         "delivered_reward_train_count": reward_volume_summary.get("delivered_reward_train_count", 0),
         "estimated_delivered_reward_ul": reward_volume_summary.get("estimated_delivered_reward_ul"),
         "reward_volume_cap_exceeded": reward_volume_summary.get("reward_volume_cap_exceeded", False),
+        "protocol_qc": protocol_qc,
         "reward_command_received_count": len(reward_command_received_events),
         "reward_complete_count": len(reward_complete_events),
         "reward_valve_on_count": len(reward_valve_on_events),
@@ -2863,9 +3157,11 @@ def ensure_initial_mouse_state(mouse_id):
     return path
 
 
-def should_commit_persistent_mouse_state(args, hardware_config, session_completed):
+def should_commit_persistent_mouse_state(args, hardware_config, session_completed,
+                                         protocol_qc_pass=True):
     return bool(
         session_completed
+        and protocol_qc_pass
         and not hardware_config.get("simulate_gpio", False)
         and not getattr(args, "simulate_water_test", False)
         and not getattr(args, "simulate_behavior_test", False)
@@ -3108,6 +3404,7 @@ def main(argv=None):
         print("REWARD SAFETY ERROR: %s" % exc, file=sys.stderr)
         raise
     plan_summary = summarize_trial_plan(trials)
+    git_provenance = get_git_provenance()
     planned_task_sec = estimate_task_seconds(trials)
     planned_total_sec = (
         pre_background_min * 60.0
@@ -3172,16 +3469,22 @@ def main(argv=None):
             % (telemetry_publisher.start_error or "startup failed"),
             file=sys.stderr,
         )
-    telemetry_state_reporter = TelemetryStateReporter(telemetry_publisher)
+    telemetry_state_reporter = TelemetryStateReporter(
+        telemetry_publisher,
+        context={
+            "mouse_id": mouse_id,
+            "session_id": session_id,
+            "contingency_phase": contingency_phase,
+        },
+    )
     water_accounting = TaskWaterTelemetryAccounting(
         reward_volume_tracker.reward_volume_ul_per_train
     )
-    telemetry_publisher.publish_session({
-        "phase": "PREPARING",
-        "total_trials": len(trials),
-        "total_blocks": int(n_blocks),
-        **_telemetry_water_fields(water_accounting),
-    })
+    telemetry_publisher.publish_session(build_telemetry_state_payload(
+        "PREPARING", total_trials=len(trials), total_blocks=int(n_blocks),
+        water_accounting=water_accounting, contingency_phase=contingency_phase,
+        mouse_id=mouse_id, session_id=session_id,
+    ))
 
     write_rows(selected_images_path, assignment_rows, [
         "protocol_version",
@@ -3215,6 +3518,7 @@ def main(argv=None):
         "session_notes": session_notes,
         "protocol": PROTOCOL_VERSION,
         "protocol_version": PROTOCOL_VERSION,
+        "telemetry_schema_version": TELEMETRY_SCHEMA_VERSION,
         "contingency_phase": contingency_phase,
         "first_reversal_session": first_reversal,
         "state_path": str(mouse_state_path),
@@ -3291,8 +3595,10 @@ def main(argv=None):
         "refresh_rate_hz": base.REFRESH_RATE_HZ,
         "photodiode_patch_enabled": base.ENABLE_PHOTODIODE_PATCH,
         "photodiode_size_px": base.PHOTODIODE_SIZE_PX,
-        "vstim_natural_img_reward_git_commit": get_git_commit(),
-        "vstim_natural_git_commit": get_git_commit(),
+        "vstim_natural_img_reward_git_commit": git_provenance["git_commit"],
+        "vstim_natural_git_commit": git_provenance["git_commit"],
+        "git_commit": git_provenance["git_commit"],
+        "git_worktree_dirty": git_provenance["git_worktree_dirty"],
         "planned_sequence_csv": str(planned_sequence_path),
         "event_log_csv": str(event_log_path),
         "trial_summary_csv": str(trial_summary_path),
@@ -3605,6 +3911,8 @@ def main(argv=None):
                 runtime_by_trial=runtime_by_trial,
                 simulate_water_test=args.simulate_water_test,
                 simulate_behavior_test=args.simulate_behavior_test,
+                mouse_id=mouse_id,
+                session_id=session_id,
             )
             metadata["task_end_monotonic_ns"] = time.monotonic_ns()
             metadata["task_elapsed_sec"] = (metadata["task_end_monotonic_ns"] - metadata["task_start_monotonic_ns"]) / 1e9
@@ -3655,6 +3963,8 @@ def main(argv=None):
                     display_timing["stimulus_onset_compensation_sec"],
                     post_background_min * 60.0,
                     water_accounting,
+                    mouse_id=mouse_id,
+                    session_id=session_id,
                 )
 
             post_actual = hold_background(
@@ -3820,6 +4130,7 @@ def main(argv=None):
             primary_error, use_camera, latest_camera_state,
             camera_cleanup_error, cleanup_errors, finalization_errors)
         camera_data_secured = preliminary_completion["camera_data_secured"]
+        protocol_qc_pass = False
         try:
             trial_summary = build_trial_summary(
                 trials,
@@ -3835,7 +4146,9 @@ def main(argv=None):
                 hardware_config["reward_num_pulses"],
                 reward_volume_summary=reward_volume_tracker.summary(),
                 camera_data_secured=camera_data_secured,
+                contingency_phase=contingency_phase,
             )
+            protocol_qc_pass = qc.get("protocol_qc", {}).get("qc_pass") is True
             atomic_write_json(qc_path, qc)
             behavior_summary = build_behavior_summary(
                 trial_summary, contingency_phase,
@@ -3919,20 +4232,22 @@ def main(argv=None):
             }, cleanup_errors, finalization_errors)
         camera_data_secured = completion_state["camera_data_secured"]
         session_completed = completion_state["session_completed"]
-        if should_commit_persistent_mouse_state(args, hardware_config, session_completed):
+        if should_commit_persistent_mouse_state(
+                args, hardware_config, session_completed,
+                protocol_qc_pass=protocol_qc_pass):
             try:
                 record_completed_session(mouse_id, contingency_phase, session_id, metadata["utc_iso_end"])
             except Exception as exc:
                 print("WARNING: completed session state was not saved: %s" % exc, file=sys.stderr)
 
-        if not session_completed:
-            safe_report_telemetry_state(
-                telemetry_state_reporter,
-                "INTERRUPTED" if interrupted else "ERROR",
-                total_trials=len(trials), total_blocks=n_blocks,
-                eta_sec=None, water_accounting=water_accounting,
-                force=True,
-            )
+        safe_report_telemetry_state(
+            telemetry_state_reporter,
+            "COMPLETE" if session_completed else ("INTERRUPTED" if interrupted else "ERROR"),
+            total_trials=len(trials), total_blocks=n_blocks,
+            eta_sec=0.0 if session_completed else None,
+            water_accounting=water_accounting,
+            force=True,
+        )
         telemetry_publisher.close()
 
         if use_camera and camera_started:

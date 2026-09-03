@@ -206,8 +206,10 @@ Persistent assignments and per-mouse phase state are saved under
 
 These are persistent longitudinal protocol files. They are created atomically
 under a filesystem lock and reused on future sessions. Legacy assignment files
-are not migrated or silently reused. Do not delete or manually edit these files
-after training or data collection begins.
+are not migrated or silently reused. The directory is backup-critical and must
+be included in routine backups; it contains permanent assignments,
+acquisition/reversal state, and first-reversal metadata. Do not delete or
+manually edit these files after training or data collection begins.
 
 ### Recent-mouse reminder
 
@@ -318,6 +320,16 @@ Telemetry phases include `WAITING_FOR_2P`, `PRE`, `STIMULUS`, `ITI`, `POST`,
 and `COMPLETE`; dashboard timestamps are operator telemetry, not scientific
 synchronization. Photodiode/DAQ remains the physical visual-timing ground
 truth.
+
+New-protocol packets use telemetry schema version `2` and include
+`protocol_version` plus the repeated `contingency_phase` (`acquisition` or
+`reversal`), separate from the operational phase. Box151 is authoritative for
+the cumulative session counters: current R+/R− completed and anticipatory
+lick trials, R+ omissions, and high/medium/low exposure split by current
+reward state. These totals are repeated in trial-complete, state, and final
+packets so packet loss self-heals; the monitor must not reconstruct them by
+counting UDP packets. Telemetry is best-effort and nonblocking, read-only, and
+the monitor cannot control the task.
 
 `reward_volume_ul_per_train` is the current per-train volume estimate or
 calibration. `task_water_delivered_ul_session` equals verified task rewards

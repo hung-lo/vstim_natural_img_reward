@@ -63,6 +63,9 @@ class ReviewFixTests(unittest.TestCase):
         simulated = self.args(simulate_gpio=True)
         behavior_simulated = self.args(simulate_behavior_test=True)
         self.assertTrue(runner.should_commit_persistent_mouse_state(real, {"simulate_gpio": False}, True))
+        self.assertFalse(runner.should_commit_persistent_mouse_state(
+            real, {"simulate_gpio": False}, True, protocol_qc_pass=False
+        ))
         self.assertFalse(runner.should_commit_persistent_mouse_state(real, {"simulate_gpio": False}, False))
         self.assertFalse(runner.should_commit_persistent_mouse_state(simulated, {"simulate_gpio": True}, True))
         self.assertFalse(runner.should_commit_persistent_mouse_state(behavior_simulated, {"simulate_gpio": False}, True))
