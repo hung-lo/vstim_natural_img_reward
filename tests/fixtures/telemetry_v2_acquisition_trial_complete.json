@@ -1,6 +1,7 @@
 {
   "type": "trial_complete",
   "telemetry_schema_version": 2,
+  "protocol": "exposure_reward_partial_reversal_v1",
   "protocol_version": "exposure_reward_partial_reversal_v1",
   "contingency_phase": "acquisition",
   "mouse_id": "fixture_mouse",

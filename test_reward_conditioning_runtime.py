@@ -1297,6 +1297,7 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
             water_accounting=accounting, mouse_id="M", session_id="S",
         )
         self.assertEqual(payload["telemetry_schema_version"], 2)
+        self.assertEqual(payload["protocol"], protocol.PROTOCOL_VERSION)
         self.assertEqual(payload["protocol_version"], protocol.PROTOCOL_VERSION)
         self.assertEqual(payload["contingency_phase"], "reversal")
         self.assertEqual(payload["mouse_id"], "M")
@@ -1306,6 +1307,68 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
         self.assertFalse(payload["reward_eligible"])
         self.assertEqual(payload["task_r_minus_cue_trials_completed_session"], 1)
         self.assertEqual(payload["task_r_minus_cue_anticipatory_lick_trials_session"], 1)
+
+    def test_v2_fixtures_match_the_reversal_contract(self):
+        fixture_dir = Path(__file__).parent / "tests" / "fixtures"
+        for filename in (
+            "telemetry_v2_acquisition_trial_complete.json",
+            "telemetry_v2_reversal_trial_complete.json",
+        ):
+            packet = json.loads((fixture_dir / filename).read_text(encoding="utf-8"))
+            self.assertEqual(packet["telemetry_schema_version"], 2)
+            self.assertEqual(packet["protocol_version"], protocol.PROTOCOL_VERSION)
+            self.assertEqual(packet["protocol"], protocol.PROTOCOL_VERSION)
+            self.assertEqual(
+                packet["task_r_plus_cue_trials_completed_session"],
+                packet["task_high_r_plus_cue_trials_completed_session"]
+                + packet["task_medium_r_plus_cue_trials_completed_session"],
+            )
+            self.assertEqual(
+                packet["task_r_minus_cue_trials_completed_session"],
+                packet["task_high_r_minus_cue_trials_completed_session"]
+                + packet["task_medium_r_minus_cue_trials_completed_session"]
+                + packet["task_low_r_minus_cue_trials_completed_session"],
+            )
+        acquisition = json.loads(
+            (fixture_dir / "telemetry_v2_acquisition_trial_complete.json").read_text(encoding="utf-8")
+        )
+        reversal = json.loads(
+            (fixture_dir / "telemetry_v2_reversal_trial_complete.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            (acquisition["stimulus_role"], acquisition["contingency_phase"], acquisition["reward_eligible"]),
+            ("high_R_to_U", "acquisition", True),
+        )
+        self.assertEqual(
+            (reversal["stimulus_role"], reversal["contingency_phase"], reversal["reward_eligible"]),
+            ("high_R_to_U", "reversal", False),
+        )
+
+    def test_telemetry_state_payload_repeats_accounting_summary(self):
+        accounting = reward.TaskWaterTelemetryAccounting()
+        accounting.record_completed_behavior_trial({
+            "trial_index": 1, "image_role": "high_R_to_R",
+            "exposure_level": "high", "reward_eligible": True,
+            "reward_omission_scheduled": True,
+        }, True)
+        accounting.record_completed_behavior_trial({
+            "trial_index": 2, "image_role": "low_U_to_U_01",
+            "exposure_level": "low", "reward_eligible": False,
+        }, False)
+        payload = reward.build_telemetry_state_payload(
+            "ITI", total_trials=500, total_blocks=10,
+            water_accounting=accounting, contingency_phase="acquisition",
+            mouse_id="M", session_id="S",
+        )
+        self.assertEqual(payload["telemetry_schema_version"], 2)
+        self.assertEqual(payload["protocol"], protocol.PROTOCOL_VERSION)
+        self.assertEqual(payload["protocol_version"], protocol.PROTOCOL_VERSION)
+        self.assertEqual(payload["contingency_phase"], "acquisition")
+        self.assertEqual(payload["mouse_id"], "M")
+        self.assertEqual(payload["session_id"], "S")
+        summary = accounting.summary()
+        for key in summary:
+            self.assertEqual(payload[key], summary[key], key)
 
     def test_protocol_qc_rejects_low_plus_and_r_minus_delivery(self):
         trials = [{

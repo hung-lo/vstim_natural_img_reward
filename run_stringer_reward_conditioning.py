@@ -1185,6 +1185,7 @@ def build_telemetry_state_payload(phase, trial=None, total_trials=0,
     trial = trial or {}
     payload = {
         "telemetry_schema_version": TELEMETRY_SCHEMA_VERSION,
+        "protocol": PROTOCOL_VERSION,
         "protocol_version": PROTOCOL_VERSION,
         "contingency_phase": contingency_phase or trial.get("contingency_phase"),
         "mouse_id": mouse_id,
@@ -1331,9 +1332,11 @@ def build_trial_telemetry_payload(trial, runtime, all_gpio_events,
         runtime.get("stim_request_monotonic_ns"),
         stimulus_onset_compensation_sec,
     )
+    protocol_version = trial.get("protocol_version", PROTOCOL_VERSION)
     payload = {
         "telemetry_schema_version": TELEMETRY_SCHEMA_VERSION,
-        "protocol_version": trial.get("protocol_version", PROTOCOL_VERSION),
+        "protocol": protocol_version,
+        "protocol_version": protocol_version,
         "contingency_phase": trial.get("contingency_phase"),
         "mouse_id": mouse_id,
         "session_id": session_id,

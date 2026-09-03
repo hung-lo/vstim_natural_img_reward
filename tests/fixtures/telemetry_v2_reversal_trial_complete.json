@@ -1,6 +1,7 @@
 {
   "type": "trial_complete",
   "telemetry_schema_version": 2,
+  "protocol": "exposure_reward_partial_reversal_v1",
   "protocol_version": "exposure_reward_partial_reversal_v1",
   "contingency_phase": "reversal",
   "mouse_id": "fixture_mouse",
@@ -30,7 +31,7 @@
   "task_water_likely_consumed_ul_session": null,
   "task_r_plus_cue_trials_completed_session": 20,
   "task_r_plus_cue_anticipatory_lick_trials_session": 18,
-  "task_r_minus_cue_trials_completed_session": 23,
+  "task_r_minus_cue_trials_completed_session": 24,
   "task_r_minus_cue_anticipatory_lick_trials_session": 4,
   "task_r_plus_omission_trials_completed_session": 2,
   "task_r_plus_omission_anticipatory_lick_trials_session": 1,
