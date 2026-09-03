@@ -122,6 +122,33 @@ class RewardConditioningProtocolTests(unittest.TestCase):
         writer.assert_not_called()
         self.assert_no_json_temps()
 
+    def test_global_panel_protocol_version_is_required(self):
+        _, path, _ = protocol.create_or_load_global_panel(self.images, self.temp_dir)
+        payload = json.loads(path.read_text())
+        for version in (None, "wrong_protocol"):
+            with self.subTest(version=version):
+                bad = dict(payload)
+                if version is None:
+                    bad.pop("protocol_version", None)
+                else:
+                    bad["protocol_version"] = version
+                protocol.atomic_write_json(path, bad)
+                with self.assertRaisesRegex(RuntimeError, "protocol version mismatch"):
+                    protocol.create_or_load_global_panel(self.images, self.temp_dir)
+
+    def test_assignment_row_protocol_version_is_required(self):
+        rows = self.assignment()
+        protocol.validate_assignment_rows(rows)
+        for version in (None, "wrong_protocol"):
+            with self.subTest(version=version):
+                bad = [dict(row) for row in rows]
+                if version is None:
+                    bad[0].pop("protocol_version", None)
+                else:
+                    bad[0]["protocol_version"] = version
+                with self.assertRaisesRegex(RuntimeError, "Assignment row belongs"):
+                    protocol.validate_assignment_rows(bad)
+
     def test_failed_atomic_writes_preserve_old_file(self):
         path = protocol.global_panel_path(self.temp_dir)
         old = b'{"authoritative": true}\n'

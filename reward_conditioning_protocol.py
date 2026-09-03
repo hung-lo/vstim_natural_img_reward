@@ -169,6 +169,11 @@ def _load_json(path, description):
 def _validate_global_panel_payload(payload, available_by_name, path):
     if not isinstance(payload, dict) or payload.get("schema_version") != PANEL_SCHEMA_VERSION:
         raise RuntimeError("Unsupported global panel schema in %s" % path)
+    if payload.get("protocol_version") != PROTOCOL_VERSION:
+        raise RuntimeError(
+            "Global panel protocol version mismatch in %s: %r"
+            % (path, payload.get("protocol_version"))
+        )
     filenames = payload.get("image_filenames", [])
     if len(filenames) != 14 or len(set(filenames)) != 14:
         raise RuntimeError("Global panel must contain 14 unique image filenames.")
@@ -227,7 +232,7 @@ def validate_assignment_rows(rows):
     if len(set(filenames)) != 14:
         raise RuntimeError("Assignment contains duplicated image filenames.")
     for row in rows:
-        if row.get("protocol_version", PROTOCOL_VERSION) != PROTOCOL_VERSION:
+        if row.get("protocol_version") != PROTOCOL_VERSION:
             raise RuntimeError("Assignment row belongs to another protocol version.")
         expected = _role_metadata(row["image_role"])
         for field in ("exposure_level", "reward_trajectory", "presentation_probability", "presentations_per_block"):

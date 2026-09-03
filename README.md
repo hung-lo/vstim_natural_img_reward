@@ -163,11 +163,13 @@ Select reversal explicitly; it never starts automatically:
 python3 run_stringer_reward_conditioning.py --mouse-id V1_2 --contingency-phase reversal
 ```
 
-The default is 500 trials in 10 exact 50-trial blocks. Each block contains 8
-presentations per high-exposure image, 3 per medium-exposure image, and 1 per
-low-exposure image. Acquisition rewards the `R_to_*` roles; reversal switches
-only `R_to_U` and `U_to_R`, preserving exposure and image identity. Both phases
-schedule exactly 198 rewards and 22 omissions at fixed 90% reward probability.
+Production protocol v1 is fixed at 500 trials in 10 exact 50-trial blocks.
+Each block contains 8 presentations per high-exposure image, 3 per
+medium-exposure image, and 1 per low-exposure image. Acquisition rewards the
+`R_to_*` roles; reversal switches only `R_to_U` and `U_to_R`, preserving
+exposure and image identity. Both phases schedule exactly 198 rewards and 22
+omissions at fixed 90% reward probability. `--blocks` is a development /
+simulation-only override; real experimental runs must use 10 blocks.
 The end-of-session behavioral readout reports R+, R-, omission, exposure, and
 role-level anticipatory licking. Its 80% R+ threshold is a decision aid only;
 the experimenter controls reversal.
@@ -206,6 +208,26 @@ These are persistent longitudinal protocol files. They are created atomically
 under a filesystem lock and reused on future sessions. Legacy assignment files
 are not migrated or silently reused. Do not delete or manually edit these files
 after training or data collection begins.
+
+### Recent-mouse reminder
+
+Normal startup shows the five most recently completed protocol mice, newest
+first:
+
+```text
+Recent mice — exposure_reward_partial_reversal_v1
+
+  Mouse ID        Phase         Last completed session (local)  Sessions
+  ------------------------------------------------------------------------
+  V1_7            reversal      ...                             3
+  V1_5            acquisition   ...                             1
+```
+
+The table is shown by default and includes the stored acquisition/reversal
+phase. The operator must still type the exact mouse ID; the selected mouse's
+own stored phase is echoed during setup. Use `--no-recent-mice` to hide the
+reminder or `--list-recent-mice` to print it and exit. A novel mouse requires
+explicit assignment confirmation and always starts in acquisition.
 
 Session output is written under:
 

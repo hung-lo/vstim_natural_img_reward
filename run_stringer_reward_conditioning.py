@@ -337,7 +337,7 @@ def resolve_session_block_count(args):
 def simulated_behavior_category(trial):
     if not isinstance(trial, dict) or trial.get("contingency_phase") not in CONTINGENCY_PHASES:
         raise ValueError("Behavior simulation requires a fully resolved trial phase.")
-    if "reward_eligible" not in trial:
+    if not isinstance(trial.get("reward_eligible"), bool):
         raise ValueError("Behavior simulation requires resolved reward eligibility.")
     return "current_r_plus" if trial["reward_eligible"] else "current_r_minus"
 
@@ -2784,15 +2784,27 @@ def _local_iso_text(value):
 def recent_mouse_states(assignment_dir=None):
     assignment_dir = ASSIGNMENT_DIR if assignment_dir is None else assignment_dir
     rows = []
+    skipped = 0
     for path in Path(assignment_dir).glob("*_reward_conditioning_state.json"):
         try:
             state = json.loads(path.read_text(encoding="utf-8"))
-            if state.get("protocol_version") != STATE_PROTOCOL_VERSION or state.get("schema_version") != STATE_SCHEMA_VERSION:
+            if (
+                not isinstance(state, dict)
+                or state.get("protocol_version") != STATE_PROTOCOL_VERSION
+                or state.get("schema_version") != STATE_SCHEMA_VERSION
+            ):
+                skipped += 1
                 continue
             if state.get("last_completed_utc_iso"):
                 rows.append(state)
-        except (OSError, ValueError):
-            continue
+        except (OSError, ValueError, TypeError):
+            skipped += 1
+    if skipped:
+        noun = "file" if skipped == 1 else "files"
+        print(
+            "WARNING: skipped %d unreadable/incompatible recent-mouse state %s."
+            % (skipped, noun)
+        )
     return sorted(rows, key=lambda state: state.get("last_completed_utc_iso") or "", reverse=True)
 
 

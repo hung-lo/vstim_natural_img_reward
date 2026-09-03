@@ -106,8 +106,13 @@ class ReviewFixTests(unittest.TestCase):
             other["protocol_version"] = "old"
             other["last_completed_utc_iso"] = "2026-09-04T20:00:00Z"
             runner.atomic_write_json(self.temp_dir / "OTHER_reward_conditioning_state.json", other)
-            states = runner.recent_mouse_states()
+            (self.temp_dir / "bad_reward_conditioning_state.json").write_text("not-json")
+            warning = io.StringIO()
+            with redirect_stdout(warning):
+                states = runner.recent_mouse_states()
             self.assertEqual([state["mouse_id"] for state in states], ["NEWEST", "MIDDLE", "OLD"])
+            self.assertEqual(warning.getvalue().count("WARNING:"), 1)
+            self.assertIn("skipped 2 unreadable/incompatible", warning.getvalue())
             output = io.StringIO()
             with redirect_stdout(output):
                 runner.print_recent_mice(limit=2)
@@ -115,8 +120,6 @@ class ReviewFixTests(unittest.TestCase):
             self.assertIn("NEWEST", text)
             self.assertNotIn("OLD", text)
             self.assertNotIn("OTHER", text)
-            (self.temp_dir / "bad_reward_conditioning_state.json").write_text("not-json")
-            self.assertEqual(len(runner.recent_mouse_states()), 3)
 
     def test_rollback_requires_override_and_confirmation(self):
         state = runner.initial_mouse_state("M")
