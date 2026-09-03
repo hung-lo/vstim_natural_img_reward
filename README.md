@@ -18,7 +18,8 @@ experiments are maintained at <https://github.com/hung-lo/vstim_natural>.
 The supported runner:
 
 - asks for the mouse/session settings and shows a final setup summary
-- uses the fixed 14-image assignment and precomputed 90% reward schedule
+- uses 14 fixed images with high/medium/low exposure at an exact 8:3:1 ratio
+- supports manually selected acquisition and partial-reversal contingencies
 - displays each stimulus as a 1.0 s plus 0.5 s RPG sequence
 - triggers reward at the 1.0 s boundary, independent of licking
 - applies scheduled suction at its open-loop onset on rewarded and omitted cues
@@ -149,12 +150,27 @@ The new open-loop reward task lives in `run_stringer_reward_conditioning.py`.
 It uses the same `rpg` framebuffer path, but adds fixed-probability reward
 delivery for a selected subset of images.
 
-Launch it from the repo root:
+Launch acquisition from the repo root:
 
 ```bash
 cd ~/vstim_natural_img_reward
 python3 run_stringer_reward_conditioning.py
 ```
+
+Select reversal explicitly; it never starts automatically:
+
+```bash
+python3 run_stringer_reward_conditioning.py --mouse-id V1_2 --contingency-phase reversal
+```
+
+The default is 500 trials in 10 exact 50-trial blocks. Each block contains 8
+presentations per high-exposure image, 3 per medium-exposure image, and 1 per
+low-exposure image. Acquisition rewards the `R_to_*` roles; reversal switches
+only `R_to_U` and `U_to_R`, preserving exposure and image identity. Both phases
+schedule exactly 198 rewards and 22 omissions at fixed 90% reward probability.
+The end-of-session behavioral readout reports R+, R-, omission, exposure, and
+role-level anticipatory licking. Its 80% R+ threshold is a decision aid only;
+the experimenter controls reversal.
 
 This repository supports the reward-conditioning runner above. The copied
 natural-image-only runners are retained only as importable compatibility
@@ -179,16 +195,17 @@ onset. For example, the Box151 configuration of 6 pulses with 0.100 s on and
 these pulse values are a Box151 example, not universal defaults. Physical
 timing should be confirmed from Intan/photodiode/valve recordings.
 
-Persistent assignments are saved under `/mnt/hd/vstim_reward_assignments/`:
+Persistent assignments and per-mouse phase state are saved under
+`/mnt/hd/vstim_reward_assignments/`:
 
-- `_global_reward_conditioning_14_image_panel.json` for the cohort-wide image panel
-- `<mouse_id>_reward_conditioning_assignment.json` for the per-mouse role mapping
+- `_exposure_reward_v1_14_image_panel.json` for the cohort-wide image panel
+- `<mouse_id>_exposure_reward_v1_assignment.json` for the permanent role mapping
+- `<mouse_id>_reward_conditioning_state.json` for phase and completion state
 
 These are persistent longitudinal protocol files. They are created atomically
-under a filesystem lock and reused on future sessions. Do not delete or
-manually edit them after training or data collection begins. `force_new=True`
-is an explicit exceptional operation for deliberately replacing a mouse's
-assignment; it does not replace the cohort-wide panel.
+under a filesystem lock and reused on future sessions. Legacy assignment files
+are not migrated or silently reused. Do not delete or manually edit these files
+after training or data collection begins.
 
 Session output is written under:
 
@@ -204,6 +221,8 @@ The main files there are:
 - `<session>_trial_summary.csv`
 - `<session>_image_assignment.csv`
 - `<session>_plan_summary.csv`
+- `<session>_behavior_summary.csv`
+- `<session>_behavior_summary.json`
 - `<session>_metadata.json`
 - `<session>_session_qc.json`
 - `raw_cache/` with the baked RPG raws

@@ -7,9 +7,8 @@ modify the existing working natural-image runners.
 Protocol
 --------
 * 14 fixed natural images per mouse.
-* 10 low-probability images at 2% each.
-* 2 high-probability unrewarded images at 20% each.
-* 2 high-probability rewarded images at 20% each.
+* 4 high-, 4 medium-, and 6 low-exposure images with exact 8:3:1 blocks.
+* Permanent reward trajectories with manually selected acquisition/reversal phase.
 * 1.5 s image duration.
 * Open-loop reward at the 1.0 s image boundary on exactly 90% of
   rewarded-cue trials, independent of licking.
@@ -34,6 +33,7 @@ import subprocess
 import sys
 import time
 import select
+from datetime import datetime
 from pathlib import Path
 
 import run_stringer_vstim as base
@@ -47,12 +47,16 @@ from rig_telemetry import (
 )
 from reward_conditioning_protocol import (
     ALL_ROLES,
+    CONTINGENCY_PHASES,
+    HIGH_ROLES,
     LOW_ROLES,
-    REWARDED_HIGH_ROLES,
+    MEDIUM_ROLES,
+    PROTOCOL_VERSION,
+    REWARDED_ROLES_BY_PHASE,
     REWARD_PROBABILITY,
     TRIALS_PER_BLOCK,
-    UNREWARDED_HIGH_ROLES,
     create_or_load_assignment,
+    assignment_directory_lock,
     global_panel_path,
     make_trial_plan,
     summarize_trial_plan,
@@ -69,6 +73,12 @@ STIM_DURATION_SEC = 1.5
 REWARD_DELAY_SEC = 1.0
 POST_REWARD_STIM_SEC = STIM_DURATION_SEC - REWARD_DELAY_SEC
 DEFAULT_N_BLOCKS = 10
+RECENT_MOUSE_DISPLAY_LIMIT = 5
+STATE_SCHEMA_VERSION = 1
+REVERSAL_READINESS_THRESHOLD = 0.80
+HIGH_UNREWARDED_LICK_WARNING_THRESHOLD = 0.50
+WEAK_DISCRIMINATION_WARNING_THRESHOLD = 0.20
+STATE_PROTOCOL_VERSION = PROTOCOL_VERSION
 DEFAULT_ITI_MIN_SEC = 3.0
 DEFAULT_ITI_MAX_SEC = 4.5
 MINIMUM_CLEAN_POST_SUCTION_SEC = 0.75
@@ -110,9 +120,15 @@ PLANNED_SEQUENCE_FIELDS = [
     "block_number",
     "within_block_index",
     "within_block_number",
+    "protocol_version",
+    "contingency_phase",
     "image_role",
     "image_category",
+    "exposure_level",
+    "reward_trajectory",
+    "current_reward_state",
     "presentation_probability",
+    "presentations_per_block",
     "image_id",
     "image_filename",
     "image_path",
@@ -141,8 +157,13 @@ EVENT_FIELDS = [
     "block_number",
     "within_block_index",
     "within_block_number",
+    "protocol_version",
+    "contingency_phase",
     "image_role",
     "image_category",
+    "exposure_level",
+    "reward_trajectory",
+    "current_reward_state",
     "presentation_probability",
     "image_id",
     "image_filename",
@@ -182,8 +203,15 @@ TRIAL_SUMMARY_FIELDS = [
     "trial_index",
     "trial_number",
     "block_number",
+    "protocol_version",
+    "contingency_phase",
     "image_role",
     "image_category",
+    "exposure_level",
+    "reward_trajectory",
+    "current_reward_state",
+    "presentation_probability",
+    "presentations_per_block",
     "image_id",
     "image_filename",
     "reward_eligible",
@@ -224,6 +252,8 @@ TRIAL_SUMMARY_FIELDS = [
     "lick_count_2p0_to_3p0_sec",
     "lick_count_3p0_to_3p5_sec",
     "lick_count_3p5_to_4p0_sec",
+    "anticipatory_lick_0_to_1p0",
+    "anticipatory_lick_0p5_to_1p0",
     "notes",
 ]
 
@@ -251,6 +281,13 @@ def parse_args(argv=None):
         help="Inject deterministic synthetic anticipatory licks for behavior-metric validation. Requires --simulate-gpio. Never use for experimental sessions.",
     )
     parser.add_argument("--mouse-id")
+    parser.add_argument("--contingency-phase", choices=CONTINGENCY_PHASES)
+    parser.add_argument("--allow-phase-rollback", action="store_true",
+                        help="Exceptional recovery/testing override for reversal to acquisition.")
+    parser.add_argument("--no-recent-mice", action="store_true",
+                        help="Suppress the recent-mouse reminder table.")
+    parser.add_argument("--list-recent-mice", action="store_true",
+                        help="Print recent protocol mice and exit without touching hardware.")
     parser.add_argument("--session-notes")
     parser.add_argument("--blocks", type=int)
     parser.add_argument("--iti-min-sec", type=float)
@@ -285,12 +322,12 @@ def parse_args(argv=None):
 
 
 def simulated_behavior_category(image_role):
-    if image_role in REWARDED_HIGH_ROLES:
-        return "rewarded_high"
-    if image_role in UNREWARDED_HIGH_ROLES:
-        return "unrewarded_high"
+    if image_role in HIGH_ROLES:
+        return "high_exposure"
+    if image_role in MEDIUM_ROLES:
+        return "medium_exposure"
     if image_role in LOW_ROLES:
-        return "low_probability"
+        return "low_exposure"
     raise ValueError(
         "Unknown trial image role for behavior simulation: %r" % image_role
     )
@@ -302,9 +339,9 @@ def should_schedule_simulated_behavior_lick(image_role, category_ordinal):
     if ordinal < 1:
         raise ValueError("Behavior simulation category ordinal must be positive.")
     targets = {
-        "rewarded_high": 15,
-        "unrewarded_high": 4,
-        "low_probability": 1,
+        "high_exposure": 15,
+        "medium_exposure": 6,
+        "low_exposure": 1,
     }
     return ordinal <= targets[simulated_behavior_category(image_role)]
 
@@ -764,6 +801,8 @@ def append_event(event_log_path, row):
 def trial_context(trial, phase):
     return {
         "phase": phase,
+        "protocol_version": trial.get("protocol_version", PROTOCOL_VERSION),
+        "contingency_phase": trial.get("contingency_phase", ""),
         "trial_index": trial.get("trial_index", ""),
         "trial_number": trial.get("trial_number", ""),
         "block_index": trial.get("block_index", ""),
@@ -772,7 +811,11 @@ def trial_context(trial, phase):
         "within_block_number": trial.get("within_block_number", ""),
         "image_role": trial.get("image_role", ""),
         "image_category": trial.get("image_category", ""),
+        "exposure_level": trial.get("exposure_level", ""),
+        "reward_trajectory": trial.get("reward_trajectory", ""),
+        "current_reward_state": trial.get("current_reward_state", ""),
         "presentation_probability": trial.get("presentation_probability", ""),
+        "presentations_per_block": trial.get("presentations_per_block", ""),
         "image_id": trial.get("image_id", ""),
         "image_filename": trial.get("image_filename", ""),
         "reward_eligible": trial.get("reward_eligible", ""),
@@ -788,6 +831,8 @@ def trial_context(trial, phase):
 def background_context(phase):
     return {
         "phase": phase,
+        "protocol_version": PROTOCOL_VERSION,
+        "contingency_phase": "",
         "trial_index": "",
         "trial_number": "",
         "block_index": "",
@@ -796,6 +841,9 @@ def background_context(phase):
         "within_block_number": "",
         "image_role": "",
         "image_category": "",
+        "exposure_level": "",
+        "reward_trajectory": "",
+        "current_reward_state": "",
         "presentation_probability": "",
         "image_id": "",
         "image_filename": "",
@@ -933,6 +981,8 @@ class TaskWaterTelemetryAccounting(object):
         self.unrewarded_high_cue_anticipatory_lick_trials = set()
         self.low_probability_cue_trials_completed = set()
         self.low_probability_cue_anticipatory_lick_trials = set()
+        self.medium_exposure_cue_trials_completed = set()
+        self.medium_exposure_cue_anticipatory_lick_trials = set()
 
     def record_trial(self, trial_index, reward_delivered, reward_contacted):
         if reward_delivered:
@@ -946,13 +996,16 @@ class TaskWaterTelemetryAccounting(object):
         if trial_index in self.behavior_recorded_trial_indices:
             return
         role = trial.get("image_role")
-        if role in REWARDED_HIGH_ROLES:
+        if trial.get("exposure_level") == "high" and trial.get("reward_eligible"):
             completed = self.rewarded_high_cue_trials_completed
             anticipatory = self.rewarded_high_cue_anticipatory_lick_trials
-        elif role in UNREWARDED_HIGH_ROLES:
+        elif trial.get("exposure_level") == "high":
             completed = self.unrewarded_high_cue_trials_completed
             anticipatory = self.unrewarded_high_cue_anticipatory_lick_trials
-        elif role in LOW_ROLES:
+        elif trial.get("exposure_level") == "medium":
+            completed = self.medium_exposure_cue_trials_completed
+            anticipatory = self.medium_exposure_cue_anticipatory_lick_trials
+        elif trial.get("exposure_level") == "low":
             completed = self.low_probability_cue_trials_completed
             anticipatory = self.low_probability_cue_anticipatory_lick_trials
         else:
@@ -980,6 +1033,8 @@ class TaskWaterTelemetryAccounting(object):
             "task_unrewarded_high_cue_anticipatory_lick_trials_session": len(self.unrewarded_high_cue_anticipatory_lick_trials),
             "task_low_probability_cue_trials_completed_session": len(self.low_probability_cue_trials_completed),
             "task_low_probability_cue_anticipatory_lick_trials_session": len(self.low_probability_cue_anticipatory_lick_trials),
+            "task_medium_exposure_cue_trials_completed_session": len(self.medium_exposure_cue_trials_completed),
+            "task_medium_exposure_cue_anticipatory_lick_trials_session": len(self.medium_exposure_cue_anticipatory_lick_trials),
         }
 
 
@@ -997,6 +1052,8 @@ def _telemetry_water_fields(water_accounting):
             "task_unrewarded_high_cue_anticipatory_lick_trials_session": 0,
             "task_low_probability_cue_trials_completed_session": 0,
             "task_low_probability_cue_anticipatory_lick_trials_session": 0,
+            "task_medium_exposure_cue_trials_completed_session": 0,
+            "task_medium_exposure_cue_anticipatory_lick_trials_session": 0,
         }
     return water_accounting.summary()
 
@@ -1726,9 +1783,9 @@ def run_trials(
     total_trials = len(trials)
     simulated_reward_ordinal = 0
     simulated_behavior_ordinals = {
-        "rewarded_high": 0,
-        "unrewarded_high": 0,
-        "low_probability": 0,
+        "high_exposure": 0,
+        "medium_exposure": 0,
+        "low_exposure": 0,
     }
 
     for completed_count, trial in enumerate(trials, start=1):
@@ -2145,8 +2202,15 @@ def _blank_trial_summary(trial):
         "trial_index": trial["trial_index"],
         "trial_number": trial["trial_number"],
         "block_number": trial["block_number"],
+        "protocol_version": trial.get("protocol_version", PROTOCOL_VERSION),
+        "contingency_phase": trial.get("contingency_phase", "acquisition"),
         "image_role": trial["image_role"],
         "image_category": trial["image_category"],
+        "exposure_level": trial.get("exposure_level", ""),
+        "reward_trajectory": trial.get("reward_trajectory", ""),
+        "current_reward_state": trial.get("current_reward_state", ""),
+        "presentation_probability": trial.get("presentation_probability", ""),
+        "presentations_per_block": trial.get("presentations_per_block", ""),
         "image_id": trial["image_id"],
         "image_filename": trial["image_filename"],
         "reward_eligible": trial["reward_eligible"],
@@ -2187,6 +2251,8 @@ def _blank_trial_summary(trial):
         "lick_count_2p0_to_3p0_sec": "",
         "lick_count_3p0_to_3p5_sec": "",
         "lick_count_3p5_to_4p0_sec": "",
+        "anticipatory_lick_0_to_1p0": "",
+        "anticipatory_lick_0p5_to_1p0": "",
         "notes": "",
     }
 
@@ -2287,11 +2353,104 @@ def build_trial_summary(
         row["lick_count_2p0_to_3p0_sec"] = counts["consumption"]
         row["lick_count_3p0_to_3p5_sec"] = counts["pre_suction"]
         row["lick_count_3p5_to_4p0_sec"] = counts["post_suction"]
+        if row["lick_count_0_to_1p0_sec"] != "":
+            row["anticipatory_lick_0_to_1p0"] = int(row["lick_count_0_to_1p0_sec"] >= 1)
+            row["anticipatory_lick_0p5_to_1p0"] = int(row["lick_count_0p5_to_1p0_sec"] >= 1)
         row["notes"] = (
             "Software-aligned summary; use photodiode/DAQ timing for final neural analysis."
         )
         rows.append(row)
     return rows
+
+
+def _behavior_group_stats(name, rows):
+    valid = []
+    for row in rows:
+        if not row.get("trial_completed"):
+            continue
+        if "stim_request_monotonic_ns" in row and row.get("stim_request_monotonic_ns") in ("", None):
+            continue
+        if row.get("lick_count_0_to_1p0_sec") in ("", None) or row.get("lick_count_0p5_to_1p0_sec") in ("", None):
+            continue
+        valid.append(row)
+    full = [int(float(row["lick_count_0_to_1p0_sec"]) >= 1) for row in valid]
+    late = [int(float(row["lick_count_0p5_to_1p0_sec"]) >= 1) for row in valid]
+    return {
+        "group": name,
+        "n_trials": len(valid),
+        "n_trials_with_anticipatory_lick_0_to_1s": sum(full),
+        "anticipatory_response_fraction_0_to_1s": sum(full) / float(len(valid)) if valid else None,
+        "n_trials_with_anticipatory_lick_0p5_to_1s": sum(late),
+        "anticipatory_response_fraction_0p5_to_1s": sum(late) / float(len(valid)) if valid else None,
+        "mean_lick_count_0_to_1s": sum(float(row["lick_count_0_to_1p0_sec"]) for row in valid) / float(len(valid)) if valid else None,
+        "mean_lick_count_0p5_to_1s": sum(float(row["lick_count_0p5_to_1p0_sec"]) for row in valid) / float(len(valid)) if valid else None,
+    }
+
+
+def build_behavior_summary(trial_summary_rows, contingency_phase, session_complete=None):
+    """Summarize valid completed trials; this never controls phase changes."""
+    if contingency_phase not in CONTINGENCY_PHASES:
+        raise ValueError("contingency_phase must be acquisition or reversal")
+    current_r_plus = [row for row in trial_summary_rows if row.get("reward_eligible")]
+    current_r_minus = [row for row in trial_summary_rows if not row.get("reward_eligible")]
+    groups = [
+        ("all current R+", current_r_plus),
+        ("all current R-", current_r_minus),
+        ("high current R+", [row for row in current_r_plus if row.get("exposure_level") == "high"]),
+        ("high current R-", [row for row in current_r_minus if row.get("exposure_level") == "high"]),
+        ("medium current R+", [row for row in current_r_plus if row.get("exposure_level") == "medium"]),
+        ("medium current R-", [row for row in current_r_minus if row.get("exposure_level") == "medium"]),
+        ("low current R-", [row for row in current_r_minus if row.get("exposure_level") == "low"]),
+        ("R+ omission trials", [row for row in current_r_plus if row.get("reward_omission_scheduled")]),
+    ]
+    group_stats = [_behavior_group_stats(name, rows) for name, rows in groups]
+    # Preserve first-seen role order while avoiding duplicate role rows.
+    role_stats = []
+    seen_roles = set()
+    for row in trial_summary_rows:
+        role = row.get("image_role")
+        if role and role not in seen_roles:
+            seen_roles.add(role)
+            role_stats.append(_behavior_group_stats(role, [trial for trial in trial_summary_rows if trial.get("image_role") == role]))
+    plus = group_stats[0]["anticipatory_response_fraction_0_to_1s"]
+    minus = group_stats[1]["anticipatory_response_fraction_0_to_1s"]
+    difference = plus - minus if plus is not None and minus is not None else None
+    warnings = []
+    if minus is not None and minus >= HIGH_UNREWARDED_LICK_WARNING_THRESHOLD:
+        warnings.append("high unrewarded-cue licking / possible indiscriminate licking")
+    if difference is not None and difference < WEAK_DISCRIMINATION_WARNING_THRESHOLD:
+        warnings.append("weak R+ vs R- lick discrimination")
+    return {
+        "schema_version": 1,
+        "contingency_phase": contingency_phase,
+        "partial": bool(session_complete is False) if session_complete is not None else any(not row.get("trial_completed") for row in trial_summary_rows),
+        "reversal_readiness_threshold": REVERSAL_READINESS_THRESHOLD,
+        "reversal_readiness_candidate": bool(plus is not None and plus >= REVERSAL_READINESS_THRESHOLD),
+        "r_plus_anticipatory_response_fraction_0_to_1s": plus,
+        "r_minus_anticipatory_response_fraction_0_to_1s": minus,
+        "r_plus_minus_r_minus_fraction_difference": difference,
+        "r_plus_omission_anticipatory_response_fraction_0_to_1s": group_stats[-1]["anticipatory_response_fraction_0_to_1s"],
+        "warnings": warnings,
+        "groups": group_stats,
+        "roles": role_stats,
+    }
+
+
+def print_behavior_summary(summary):
+    def percent(value):
+        return "n/a" if value is None else "%.1f%%" % (100.0 * value)
+    plus = summary["groups"][0]
+    minus = summary["groups"][1]
+    omission = summary["groups"][-1]
+    print("BEHAVIOR SUMMARY — %s%s" % (summary["contingency_phase"], " (partial)" if summary["partial"] else ""))
+    print("R+ anticipatory trials (0-1 s): %s/%s = %s" % (plus["n_trials_with_anticipatory_lick_0_to_1s"], plus["n_trials"], percent(plus["anticipatory_response_fraction_0_to_1s"])))
+    print("R- anticipatory trials (0-1 s): %s/%s = %s" % (minus["n_trials_with_anticipatory_lick_0_to_1s"], minus["n_trials"], percent(minus["anticipatory_response_fraction_0_to_1s"])))
+    print("R+ - R- discrimination: %s" % percent(summary["r_plus_minus_r_minus_fraction_difference"]))
+    print("R+ omission anticipatory trials: %s/%s = %s" % (omission["n_trials_with_anticipatory_lick_0_to_1s"], omission["n_trials"], percent(omission["anticipatory_response_fraction_0_to_1s"])))
+    print("80%% R+ reversal-readiness candidate: %s" % ("YES" if summary["reversal_readiness_candidate"] else "NO"))
+    for warning in summary["warnings"]:
+        print("WARNING: %s" % warning)
+    print("Decision: experimenter-controlled; no automatic reversal.")
 
 
 def write_rows(path, rows, fields):
@@ -2563,6 +2722,113 @@ def maybe_import_camera_support(no_camera):
         return None
 
 
+def state_path_for_mouse(mouse_id):
+    return ASSIGNMENT_DIR / (str(mouse_id) + "_reward_conditioning_state.json")
+
+
+def load_mouse_state(mouse_id, required=False):
+    path = state_path_for_mouse(mouse_id)
+    if not path.exists():
+        return None
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        if required:
+            raise RuntimeError("Could not load mouse state %s: %s" % (path, exc))
+        return None
+    if state.get("protocol_version") != STATE_PROTOCOL_VERSION or state.get("schema_version") != STATE_SCHEMA_VERSION:
+        if required:
+            raise RuntimeError("Mouse state belongs to another protocol version: %s" % path)
+        return None
+    return state
+
+
+def _local_iso_text(value):
+    if not value:
+        return "—"
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return parsed.astimezone().strftime("%Y-%m-%d %H:%M")
+    except ValueError:
+        return "—"
+
+
+def recent_mouse_states(assignment_dir=None):
+    assignment_dir = ASSIGNMENT_DIR if assignment_dir is None else assignment_dir
+    rows = []
+    for path in Path(assignment_dir).glob("*_reward_conditioning_state.json"):
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+            if state.get("protocol_version") != STATE_PROTOCOL_VERSION or state.get("schema_version") != STATE_SCHEMA_VERSION:
+                continue
+            rows.append(state)
+        except (OSError, ValueError):
+            continue
+    return sorted(rows, key=lambda state: state.get("last_completed_utc_iso") or "", reverse=True)
+
+
+def print_recent_mice(assignment_dir=None, limit=RECENT_MOUSE_DISPLAY_LIMIT):
+    print("Recent mice — %s" % PROTOCOL_VERSION)
+    print("\n  %-15s %-13s %-30s %s" % ("Mouse ID", "Phase", "Last completed session (local)", "Sessions"))
+    print("  " + "-" * 72)
+    for state in recent_mouse_states(assignment_dir)[:limit]:
+        print("  %-15s %-13s %-30s %s" % (
+            state.get("mouse_id", ""), state.get("current_phase", ""),
+            _local_iso_text(state.get("last_completed_utc_iso")),
+            state.get("completed_session_count", 0),
+        ))
+    print()
+
+
+def initial_mouse_state(mouse_id):
+    return {
+        "schema_version": STATE_SCHEMA_VERSION,
+        "mouse_id": mouse_id,
+        "protocol_version": STATE_PROTOCOL_VERSION,
+        "current_phase": "acquisition",
+        "reversal_has_started": False,
+        "first_reversal_session_id": None,
+        "first_reversal_utc_iso": None,
+        "last_completed_session_id": None,
+        "last_completed_utc_iso": None,
+        "last_completed_phase": None,
+        "completed_session_count": 0,
+    }
+
+
+def record_completed_session(mouse_id, phase, session_id, completed_utc_iso):
+    path = state_path_for_mouse(mouse_id)
+    with assignment_directory_lock(ASSIGNMENT_DIR):
+        state = load_mouse_state(mouse_id) or initial_mouse_state(mouse_id)
+        if phase == "reversal" and not state.get("reversal_has_started"):
+            state["reversal_has_started"] = True
+            state["first_reversal_session_id"] = session_id
+            state["first_reversal_utc_iso"] = completed_utc_iso
+        state["current_phase"] = phase
+        state["last_completed_session_id"] = session_id
+        state["last_completed_utc_iso"] = completed_utc_iso
+        state["last_completed_phase"] = phase
+        state["completed_session_count"] = int(state.get("completed_session_count", 0)) + 1
+        atomic_write_json(path, state)
+    return path
+
+
+def resolve_contingency_phase(args, state):
+    stored = (state or {}).get("current_phase", "acquisition")
+    requested = args.contingency_phase or (stored if state else None)
+    if requested is None:
+        requested = _strict_prompt("Contingency phase [acquisition/reversal]: ").lower()
+        while requested not in CONTINGENCY_PHASES:
+            print("Please enter acquisition or reversal.")
+            requested = _strict_prompt("Contingency phase [acquisition/reversal]: ").lower()
+    if stored == "reversal" and requested == "acquisition" and not args.allow_phase_rollback:
+        raise RuntimeError("Refusing reversal-to-acquisition rollback without --allow-phase-rollback.")
+    if stored == "reversal" and requested == "acquisition" and not prompt_yes_no_strict(
+            "EXCEPTIONAL PHASE ROLLBACK: return this mouse to acquisition", default_yes=False):
+        raise RuntimeError("Phase rollback cancelled.")
+    return requested
+
+
 def format_setup_summary(mouse_id, session_notes, assignment_path,
                          assignment_created, n_blocks, trials, iti_min_sec,
                          iti_max_sec, pre_sec, post_sec, planned_task_sec,
@@ -2570,7 +2836,8 @@ def format_setup_summary(mouse_id, session_notes, assignment_path,
                          suction_delay_sec, reward_train_duration_sec,
                          reward_timing=None,
                          output_root=OUTPUT_ROOT,
-                         display_timing=None):
+                         display_timing=None, contingency_phase="acquisition",
+                         state_path=None, first_reversal=False):
     if reward_timing is None:
         reward_extension_sec = max(
             0.0, reward_train_duration_sec - POST_REWARD_STIM_SEC
@@ -2593,14 +2860,20 @@ def format_setup_summary(mouse_id, session_notes, assignment_path,
     lines = [
         "Session setup summary:",
         "  Mouse: %s" % mouse_id,
+        "  Protocol version: %s" % PROTOCOL_VERSION,
+        "  Contingency phase: %s" % contingency_phase,
+        "  First reversal session: %s" % first_reversal,
         "  Session notes: %s" % (session_notes or "(none)"),
         "  Shared 14-image panel: %s" % global_panel_path(ASSIGNMENT_DIR),
         "  Fixed per-mouse role assignment: %s" % assignment_path,
+        "  Persistent state file: %s" % (state_path or state_path_for_mouse(mouse_id)),
         "  Assignment newly created: %s" % assignment_created,
         "  Blocks: %d x %d trials" % (n_blocks, TRIALS_PER_BLOCK),
         "  Total trials: %d" % len(trials),
         "  Scheduled rewards: %d" % sum(1 for trial in trials if trial["reward_scheduled"]),
         "  Scheduled omissions: %d" % sum(1 for trial in trials if trial["reward_omission_scheduled"]),
+        "  Exposure counts per image/block: high=8, medium=3, low=1 (8:3:1)",
+        "  Fixed reward probability: 90%% (scheduled 198 rewards, 22 omissions per 500-trial session)" if n_blocks == 10 else "  Fixed reward probability: 90%%",
         "  Scheduled suction events: %d" % sum(1 for trial in trials if trial.get("suction_scheduled")),
         "  Stimulus: 1.5 s; open-loop reward boundary: 1.0 s",
         "  Display timing calibration: %s" % calibration_label,
@@ -2652,6 +2925,11 @@ def format_setup_summary(mouse_id, session_notes, assignment_path,
 
 def main(argv=None):
     args = parse_args(argv)
+    if args.list_recent_mice:
+        print_recent_mice()
+        return 0
+    if not args.no_recent_mice:
+        print_recent_mice()
     base.print_environment()
     hardware_config = load_hardware_config(
         args.hardware_config, simulate_gpio=args.simulate_gpio
@@ -2685,6 +2963,23 @@ def main(argv=None):
             mouse_id = base.sanitize_text(mouse_id_raw)
             if mouse_id: break
             print("Mouse ID is required; try again.")
+    mouse_state_path = state_path_for_mouse(mouse_id)
+    mouse_state = load_mouse_state(mouse_id, required=True)
+    print("Selected mouse: %s" % mouse_id)
+    if mouse_state:
+        print("Stored contingency phase: %s" % mouse_state.get("current_phase", "acquisition").upper())
+        print("Last completed session: %s" % _local_iso_text(mouse_state.get("last_completed_utc_iso")))
+    else:
+        print("NEW MOUSE for %s" % PROTOCOL_VERSION)
+        if not prompt_yes_no_strict("Create a new protocol assignment for mouse %s" % mouse_id, default_yes=False):
+            print("Session aborted before assignment creation.")
+            return 0
+    contingency_phase = resolve_contingency_phase(args, mouse_state)
+    first_reversal = contingency_phase == "reversal" and not (mouse_state or {}).get("reversal_has_started", False)
+    if first_reversal and not prompt_yes_no_strict(
+            "FIRST REVERSAL FOR THIS MOUSE\nThis switches the R_to_U and U_to_R contingencies while preserving exposure frequencies.\nThe image assignment will NOT change.\nContinue?", default_yes=False):
+        print("Session aborted before hardware start.")
+        return 0
     session_notes = args.session_notes if args.session_notes is not None else _strict_prompt("Session notes, optional: ")
     n_blocks = args.blocks if args.blocks is not None else prompt_int_with_default("Number of 50-trial probability blocks", DEFAULT_N_BLOCKS, minimum=1)
     if int(n_blocks) < 1: raise ValueError("blocks must be at least 1")
@@ -2732,6 +3027,7 @@ def main(argv=None):
         stim_duration_sec=STIM_DURATION_SEC,
         reward_delay_sec=REWARD_DELAY_SEC,
         suction_delay_sec=hardware_config["suction_delay_from_stim_onset_sec"],
+        contingency_phase=contingency_phase,
     )
     reward_volume_tracker = RewardVolumeTracker(
         hardware_config.get("reward_volume_ul_per_train"),
@@ -2758,7 +3054,9 @@ def main(argv=None):
         pre_background_min * 60.0, post_background_min * 60.0,
         planned_task_sec, planned_total_sec, hardware_config, use_camera,
         suction_delay_sec, reward_train_duration_sec,
-        reward_timing=reward_timing, display_timing=display_timing))
+        reward_timing=reward_timing, display_timing=display_timing,
+        contingency_phase=contingency_phase, state_path=mouse_state_path,
+        first_reversal=first_reversal))
     print()
     for row in plan_summary:
         print(
@@ -2785,6 +3083,8 @@ def main(argv=None):
     selected_images_path = session_root / (session_id + "_image_assignment.csv")
     plan_summary_path = session_root / (session_id + "_plan_summary.csv")
     trial_summary_path = session_root / (session_id + "_trial_summary.csv")
+    behavior_summary_path = session_root / (session_id + "_behavior_summary.json")
+    behavior_summary_csv_path = session_root / (session_id + "_behavior_summary.csv")
     lick_events_path = session_root / (session_id + "_lick_events.csv")
     qc_path = session_root / (session_id + "_session_qc.json")
     metadata_path = session_root / (session_id + "_metadata.json")
@@ -2794,7 +3094,7 @@ def main(argv=None):
         host=args.telemetry_host,
         port=args.telemetry_port,
         session_id=session_id,
-        protocol="reward_conditioning",
+        protocol=PROTOCOL_VERSION,
         enabled=not args.no_telemetry,
     )
     telemetry_started = telemetry_publisher.start()
@@ -2816,10 +3116,13 @@ def main(argv=None):
     })
 
     write_rows(selected_images_path, assignment_rows, [
+        "protocol_version",
         "image_role",
         "image_category",
+        "exposure_level",
+        "reward_trajectory",
         "presentation_probability",
-        "reward_eligible",
+        "presentations_per_block",
         "image_id",
         "image_filename",
         "image_path",
@@ -2828,6 +3131,8 @@ def main(argv=None):
     write_rows(plan_summary_path, plan_summary, [
         "image_role",
         "image_filename",
+        "exposure_level",
+        "reward_trajectory",
         "n_presentations",
         "n_rewards",
         "n_omissions",
@@ -2840,7 +3145,11 @@ def main(argv=None):
         "mouse_id_input": mouse_id_raw,
         "mouse_id": mouse_id,
         "session_notes": session_notes,
-        "protocol": "open_loop_natural_image_reward_conditioning",
+        "protocol": PROTOCOL_VERSION,
+        "protocol_version": PROTOCOL_VERSION,
+        "contingency_phase": contingency_phase,
+        "first_reversal_session": first_reversal,
+        "state_path": str(mouse_state_path),
         "reward_is_lick_contingent": False,
         "simulate_gpio": bool(hardware_config["simulate_gpio"]),
         "simulate_water_test": bool(args.simulate_water_test),
@@ -2852,6 +3161,8 @@ def main(argv=None):
         "total_trials": len(trials),
         "reward_probability": REWARD_PROBABILITY,
         "reward_probability_fixed": True,
+        "scheduled_reward_count": sum(1 for trial in trials if trial["reward_scheduled"]),
+        "scheduled_omission_count": sum(1 for trial in trials if trial["reward_omission_scheduled"]),
         "stim_duration_sec": STIM_DURATION_SEC,
         "reward_delay_sec": REWARD_DELAY_SEC,
         "post_reward_stim_sec": POST_REWARD_STIM_SEC,
@@ -2917,6 +3228,8 @@ def main(argv=None):
         "planned_sequence_csv": str(planned_sequence_path),
         "event_log_csv": str(event_log_path),
         "trial_summary_csv": str(trial_summary_path),
+        "behavior_summary_json": str(behavior_summary_path),
+        "behavior_summary_csv": str(behavior_summary_csv_path),
         "camera_event_log_csv": str(camera_event_log_path) if use_camera else "",
         "camera_recording_elapsed_local_sec": None,
         "camera_startup_confirmation_latency_sec": None,
@@ -2939,6 +3252,8 @@ def main(argv=None):
                 "plan_summary": plan_summary_path,
                 "event_log": event_log_path,
                 "trial_summary": trial_summary_path,
+                "behavior_summary": behavior_summary_path,
+                "behavior_summary_csv": behavior_summary_csv_path,
                 "lick_events": lick_events_path,
                 "session_qc": qc_path,
                 "camera_event_log": camera_event_log_path if use_camera else None,
@@ -3454,7 +3769,25 @@ def main(argv=None):
                 camera_data_secured=camera_data_secured,
             )
             atomic_write_json(qc_path, qc)
+            behavior_summary = build_behavior_summary(
+                trial_summary, contingency_phase,
+                session_complete=all(row.get("trial_completed") for row in trial_summary),
+            )
+            atomic_write_json(behavior_summary_path, behavior_summary)
+            behavior_csv_rows = [{"scope": "group", **row} for row in behavior_summary["groups"]]
+            behavior_csv_rows.extend({"scope": "role", **row} for row in behavior_summary["roles"])
+            write_rows(behavior_summary_csv_path, behavior_csv_rows, [
+                "scope", "group", "n_trials",
+                "n_trials_with_anticipatory_lick_0_to_1s",
+                "anticipatory_response_fraction_0_to_1s",
+                "n_trials_with_anticipatory_lick_0p5_to_1s",
+                "anticipatory_response_fraction_0p5_to_1s",
+                "mean_lick_count_0_to_1s", "mean_lick_count_0p5_to_1s",
+            ])
+            print_behavior_summary(behavior_summary)
             metadata["session_qc_json"] = str(qc_path)
+            metadata["behavior_summary_json"] = str(behavior_summary_path)
+            metadata["behavior_summary_csv"] = str(behavior_summary_csv_path)
         except Exception as exc:
             finalization_errors.append("session_artifacts: %s: %s" % (type(exc).__name__, exc))
 
@@ -3499,6 +3832,8 @@ def main(argv=None):
                 "plan_summary": plan_summary_path,
                 "event_log": event_log_path,
                 "trial_summary": trial_summary_path,
+                "behavior_summary": behavior_summary_path,
+                "behavior_summary_csv": behavior_summary_csv_path,
                 "lick_events": lick_events_path,
                 "session_qc": qc_path,
                 "camera_event_log": camera_event_log_path if use_camera else None,
@@ -3516,6 +3851,11 @@ def main(argv=None):
             }, cleanup_errors, finalization_errors)
         camera_data_secured = completion_state["camera_data_secured"]
         session_completed = completion_state["session_completed"]
+        if session_completed:
+            try:
+                record_completed_session(mouse_id, contingency_phase, session_id, metadata["utc_iso_end"])
+            except Exception as exc:
+                print("WARNING: completed session state was not saved: %s" % exc, file=sys.stderr)
 
         if not session_completed:
             safe_report_telemetry_state(
