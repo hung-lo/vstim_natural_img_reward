@@ -46,11 +46,7 @@ from rig_telemetry import (
     TelemetryPublisher,
 )
 from reward_conditioning_protocol import (
-    ALL_ROLES,
     CONTINGENCY_PHASES,
-    HIGH_ROLES,
-    LOW_ROLES,
-    MEDIUM_ROLES,
     PROTOCOL_VERSION,
     REWARDED_ROLES_BY_PHASE,
     REWARD_PROBABILITY,
@@ -290,7 +286,10 @@ def parse_args(argv=None):
     parser.add_argument("--list-recent-mice", action="store_true",
                         help="Print recent protocol mice and exit without touching hardware.")
     parser.add_argument("--session-notes")
-    parser.add_argument("--blocks", type=int)
+    parser.add_argument(
+        "--blocks", type=int,
+        help="Development/testing override; experimental runs require 10 blocks.",
+    )
     parser.add_argument("--iti-min-sec", type=float)
     parser.add_argument("--iti-max-sec", type=float)
     parser.add_argument("--pre-background-min", type=float)
@@ -322,29 +321,36 @@ def parse_args(argv=None):
     return args
 
 
-def simulated_behavior_category(image_role):
-    if image_role in HIGH_ROLES:
-        return "high_exposure"
-    if image_role in MEDIUM_ROLES:
-        return "medium_exposure"
-    if image_role in LOW_ROLES:
-        return "low_exposure"
-    raise ValueError(
-        "Unknown trial image role for behavior simulation: %r" % image_role
-    )
+def resolve_session_block_count(args):
+    requested_blocks = getattr(args, "blocks", None)
+    n_blocks = int(requested_blocks) if requested_blocks is not None else DEFAULT_N_BLOCKS
+    if n_blocks < 1:
+        raise ValueError("blocks must be at least 1")
+    if not getattr(args, "simulate_gpio", False) and n_blocks != DEFAULT_N_BLOCKS:
+        raise RuntimeError(
+            "Protocol %s requires exactly %d blocks / %d trials for experimental runs."
+            % (PROTOCOL_VERSION, DEFAULT_N_BLOCKS, DEFAULT_N_BLOCKS * TRIALS_PER_BLOCK)
+        )
+    return n_blocks
 
 
-def should_schedule_simulated_behavior_lick(image_role, category_ordinal):
-    """Return the deterministic one-block anticipatory-lick selection."""
+def simulated_behavior_category(trial):
+    if not isinstance(trial, dict) or trial.get("contingency_phase") not in CONTINGENCY_PHASES:
+        raise ValueError("Behavior simulation requires a fully resolved trial phase.")
+    if "reward_eligible" not in trial:
+        raise ValueError("Behavior simulation requires resolved reward eligibility.")
+    return "current_r_plus" if trial["reward_eligible"] else "current_r_minus"
+
+
+def should_schedule_simulated_behavior_lick(trial, category_ordinal):
+    """Return a deterministic 90% R+ / 20% R- synthetic lick schedule."""
     ordinal = int(category_ordinal)
     if ordinal < 1:
         raise ValueError("Behavior simulation category ordinal must be positive.")
-    targets = {
-        "high_exposure": 15,
-        "medium_exposure": 6,
-        "low_exposure": 1,
-    }
-    return ordinal <= targets[simulated_behavior_category(image_role)]
+    category = simulated_behavior_category(trial)
+    if category == "current_r_plus":
+        return ordinal % 10 != 0
+    return ordinal % 5 == 0
 
 
 def _strict_prompt(prompt):
@@ -1784,9 +1790,8 @@ def run_trials(
     total_trials = len(trials)
     simulated_reward_ordinal = 0
     simulated_behavior_ordinals = {
-        "high_exposure": 0,
-        "medium_exposure": 0,
-        "low_exposure": 0,
+        "current_r_plus": 0,
+        "current_r_minus": 0,
     }
 
     for completed_count, trial in enumerate(trials, start=1):
@@ -1827,10 +1832,10 @@ def run_trials(
             force=True,
         )
         if simulate_behavior_test:
-            behavior_category = simulated_behavior_category(trial.get("image_role"))
+            behavior_category = simulated_behavior_category(trial)
             simulated_behavior_ordinals[behavior_category] += 1
             if should_schedule_simulated_behavior_lick(
-                    trial.get("image_role"),
+                    trial,
                     simulated_behavior_ordinals[behavior_category]):
                 # The worker receives this before the authoritative stimulus
                 # request.  Add the calibrated request-to-physical-onset
@@ -2858,6 +2863,10 @@ def should_commit_persistent_mouse_state(args, hardware_config, session_complete
 def resolve_contingency_phase(args, state):
     stored = (state or {}).get("current_phase", "acquisition")
     requested = getattr(args, "contingency_phase", None) or (stored if state else None)
+    if state is None:
+        if requested == "reversal":
+            raise RuntimeError("A new protocol mouse must start in acquisition.")
+        return "acquisition"
     if requested is None:
         requested = _strict_prompt("Contingency phase [acquisition/reversal]: ").lower()
         while requested not in CONTINGENCY_PHASES:
@@ -2970,6 +2979,7 @@ def main(argv=None):
     if args.list_recent_mice:
         print_recent_mice()
         return 0
+    n_blocks = resolve_session_block_count(args)
     if not args.no_recent_mice:
         print_recent_mice()
     base.print_environment()
@@ -3018,6 +3028,8 @@ def main(argv=None):
         if not prompt_yes_no_strict("Create a new protocol assignment for mouse %s" % mouse_id, default_yes=False):
             print("Session aborted before assignment creation.")
             return 0
+    if not mouse_has_protocol_files:
+        print("New protocol mouse: initial contingency is ACQUISITION.")
     contingency_phase = resolve_contingency_phase(args, mouse_state)
     first_reversal = contingency_phase == "reversal" and not (mouse_state or {}).get("reversal_has_started", False)
     if first_reversal and not prompt_yes_no_strict(
@@ -3025,8 +3037,6 @@ def main(argv=None):
         print("Session aborted before hardware start.")
         return 0
     session_notes = args.session_notes if args.session_notes is not None else _strict_prompt("Session notes, optional: ")
-    n_blocks = args.blocks if args.blocks is not None else prompt_int_with_default("Number of 50-trial probability blocks", DEFAULT_N_BLOCKS, minimum=1)
-    if int(n_blocks) < 1: raise ValueError("blocks must be at least 1")
     iti_min_sec = args.iti_min_sec if args.iti_min_sec is not None else prompt_float_or_default(
         "Minimum gray ITI in seconds",
         DEFAULT_ITI_MIN_SEC,

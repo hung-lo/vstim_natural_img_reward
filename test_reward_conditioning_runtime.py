@@ -306,41 +306,61 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
                 protocol.role_metadata(role),
                 image_filename="%s.png" % role,
             ))
-        trials, _ = protocol.make_trial_plan(
-            assignment, n_blocks=10, iti_min_sec=1.0, iti_max_sec=1.1,
-            sequence_seed=12345, mouse_id="SIM_BEHAVIOR",
-        )
-        self.assertEqual(len(trials), 500)
-        ordinals = {category: 0 for category in (
-            "high_exposure", "medium_exposure", "low_exposure")}
-        selected = {category: 0 for category in ordinals}
-        for trial in trials:
-            category = reward.simulated_behavior_category(trial["image_role"])
-            ordinals[category] += 1
-            if reward.should_schedule_simulated_behavior_lick(
-                    trial["image_role"], ordinals[category]):
-                selected[category] += 1
-        self.assertEqual(ordinals, {
-            "high_exposure": 320, "medium_exposure": 120, "low_exposure": 60,
-        })
-        self.assertEqual(selected, {
-            "high_exposure": 15, "medium_exposure": 6, "low_exposure": 1,
-        })
+        for phase in protocol.CONTINGENCY_PHASES:
+            with self.subTest(phase=phase):
+                trials, _ = protocol.make_trial_plan(
+                    assignment, n_blocks=10, iti_min_sec=1.0, iti_max_sec=1.1,
+                    sequence_seed=12345, mouse_id="SIM_BEHAVIOR",
+                    contingency_phase=phase,
+                )
+                self.assertEqual(len(trials), 500)
+                ordinals = {category: 0 for category in (
+                    "current_r_plus", "current_r_minus")}
+                selected = {category: 0 for category in ordinals}
+                for trial in trials:
+                    category = reward.simulated_behavior_category(trial)
+                    ordinals[category] += 1
+                    if reward.should_schedule_simulated_behavior_lick(
+                            trial, ordinals[category]):
+                        selected[category] += 1
+                self.assertEqual(ordinals, {
+                    "current_r_plus": 220, "current_r_minus": 280,
+                })
+                self.assertEqual(selected, {
+                    "current_r_plus": 198, "current_r_minus": 56,
+                })
+
+        acquisition = protocol.apply_contingency(assignment, "acquisition")
+        reversal = protocol.apply_contingency(assignment, "reversal")
+        for role in ("high_R_to_R", "low_U_to_U_01"):
+            acq_trial = next(row for row in acquisition if row["image_role"] == role)
+            rev_trial = next(row for row in reversal if row["image_role"] == role)
+            self.assertEqual(
+                reward.simulated_behavior_category(acq_trial),
+                reward.simulated_behavior_category(rev_trial),
+            )
+        acq_switch = next(row for row in acquisition if row["image_role"] == "high_R_to_U")
+        rev_switch = next(row for row in reversal if row["image_role"] == "high_R_to_U")
+        self.assertEqual(reward.simulated_behavior_category(acq_switch), "current_r_plus")
+        self.assertEqual(reward.simulated_behavior_category(rev_switch), "current_r_minus")
+        self.assertTrue(reward.should_schedule_simulated_behavior_lick(acq_switch, 1))
+        self.assertFalse(reward.should_schedule_simulated_behavior_lick(rev_switch, 1))
 
     def test_reward_omission_remains_rewarded_high_behavior_category(self):
         trial = {
             "image_role": "high_R_to_R",
+            "contingency_phase": "acquisition",
             "reward_eligible": True,
             "reward_scheduled": False,
             "reward_omission_scheduled": True,
         }
         self.assertEqual(
-            reward.simulated_behavior_category(trial["image_role"]),
-            "high_exposure",
+            reward.simulated_behavior_category(trial),
+            "current_r_plus",
         )
         self.assertTrue(
             reward.should_schedule_simulated_behavior_lick(
-                trial["image_role"], 15
+                trial, 9
             )
         )
 

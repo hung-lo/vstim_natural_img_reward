@@ -35,6 +35,7 @@ class ReviewFixTests(unittest.TestCase):
             "simulate_gpio": False,
             "simulate_water_test": False,
             "simulate_behavior_test": False,
+            "blocks": None,
         }
         values.update(overrides)
         return SimpleNamespace(**values)
@@ -127,6 +128,19 @@ class ReviewFixTests(unittest.TestCase):
                 runner.resolve_contingency_phase(self.args(contingency_phase="acquisition", allow_phase_rollback=True), state)
         with mock.patch.object(runner, "prompt_yes_no_strict", return_value=True):
             self.assertEqual(runner.resolve_contingency_phase(self.args(contingency_phase="acquisition", allow_phase_rollback=True), state), "acquisition")
+
+    def test_new_mouse_is_acquisition_only_and_blocks_nonstandard_real_lengths(self):
+        self.assertEqual(runner.resolve_contingency_phase(self.args(), None), "acquisition")
+        with self.assertRaisesRegex(RuntimeError, "new protocol mouse"):
+            runner.resolve_contingency_phase(self.args(contingency_phase="reversal"), None)
+        self.assertEqual(
+            runner.resolve_session_block_count(self.args()), runner.DEFAULT_N_BLOCKS
+        )
+        with self.assertRaisesRegex(RuntimeError, "exactly 10 blocks / 500 trials"):
+            runner.resolve_session_block_count(self.args(blocks=20))
+        self.assertEqual(
+            runner.resolve_session_block_count(self.args(simulate_gpio=True, blocks=20)), 20
+        )
 
     @staticmethod
     def behavior_row(role, reward_eligible, full, late, completed=True, omission=False):
