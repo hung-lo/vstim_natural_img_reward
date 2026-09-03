@@ -302,18 +302,17 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
     def test_simulated_behavior_selection_matches_one_block_targets(self):
         assignment = []
         for role in protocol.ALL_ROLES:
-            assignment.append({
-                "image_role": role,
-                "image_filename": "%s.png" % role,
-                "reward_eligible": role in protocol.REWARDED_HIGH_ROLES,
-            })
+            assignment.append(dict(
+                protocol.role_metadata(role),
+                image_filename="%s.png" % role,
+            ))
         trials, _ = protocol.make_trial_plan(
-            assignment, n_blocks=1, iti_min_sec=1.0, iti_max_sec=1.1,
+            assignment, n_blocks=10, iti_min_sec=1.0, iti_max_sec=1.1,
             sequence_seed=12345, mouse_id="SIM_BEHAVIOR",
         )
-        self.assertEqual(len(trials), 50)
+        self.assertEqual(len(trials), 500)
         ordinals = {category: 0 for category in (
-            "rewarded_high", "unrewarded_high", "low_probability")}
+            "high_exposure", "medium_exposure", "low_exposure")}
         selected = {category: 0 for category in ordinals}
         for trial in trials:
             category = reward.simulated_behavior_category(trial["image_role"])
@@ -322,22 +321,22 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
                     trial["image_role"], ordinals[category]):
                 selected[category] += 1
         self.assertEqual(ordinals, {
-            "rewarded_high": 20, "unrewarded_high": 20, "low_probability": 10,
+            "high_exposure": 320, "medium_exposure": 120, "low_exposure": 60,
         })
         self.assertEqual(selected, {
-            "rewarded_high": 15, "unrewarded_high": 4, "low_probability": 1,
+            "high_exposure": 15, "medium_exposure": 6, "low_exposure": 1,
         })
 
     def test_reward_omission_remains_rewarded_high_behavior_category(self):
         trial = {
-            "image_role": "rewarded_high_1",
+            "image_role": "high_R_to_R",
             "reward_eligible": True,
             "reward_scheduled": False,
             "reward_omission_scheduled": True,
         }
         self.assertEqual(
             reward.simulated_behavior_category(trial["image_role"]),
-            "rewarded_high",
+            "high_exposure",
         )
         self.assertTrue(
             reward.should_schedule_simulated_behavior_lick(
@@ -632,6 +631,10 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
              mock.patch.object(reward, "load_hardware_config", return_value=hardware), \
              mock.patch.object(reward.base, "resolve_image_dir", return_value=Path("images")), \
              mock.patch.object(reward.base, "list_png_files", return_value=[Path("image.png")]), \
+             mock.patch.object(reward, "mouse_protocol_files",
+                               return_value=(Path("assignment.json"), Path("state.json"), True)), \
+             mock.patch.object(reward, "load_mouse_state",
+                               return_value=reward.initial_mouse_state("mouse")), \
              mock.patch.object(reward, "create_or_load_assignment",
                                return_value=([{"image_filename": "image.png"}],
                                              Path("assignment.json"), False, 1)), \
@@ -1149,13 +1152,13 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
 
     def test_behavior_counters_use_explicit_protocol_role_categories(self):
         accounting = reward.TaskWaterTelemetryAccounting(3.0)
-        rewarded_high_lick = {"trial_index": 1, "image_role": "rewarded_high_1"}
-        rewarded_high_omission = {"trial_index": 2, "image_role": "rewarded_high_2"}
-        rewarded_high_no_lick = {"trial_index": 3, "image_role": "rewarded_high_1"}
-        unrewarded_high_lick = {"trial_index": 4, "image_role": "unrewarded_high_1"}
-        unrewarded_high_no_lick = {"trial_index": 5, "image_role": "unrewarded_high_2"}
-        low_lick = {"trial_index": 6, "image_role": "low_01"}
-        low_no_lick = {"trial_index": 7, "image_role": "low_02"}
+        rewarded_high_lick = {"trial_index": 1, "image_role": "high_R_to_R", "exposure_level": "high", "reward_eligible": True}
+        rewarded_high_omission = {"trial_index": 2, "image_role": "high_R_to_U", "exposure_level": "high", "reward_eligible": True}
+        rewarded_high_no_lick = {"trial_index": 3, "image_role": "high_R_to_R", "exposure_level": "high", "reward_eligible": True}
+        unrewarded_high_lick = {"trial_index": 4, "image_role": "high_U_to_R", "exposure_level": "high", "reward_eligible": False}
+        unrewarded_high_no_lick = {"trial_index": 5, "image_role": "high_U_to_U", "exposure_level": "high", "reward_eligible": False}
+        low_lick = {"trial_index": 6, "image_role": "low_U_to_U_01", "exposure_level": "low", "reward_eligible": False}
+        low_no_lick = {"trial_index": 7, "image_role": "low_U_to_U_02", "exposure_level": "low", "reward_eligible": False}
 
         accounting.record_completed_behavior_trial(rewarded_high_lick, True)
         accounting.record_completed_behavior_trial(rewarded_high_omission, True)
@@ -1198,7 +1201,7 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
 
     def test_behavior_counters_ignore_partial_and_post_reward_licks(self):
         accounting = reward.TaskWaterTelemetryAccounting(3.0)
-        partial = {"trial_index": 10, "image_role": "rewarded_high_1"}
+        partial = {"trial_index": 10, "image_role": "high_R_to_R", "exposure_level": "high", "reward_eligible": True}
         partial_runtime = {
             "trial_completed": False,
             "stim_request_monotonic_ns": 100_000_000_000,
@@ -1207,7 +1210,7 @@ class RewardConditioningRuntimeTests(unittest.TestCase):
             None, partial, partial_runtime, [], 1, 1, 1,
             water_accounting=accounting,
         )
-        post_reward_only = {"trial_index": 11, "image_role": "rewarded_high_1"}
+        post_reward_only = {"trial_index": 11, "image_role": "high_R_to_R", "exposure_level": "high", "reward_eligible": True}
         post_reward_only_lick = [
             {"event_type": "lick_onset", "monotonic_ns": 101_500_000_000}
         ]

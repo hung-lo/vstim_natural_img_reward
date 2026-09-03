@@ -57,6 +57,7 @@ from reward_conditioning_protocol import (
     TRIALS_PER_BLOCK,
     create_or_load_assignment,
     assignment_directory_lock,
+    assignment_path_for_mouse,
     global_panel_path,
     make_trial_plan,
     summarize_trial_plan,
@@ -2420,12 +2421,13 @@ def build_behavior_summary(trial_summary_rows, contingency_phase, session_comple
         warnings.append("high unrewarded-cue licking / possible indiscriminate licking")
     if difference is not None and difference < WEAK_DISCRIMINATION_WARNING_THRESHOLD:
         warnings.append("weak R+ vs R- lick discrimination")
+    partial = bool(session_complete is False) if session_complete is not None else any(not row.get("trial_completed") for row in trial_summary_rows)
     return {
         "schema_version": 1,
         "contingency_phase": contingency_phase,
-        "partial": bool(session_complete is False) if session_complete is not None else any(not row.get("trial_completed") for row in trial_summary_rows),
+        "partial": partial,
         "reversal_readiness_threshold": REVERSAL_READINESS_THRESHOLD,
-        "reversal_readiness_candidate": bool(plus is not None and plus >= REVERSAL_READINESS_THRESHOLD),
+        "reversal_readiness_candidate": None if partial else bool(plus is not None and plus >= REVERSAL_READINESS_THRESHOLD),
         "r_plus_anticipatory_response_fraction_0_to_1s": plus,
         "r_minus_anticipatory_response_fraction_0_to_1s": minus,
         "r_plus_minus_r_minus_fraction_difference": difference,
@@ -2447,7 +2449,10 @@ def print_behavior_summary(summary):
     print("R- anticipatory trials (0-1 s): %s/%s = %s" % (minus["n_trials_with_anticipatory_lick_0_to_1s"], minus["n_trials"], percent(minus["anticipatory_response_fraction_0_to_1s"])))
     print("R+ - R- discrimination: %s" % percent(summary["r_plus_minus_r_minus_fraction_difference"]))
     print("R+ omission anticipatory trials: %s/%s = %s" % (omission["n_trials_with_anticipatory_lick_0_to_1s"], omission["n_trials"], percent(omission["anticipatory_response_fraction_0_to_1s"])))
-    print("80%% R+ reversal-readiness candidate: %s" % ("YES" if summary["reversal_readiness_candidate"] else "NO"))
+    candidate = summary["reversal_readiness_candidate"]
+    print("80%% R+ reversal-readiness candidate: %s" % (
+        "NOT ASSESSED (partial session)" if candidate is None else "YES" if candidate else "NO"
+    ))
     for warning in summary["warnings"]:
         print("WARNING: %s" % warning)
     print("Decision: experimenter-controlled; no automatic reversal.")
@@ -2743,6 +2748,24 @@ def load_mouse_state(mouse_id, required=False):
     return state
 
 
+def mouse_protocol_files(mouse_id):
+    """Return the authoritative assignment/state paths and reject mismatches."""
+    assignment_path = assignment_path_for_mouse(ASSIGNMENT_DIR, mouse_id)
+    state_path = state_path_for_mouse(mouse_id)
+    assignment_exists, state_exists = assignment_path.exists(), state_path.exists()
+    if assignment_exists != state_exists:
+        if assignment_exists:
+            raise RuntimeError(
+                "Assignment exists but persistent protocol state is missing for mouse %s; "
+                "restore/recover the state before starting." % mouse_id
+            )
+        raise RuntimeError(
+            "Persistent protocol state exists but the authoritative assignment is missing "
+            "for mouse %s; restore the assignment before starting." % mouse_id
+        )
+    return assignment_path, state_path, assignment_exists
+
+
 def _local_iso_text(value):
     if not value:
         return "—"
@@ -2761,7 +2784,8 @@ def recent_mouse_states(assignment_dir=None):
             state = json.loads(path.read_text(encoding="utf-8"))
             if state.get("protocol_version") != STATE_PROTOCOL_VERSION or state.get("schema_version") != STATE_SCHEMA_VERSION:
                 continue
-            rows.append(state)
+            if state.get("last_completed_utc_iso"):
+                rows.append(state)
         except (OSError, ValueError):
             continue
     return sorted(rows, key=lambda state: state.get("last_completed_utc_iso") or "", reverse=True)
@@ -2813,15 +2837,33 @@ def record_completed_session(mouse_id, phase, session_id, completed_utc_iso):
     return path
 
 
+def ensure_initial_mouse_state(mouse_id):
+    """Create zero-session state once, immediately after a real assignment is created."""
+    path = state_path_for_mouse(mouse_id)
+    with assignment_directory_lock(ASSIGNMENT_DIR):
+        if not path.exists():
+            atomic_write_json(path, initial_mouse_state(mouse_id))
+    return path
+
+
+def should_commit_persistent_mouse_state(args, hardware_config, session_completed):
+    return bool(
+        session_completed
+        and not hardware_config.get("simulate_gpio", False)
+        and not getattr(args, "simulate_water_test", False)
+        and not getattr(args, "simulate_behavior_test", False)
+    )
+
+
 def resolve_contingency_phase(args, state):
     stored = (state or {}).get("current_phase", "acquisition")
-    requested = args.contingency_phase or (stored if state else None)
+    requested = getattr(args, "contingency_phase", None) or (stored if state else None)
     if requested is None:
         requested = _strict_prompt("Contingency phase [acquisition/reversal]: ").lower()
         while requested not in CONTINGENCY_PHASES:
             print("Please enter acquisition or reversal.")
             requested = _strict_prompt("Contingency phase [acquisition/reversal]: ").lower()
-    if stored == "reversal" and requested == "acquisition" and not args.allow_phase_rollback:
+    if stored == "reversal" and requested == "acquisition" and not getattr(args, "allow_phase_rollback", False):
         raise RuntimeError("Refusing reversal-to-acquisition rollback without --allow-phase-rollback.")
     if stored == "reversal" and requested == "acquisition" and not prompt_yes_no_strict(
             "EXCEPTIONAL PHASE ROLLBACK: return this mouse to acquisition", default_yes=False):
@@ -2963,14 +3005,16 @@ def main(argv=None):
             mouse_id = base.sanitize_text(mouse_id_raw)
             if mouse_id: break
             print("Mouse ID is required; try again.")
-    mouse_state_path = state_path_for_mouse(mouse_id)
+    _, mouse_state_path, mouse_has_protocol_files = mouse_protocol_files(mouse_id)
     mouse_state = load_mouse_state(mouse_id, required=True)
     print("Selected mouse: %s" % mouse_id)
-    if mouse_state:
+    if mouse_has_protocol_files:
         print("Stored contingency phase: %s" % mouse_state.get("current_phase", "acquisition").upper())
         print("Last completed session: %s" % _local_iso_text(mouse_state.get("last_completed_utc_iso")))
     else:
         print("NEW MOUSE for %s" % PROTOCOL_VERSION)
+        if args.simulate_gpio:
+            raise RuntimeError("Simulation cannot create a new persistent mouse assignment; use a temporary test directory or an existing mouse.")
         if not prompt_yes_no_strict("Create a new protocol assignment for mouse %s" % mouse_id, default_yes=False):
             print("Session aborted before assignment creation.")
             return 0
@@ -3018,6 +3062,8 @@ def main(argv=None):
             ASSIGNMENT_DIR,
         )
     )
+    if assignment_created and not args.simulate_gpio:
+        ensure_initial_mouse_state(mouse_id)
     trials, sequence_seed = make_trial_plan(
         assignment_rows,
         n_blocks=n_blocks,
@@ -3851,7 +3897,7 @@ def main(argv=None):
             }, cleanup_errors, finalization_errors)
         camera_data_secured = completion_state["camera_data_secured"]
         session_completed = completion_state["session_completed"]
-        if session_completed:
+        if should_commit_persistent_mouse_state(args, hardware_config, session_completed):
             try:
                 record_completed_session(mouse_id, contingency_phase, session_id, metadata["utc_iso_end"])
             except Exception as exc:

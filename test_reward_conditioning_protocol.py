@@ -2,11 +2,15 @@
 """Hardware-free checks for the exposure/reversal protocol."""
 
 import json
+import random
 import shutil
 import tempfile
+import threading
 import unittest
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest import mock
 
 import reward_conditioning_protocol as protocol
 
@@ -18,6 +22,14 @@ class RewardConditioningProtocolTests(unittest.TestCase):
 
     def tearDown(self):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def assert_no_json_temps(self, directory=None):
+        directory = self.temp_dir if directory is None else Path(directory)
+        self.assertEqual(list(directory.glob(".*.tmp")), [])
+
+    @staticmethod
+    def assignment_mapping(rows):
+        return [(row["image_role"], row["image_filename"]) for row in rows]
 
     def assignment(self, mouse="MOUSE"):
         return protocol.create_or_load_assignment(mouse, self.images, self.temp_dir)[0]
@@ -92,6 +104,137 @@ class RewardConditioningProtocolTests(unittest.TestCase):
     def test_invalid_non_default_block_multiple_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "multiple of 10"):
             protocol.make_trial_plan(self.assignment(), 1)
+
+    def test_atomic_global_panel_creation_and_reuse(self):
+        panel, path, created = protocol.create_or_load_global_panel(self.images, self.temp_dir)
+        payload = json.loads(path.read_text())
+        self.assertTrue(created)
+        self.assertEqual(payload["schema_version"], protocol.PANEL_SCHEMA_VERSION)
+        self.assertEqual(payload["protocol_version"], protocol.PROTOCOL_VERSION)
+        self.assertEqual([item.name for item in panel], payload["image_filenames"])
+        expected = sorted(random.Random(protocol.DEFAULT_GLOBAL_PANEL_SEED).sample(sorted(self.images), 14))
+        self.assertEqual(panel, expected)
+        with mock.patch.object(protocol, "atomic_write_json") as writer:
+            reused, reused_path, reused_created = protocol.create_or_load_global_panel(list(reversed(self.images)), self.temp_dir, panel_seed=999)
+        self.assertFalse(reused_created)
+        self.assertEqual(reused_path, path)
+        self.assertEqual(reused, panel)
+        writer.assert_not_called()
+        self.assert_no_json_temps()
+
+    def test_failed_atomic_writes_preserve_old_file(self):
+        path = protocol.global_panel_path(self.temp_dir)
+        old = b'{"authoritative": true}\n'
+        path.write_bytes(old)
+        with mock.patch.object(protocol.os, "replace", side_effect=OSError("replace")):
+            with self.assertRaises(OSError):
+                protocol.atomic_write_json(path, {"replacement": True})
+        self.assertEqual(path.read_bytes(), old)
+        self.assert_no_json_temps()
+        with mock.patch.object(protocol.os, "fsync", side_effect=OSError("fsync")):
+            with self.assertRaises(OSError):
+                protocol.atomic_write_json(path, {"replacement": True})
+        self.assertEqual(path.read_bytes(), old)
+        self.assert_no_json_temps()
+
+    def test_concurrent_panel_creation_converges(self):
+        barrier = threading.Barrier(2)
+        def create():
+            barrier.wait(timeout=5)
+            return protocol.create_or_load_global_panel(self.images, self.temp_dir)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda _: create(), range(2)))
+        self.assertEqual([item.name for item in results[0][0]], [item.name for item in results[1][0]])
+        self.assertEqual(sorted(result[2] for result in results), [False, True])
+
+    def test_concurrent_assignment_creation_is_safe(self):
+        barrier = threading.Barrier(2)
+        def create(mouse):
+            barrier.wait(timeout=5)
+            return protocol.create_or_load_assignment(mouse, self.images, self.temp_dir)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            same = list(pool.map(lambda _: create("RACE"), range(2)))
+        self.assertEqual(self.assignment_mapping(same[0][0]), self.assignment_mapping(same[1][0]))
+        self.assertEqual(sorted(item[2] for item in same), [False, True])
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            different = list(pool.map(create, ("A", "B")))
+        self.assertTrue(all(item[2] for item in different))
+        self.assertEqual({row["image_filename"] for row in different[0][0]}, {row["image_filename"] for row in different[1][0]})
+
+    def test_existing_assignment_is_authoritative_under_changed_inputs(self):
+        first = protocol.create_or_load_assignment("FIXED", self.images, self.temp_dir, master_seed=111, panel_seed=222)
+        assignment_bytes = first[1].read_bytes()
+        panel_bytes = protocol.global_panel_path(self.temp_dir).read_bytes()
+        with mock.patch.object(protocol, "atomic_write_json") as writer:
+            second = protocol.create_or_load_assignment("FIXED", list(reversed(self.images)), self.temp_dir, master_seed=999, panel_seed=888)
+        self.assertEqual(self.assignment_mapping(first[0]), self.assignment_mapping(second[0]))
+        self.assertEqual(first[3], second[3])
+        self.assertEqual(first[1].read_bytes(), assignment_bytes)
+        self.assertEqual(protocol.global_panel_path(self.temp_dir).read_bytes(), panel_bytes)
+        writer.assert_not_called()
+
+    def test_off_panel_image_is_rejected_without_repair(self):
+        rows, path, _, _ = protocol.create_or_load_assignment("OFF", self.images, self.temp_dir)
+        payload = json.loads(path.read_text())
+        panel = json.loads(protocol.global_panel_path(self.temp_dir).read_text())
+        replacement = next(item for item in self.images if item.name not in panel["image_filenames"])
+        payload["images"][0]["image_filename"] = replacement.name
+        payload["images"][0]["image_path"] = str(replacement)
+        protocol.atomic_write_json(path, payload)
+        bad = path.read_bytes()
+        with self.assertRaisesRegex(RuntimeError, "do not match"):
+            protocol.create_or_load_assignment("OFF", self.images, self.temp_dir)
+        self.assertEqual(path.read_bytes(), bad)
+
+    def test_panel_provenance_and_missing_panel_are_safe(self):
+        _, path, _, _ = protocol.create_or_load_assignment("PROVENANCE", self.images, self.temp_dir)
+        payload = json.loads(path.read_text())
+        payload["global_panel_path"] = "/old/panel.json"
+        protocol.atomic_write_json(path, payload)
+        with self.assertRaisesRegex(RuntimeError, "inconsistent global panel path"):
+            protocol.create_or_load_assignment("PROVENANCE", self.images, self.temp_dir)
+        panel_path = protocol.global_panel_path(self.temp_dir)
+        panel_path.unlink()
+        with self.assertRaisesRegex(RuntimeError, "Refusing to create"):
+            protocol.create_or_load_assignment("PROVENANCE", self.images, self.temp_dir)
+        self.assertFalse(panel_path.exists())
+
+    def test_corrupt_panel_and_assignment_fail_without_replacement(self):
+        panel_path = protocol.global_panel_path(self.temp_dir)
+        panel_path.write_text("not-json")
+        with self.assertRaises(RuntimeError):
+            protocol.create_or_load_global_panel(self.images, self.temp_dir)
+        self.assertEqual(panel_path.read_text(), "not-json")
+        panel_path.unlink()
+        rows, assignment_path, _, _ = protocol.create_or_load_assignment("BAD", self.images, self.temp_dir)
+        assignment_path.write_text("not-json")
+        with self.assertRaises(RuntimeError):
+            protocol.create_or_load_assignment("BAD", self.images, self.temp_dir)
+        self.assertEqual(assignment_path.read_text(), "not-json")
+
+    def test_missing_saved_image_is_rejected(self):
+        rows, path, _, _ = protocol.create_or_load_assignment("MISSING", self.images, self.temp_dir)
+        bad_bytes = path.read_bytes()
+        available = [item for item in self.images if item.name != rows[0]["image_filename"]]
+        with self.assertRaisesRegex(RuntimeError, "missing image"):
+            protocol.create_or_load_assignment("MISSING", available, self.temp_dir)
+        self.assertEqual(path.read_bytes(), bad_bytes)
+
+    def test_force_new_is_explicit_and_lock_releases(self):
+        rows, path, _, seed = protocol.create_or_load_assignment("FORCE", self.images, self.temp_dir, master_seed=1)
+        old_bytes = path.read_bytes()
+        with mock.patch.object(protocol.os, "replace", side_effect=OSError("replace")):
+            with self.assertRaises(OSError):
+                protocol.create_or_load_assignment("FORCE", self.images, self.temp_dir, master_seed=2, force_new=True)
+        self.assertEqual(path.read_bytes(), old_bytes)
+        loaded = protocol.create_or_load_assignment("FORCE", self.images, self.temp_dir)
+        self.assertEqual(self.assignment_mapping(loaded[0]), self.assignment_mapping(rows))
+        self.assertEqual(loaded[3], seed)
+        with self.assertRaisesRegex(RuntimeError, "lock failure"):
+            with protocol.assignment_directory_lock(self.temp_dir):
+                raise RuntimeError("lock failure")
+        with protocol.assignment_directory_lock(self.temp_dir):
+            pass
 
 
 if __name__ == "__main__":

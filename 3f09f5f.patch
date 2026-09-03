@@ -1,0 +1,2579 @@
+commit 3f09f5f2416fe17d1c2930bf822dad2c150a2b21
+Author:     hung-lo <hung.lo.ecn@gmail.com>
+AuthorDate: Wed Sep 2 20:32:58 2026 -0400
+Commit:     hung-lo <hung.lo.ecn@gmail.com>
+CommitDate: Wed Sep 2 20:32:58 2026 -0400
+
+    Simplify natural image reward pipeline
+
+diff --git a/README.md b/README.md
+index a027ce5..189e937 100644
+--- a/README.md
++++ b/README.md
+@@ -18,7 +18,8 @@ experiments are maintained at <https://github.com/hung-lo/vstim_natural>.
+ The supported runner:
+ 
+ - asks for the mouse/session settings and shows a final setup summary
+-- uses the fixed 14-image assignment and precomputed 90% reward schedule
++- uses 14 fixed images with high/medium/low exposure at an exact 8:3:1 ratio
++- supports manually selected acquisition and partial-reversal contingencies
+ - displays each stimulus as a 1.0 s plus 0.5 s RPG sequence
+ - triggers reward at the 1.0 s boundary, independent of licking
+ - applies scheduled suction at its open-loop onset on rewarded and omitted cues
+@@ -149,13 +150,28 @@ The new open-loop reward task lives in `run_stringer_reward_conditioning.py`.
+ It uses the same `rpg` framebuffer path, but adds fixed-probability reward
+ delivery for a selected subset of images.
+ 
+-Launch it from the repo root:
++Launch acquisition from the repo root:
+ 
+ ```bash
+ cd ~/vstim_natural_img_reward
+ python3 run_stringer_reward_conditioning.py
+ ```
+ 
++Select reversal explicitly; it never starts automatically:
++
++```bash
++python3 run_stringer_reward_conditioning.py --mouse-id V1_2 --contingency-phase reversal
++```
++
++The default is 500 trials in 10 exact 50-trial blocks. Each block contains 8
++presentations per high-exposure image, 3 per medium-exposure image, and 1 per
++low-exposure image. Acquisition rewards the `R_to_*` roles; reversal switches
++only `R_to_U` and `U_to_R`, preserving exposure and image identity. Both phases
++schedule exactly 198 rewards and 22 omissions at fixed 90% reward probability.
++The end-of-session behavioral readout reports R+, R-, omission, exposure, and
++role-level anticipatory licking. Its 80% R+ threshold is a decision aid only;
++the experimenter controls reversal.
++
+ This repository supports the reward-conditioning runner above. The copied
+ natural-image-only runners are retained only as importable compatibility
+ modules and refuse direct execution. For the natural-image-only protocol, use
+@@ -179,16 +195,17 @@ onset. For example, the Box151 configuration of 6 pulses with 0.100 s on and
+ these pulse values are a Box151 example, not universal defaults. Physical
+ timing should be confirmed from Intan/photodiode/valve recordings.
+ 
+-Persistent assignments are saved under `/mnt/hd/vstim_reward_assignments/`:
++Persistent assignments and per-mouse phase state are saved under
++`/mnt/hd/vstim_reward_assignments/`:
+ 
+-- `_global_reward_conditioning_14_image_panel.json` for the cohort-wide image panel
+-- `<mouse_id>_reward_conditioning_assignment.json` for the per-mouse role mapping
++- `_exposure_reward_v1_14_image_panel.json` for the cohort-wide image panel
++- `<mouse_id>_exposure_reward_v1_assignment.json` for the permanent role mapping
++- `<mouse_id>_reward_conditioning_state.json` for phase and completion state
+ 
+ These are persistent longitudinal protocol files. They are created atomically
+-under a filesystem lock and reused on future sessions. Do not delete or
+-manually edit them after training or data collection begins. `force_new=True`
+-is an explicit exceptional operation for deliberately replacing a mouse's
+-assignment; it does not replace the cohort-wide panel.
++under a filesystem lock and reused on future sessions. Legacy assignment files
++are not migrated or silently reused. Do not delete or manually edit these files
++after training or data collection begins.
+ 
+ Session output is written under:
+ 
+@@ -204,6 +221,8 @@ The main files there are:
+ - `<session>_trial_summary.csv`
+ - `<session>_image_assignment.csv`
+ - `<session>_plan_summary.csv`
++- `<session>_behavior_summary.csv`
++- `<session>_behavior_summary.json`
+ - `<session>_metadata.json`
+ - `<session>_session_qc.json`
+ - `raw_cache/` with the baked RPG raws
+diff --git a/reward_conditioning_protocol.py b/reward_conditioning_protocol.py
+index 2e8ac94..af27ff3 100644
+--- a/reward_conditioning_protocol.py
++++ b/reward_conditioning_protocol.py
+@@ -1,21 +1,5 @@
+ #!/usr/bin/env python3
+-"""Pure protocol logic for natural-image reward conditioning.
+-
+-This module has no Raspberry Pi, RPG, camera, or GPIO dependency.  It owns:
+-
+-* one persistent 14-image panel shared across the cohort;
+-* persistent image-to-role assignment for each mouse;
+-* exact 50-trial probability blocks;
+-* constrained pseudorandomization with no adjacent image repeats;
+-* exact 90% reward / 10% omission scheduling independent of licking; and
+-* validation of the complete planned session before hardware starts.
+-
+-The intended protocol has 14 images:
+-
+-* 10 low-probability images: 1 presentation each per 50-trial block (2% each)
+-* 2 high-probability unrewarded images: 10 each per block (20% each)
+-* 2 high-probability rewarded images: 10 each per block (20% each)
+-"""
++"""Pure, hardware-free protocol logic for the exposure/reversal task."""
+ 
+ from __future__ import print_function
+ 
+@@ -30,77 +14,102 @@ from contextlib import contextmanager
+ from pathlib import Path
+ 
+ 
+-ASSIGNMENT_SCHEMA_VERSION = 2
+-PANEL_SCHEMA_VERSION = 1
++PROTOCOL_VERSION = "exposure_reward_partial_reversal_v1"
++ASSIGNMENT_SCHEMA_VERSION = 3
++PANEL_SCHEMA_VERSION = 2
+ DEFAULT_GLOBAL_PANEL_SEED = 777
+ DEFAULT_ASSIGNMENT_MASTER_SEED = 20260804
+ DEFAULT_SEQUENCE_MASTER_SEED = 20260805
+-GLOBAL_PANEL_FILENAME = "_global_reward_conditioning_14_image_panel.json"
++GLOBAL_PANEL_FILENAME = "_exposure_reward_v1_14_image_panel.json"
+ ASSIGNMENT_LOCK_FILENAME = ".reward_conditioning_assignments.lock"
+ 
+-# Protocol version 1 deliberately fixes this schedule. Do not expose it as
+-# an operator prompt, command-line option, or hardware-configuration field.
+ REWARDS_PER_TEN_PRESENTATIONS = 9
+ OMISSIONS_PER_TEN_PRESENTATIONS = 1
+-REWARD_PROBABILITY = REWARDS_PER_TEN_PRESENTATIONS / 10.0
+-
+-REWARDED_HIGH_ROLES = ("rewarded_high_1", "rewarded_high_2")
+-UNREWARDED_HIGH_ROLES = ("unrewarded_high_1", "unrewarded_high_2")
+-LOW_ROLES = tuple("low_%02d" % index for index in range(1, 11))
+-ALL_ROLES = REWARDED_HIGH_ROLES + UNREWARDED_HIGH_ROLES + LOW_ROLES
+-
+-ROLE_PRESENTATIONS_PER_BLOCK = {}
+-for _role in REWARDED_HIGH_ROLES + UNREWARDED_HIGH_ROLES:
+-    ROLE_PRESENTATIONS_PER_BLOCK[_role] = 10
+-for _role in LOW_ROLES:
+-    ROLE_PRESENTATIONS_PER_BLOCK[_role] = 1
+-
++REWARD_PROBABILITY = 0.90
++CONTINGENCY_PHASES = ("acquisition", "reversal")
++
++HIGH_ROLES = ("high_R_to_R", "high_R_to_U", "high_U_to_R", "high_U_to_U")
++MEDIUM_ROLES = ("medium_R_to_R", "medium_R_to_U", "medium_U_to_R", "medium_U_to_U")
++LOW_ROLES = tuple("low_U_to_U_%02d" % index for index in range(1, 7))
++ALL_ROLES = HIGH_ROLES + MEDIUM_ROLES + LOW_ROLES
++ROLE_PRESENTATIONS_PER_BLOCK = dict(
++    [(role, 8) for role in HIGH_ROLES]
++    + [(role, 3) for role in MEDIUM_ROLES]
++    + [(role, 1) for role in LOW_ROLES]
++)
+ TRIALS_PER_BLOCK = sum(ROLE_PRESENTATIONS_PER_BLOCK.values())
+ assert TRIALS_PER_BLOCK == 50
+ 
++REWARDED_ROLES_BY_PHASE = {
++    "acquisition": ("high_R_to_R", "high_R_to_U", "medium_R_to_R", "medium_R_to_U"),
++    "reversal": ("high_R_to_R", "high_U_to_R", "medium_R_to_R", "medium_U_to_R"),
++}
++
+ 
+ def stable_seed(*parts):
+-    """Return a stable integer seed from arbitrary values."""
+-    text = "|".join(str(part) for part in parts)
+-    digest = hashlib.sha256(text.encode("utf-8")).digest()
++    digest = hashlib.sha256("|".join(str(part) for part in parts).encode("utf-8")).digest()
+     return int.from_bytes(digest[:8], byteorder="big", signed=False)
+ 
+ 
+ def _role_metadata(role):
+-    if role in REWARDED_HIGH_ROLES:
+-        return {
+-            "image_role": role,
+-            "image_category": "high_probability_rewarded",
+-            "presentation_probability": 0.20,
+-            "reward_eligible": True,
+-        }
+-    if role in UNREWARDED_HIGH_ROLES:
+-        return {
+-            "image_role": role,
+-            "image_category": "high_probability_unrewarded",
+-            "presentation_probability": 0.20,
+-            "reward_eligible": False,
+-        }
+-    if role in LOW_ROLES:
+-        return {
+-            "image_role": role,
+-            "image_category": "low_probability_unrewarded",
+-            "presentation_probability": 0.02,
+-            "reward_eligible": False,
+-        }
+-    raise ValueError("Unknown image role: %s" % role)
++    if role in HIGH_ROLES:
++        exposure_level, probability, presentations = "high", 0.16, 8
++    elif role in MEDIUM_ROLES:
++        exposure_level, probability, presentations = "medium", 0.06, 3
++    elif role in LOW_ROLES:
++        exposure_level, probability, presentations = "low", 0.02, 1
++    else:
++        raise ValueError("Unknown image role: %s" % role)
++    trajectory = "U_to_U" if role in LOW_ROLES else role.split("_", 1)[1]
++    return {
++        "protocol_version": PROTOCOL_VERSION,
++        "image_role": role,
++        "exposure_level": exposure_level,
++        "image_category": exposure_level + "_exposure",
++        "reward_trajectory": trajectory,
++        "presentation_probability": probability,
++        "presentations_per_block": presentations,
++    }
++
++
++def role_metadata(role):
++    """Return permanent metadata for one image role."""
++    return dict(_role_metadata(role))
++
++
++def reward_state_for_role(image_role, contingency_phase):
++    if contingency_phase not in CONTINGENCY_PHASES:
++        raise ValueError("contingency_phase must be acquisition or reversal")
++    trajectory = _role_metadata(image_role)["reward_trajectory"]
++    return trajectory.split("_to_")[0 if contingency_phase == "acquisition" else 1]
++
++
++def apply_contingency(assignment_rows, contingency_phase):
++    if contingency_phase not in CONTINGENCY_PHASES:
++        raise ValueError("contingency_phase must be acquisition or reversal")
++    resolved = []
++    for row in assignment_rows:
++        current = dict(row)
++        state = reward_state_for_role(row["image_role"], contingency_phase)
++        current.update({
++            "protocol_version": PROTOCOL_VERSION,
++            "contingency_phase": contingency_phase,
++            "current_reward_state": state,
++            "reward_eligible": state == "R",
++        })
++        resolved.append(current)
++    return resolved
+ 
+ 
+ def _parse_image_id(path):
+-    path = Path(path)
+-    for part in reversed(path.stem.split("_")):
++    for part in reversed(Path(path).stem.split("_")):
+         if part.isdigit():
+             return int(part)
+     return None
+ 
+ 
+ def assignment_path_for_mouse(assignment_dir, mouse_id):
+-    return Path(assignment_dir) / (str(mouse_id) + "_reward_conditioning_assignment.json")
++    return Path(assignment_dir) / (str(mouse_id) + "_exposure_reward_v1_assignment.json")
+ 
+ 
+ def global_panel_path(assignment_dir):
+@@ -109,43 +118,31 @@ def global_panel_path(assignment_dir):
+ 
+ @contextmanager
+ def assignment_directory_lock(assignment_dir):
+-    """Exclusively lock persistent panel/assignment operations in one directory."""
+     assignment_dir = Path(assignment_dir)
+     assignment_dir.mkdir(parents=True, exist_ok=True)
+-    lock_path = assignment_dir / ASSIGNMENT_LOCK_FILENAME
+-    with lock_path.open("a+") as lock_file:
++    with (assignment_dir / ASSIGNMENT_LOCK_FILENAME).open("a+") as lock_file:
+         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+         try:
+-            yield lock_path
++            yield assignment_dir / ASSIGNMENT_LOCK_FILENAME
+         finally:
+             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+ 
+ 
+ def atomic_write_json(path, payload):
+-    """Atomically install complete JSON and clean up an unpromoted temp file."""
+     path = Path(path)
+     path.parent.mkdir(parents=True, exist_ok=True)
+-    serialized = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+-    temp_path = None
++    temporary = None
+     try:
+         with tempfile.NamedTemporaryFile(
+-            mode="w",
+-            encoding="utf-8",
+-            dir=str(path.parent),
+-            prefix="." + path.name + ".",
+-            suffix=".tmp",
+-            delete=False,
+-        ) as temp_file:
+-            temp_path = Path(temp_file.name)
+-            temp_file.write(serialized)
+-            temp_file.flush()
+-            os.fsync(temp_file.fileno())
+-
+-        os.replace(str(temp_path), str(path))
+-        temp_path = None
+-
+-        # The rename is the core atomicity guarantee. Directory fsync improves
+-        # crash durability but is not supported by every mounted filesystem.
++            mode="w", encoding="utf-8", dir=str(path.parent),
++            prefix="." + path.name + ".", suffix=".tmp", delete=False,
++        ) as handle:
++            temporary = Path(handle.name)
++            handle.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
++            handle.flush()
++            os.fsync(handle.fileno())
++        os.replace(str(temporary), str(path))
++        temporary = None
+         try:
+             directory_fd = os.open(str(path.parent), os.O_RDONLY)
+             try:
+@@ -155,586 +152,316 @@ def atomic_write_json(path, payload):
+         except OSError:
+             pass
+     finally:
+-        if temp_path is not None:
++        if temporary is not None:
+             try:
+-                temp_path.unlink()
++                temporary.unlink()
+             except OSError:
+                 pass
+ 
+ 
+-def _load_authoritative_json(path, description):
++def _load_json(path, description):
+     try:
+         return json.loads(Path(path).read_text(encoding="utf-8"))
+     except (OSError, ValueError) as error:
+-        raise RuntimeError(
+-            "Could not load valid JSON from authoritative %s %s: %s"
+-            % (description, path, error)
+-        )
+-
+-
+-def _validated_integer_metadata(payload, field_name, description, path):
+-    if field_name not in payload:
+-        raise RuntimeError(
+-            "%s %s is missing required %s metadata."
+-            % (description, path, field_name)
+-        )
+-    value = payload[field_name]
+-    if isinstance(value, bool) or not isinstance(value, (int, str)):
+-        raise RuntimeError(
+-            "%s %s has invalid %s metadata: %r"
+-            % (description, path, field_name, value)
+-        )
+-    try:
+-        return int(value)
+-    except ValueError:
+-        raise RuntimeError(
+-            "%s %s has invalid %s metadata: %r"
+-            % (description, path, field_name, value)
+-        )
++        raise RuntimeError("Could not load valid JSON from %s %s: %s" % (description, path, error))
+ 
+ 
+ def _validate_global_panel_payload(payload, available_by_name, path):
+-    if not isinstance(payload, dict):
+-        raise RuntimeError("Global panel %s must contain a JSON object." % path)
+-    if payload.get("schema_version") != PANEL_SCHEMA_VERSION:
+-        raise RuntimeError(
+-            "Unsupported global panel schema in %s: %r"
+-            % (path, payload.get("schema_version"))
+-        )
+-    _validated_integer_metadata(payload, "panel_seed", "Global panel", path)
+-    filenames = list(payload.get("image_filenames", []))
+-    if len(filenames) != len(ALL_ROLES) or len(set(filenames)) != len(filenames):
++    if not isinstance(payload, dict) or payload.get("schema_version") != PANEL_SCHEMA_VERSION:
++        raise RuntimeError("Unsupported global panel schema in %s" % path)
++    filenames = payload.get("image_filenames", [])
++    if len(filenames) != 14 or len(set(filenames)) != 14:
+         raise RuntimeError("Global panel must contain 14 unique image filenames.")
+     missing = [name for name in filenames if name not in available_by_name]
+     if missing:
+-        raise RuntimeError(
+-            "Global panel refers to missing image files: %s"
+-            % ", ".join(sorted(missing))
+-        )
+-    return filenames
++        raise RuntimeError("Global panel refers to missing image files: %s" % ", ".join(sorted(missing)))
++    if isinstance(payload.get("panel_seed"), bool) or not isinstance(payload.get("panel_seed"), (int, str)):
++        raise RuntimeError("Global panel has invalid panel_seed metadata.")
++    try:
++        int(payload["panel_seed"])
++    except (KeyError, ValueError):
++        raise RuntimeError("Global panel has invalid panel_seed metadata.")
++    return list(filenames)
+ 
+ 
+ def _existing_assignment_paths(assignment_dir):
+-    return sorted(
+-        Path(assignment_dir).glob("*_reward_conditioning_assignment.json")
+-    )
+-
+-
+-def _refuse_panel_creation_with_orphaned_assignments(assignment_dir, panel_path):
+-    assignment_paths = _existing_assignment_paths(assignment_dir)
+-    if not assignment_paths:
+-        return
+-    raise RuntimeError(
+-        "Existing longitudinal mouse assignment file(s) found, but the "
+-        "authoritative cohort-wide global panel is missing at %s. Refusing "
+-        "to regenerate it automatically. Restore the original global panel "
+-        "from backup or resolve the authoritative files manually: %s"
+-        % (panel_path, ", ".join(path.name for path in assignment_paths))
+-    )
+-
+-
+-def _create_or_load_global_panel_unlocked(
+-    available_image_files,
+-    assignment_dir,
+-    panel_seed=DEFAULT_GLOBAL_PANEL_SEED,
+-):
+-    """Create/load the cohort panel while the caller holds the directory lock."""
++    return sorted(Path(assignment_dir).glob("*_exposure_reward_v1_assignment.json"))
++
++
++def _create_or_load_global_panel_unlocked(available_image_files, assignment_dir, panel_seed=DEFAULT_GLOBAL_PANEL_SEED):
+     available_image_files = sorted(Path(path) for path in available_image_files)
+     available_by_name = {path.name: path for path in available_image_files}
+-    assignment_dir = Path(assignment_dir)
+     path = global_panel_path(assignment_dir)
+-
+     if path.exists():
+-        payload = _load_authoritative_json(path, "global panel")
++        payload = _load_json(path, "global panel")
+         filenames = _validate_global_panel_payload(payload, available_by_name, path)
+         return [available_by_name[name] for name in filenames], path, False
+-
+-    _refuse_panel_creation_with_orphaned_assignments(assignment_dir, path)
+-
+-    if len(available_image_files) < len(ALL_ROLES):
+-        raise RuntimeError(
+-            "Need at least %d PNG files, but found %d."
+-            % (len(ALL_ROLES), len(available_image_files))
+-        )
+-    rng = random.Random(int(panel_seed))
+-    selected = sorted(rng.sample(available_image_files, len(ALL_ROLES)))
++    if _existing_assignment_paths(assignment_dir):
++        raise RuntimeError("Refusing to create missing new global panel beside existing new assignments: %s" % path)
++    if len(available_image_files) < 14:
++        raise RuntimeError("Need at least 14 PNG files, but found %d." % len(available_image_files))
++    selected = sorted(random.Random(int(panel_seed)).sample(available_image_files, 14))
+     payload = {
+         "schema_version": PANEL_SCHEMA_VERSION,
++        "protocol_version": PROTOCOL_VERSION,
+         "panel_seed": int(panel_seed),
+         "image_filenames": [path_item.name for path_item in selected],
+-        "notes": (
+-            "Shared 14-image cohort panel. Do not replace after data collection "
+-            "begins. Per-mouse files assign these images to protocol roles."
+-        ),
+     }
+     _validate_global_panel_payload(payload, available_by_name, path)
+     atomic_write_json(path, payload)
+     return selected, path, True
+ 
+ 
+-def create_or_load_global_panel(
+-    available_image_files,
+-    assignment_dir,
+-    panel_seed=DEFAULT_GLOBAL_PANEL_SEED,
+-):
+-    """Create or load one shared 14-image panel for the entire cohort.
+-
+-    Using the same image identities across mice improves cross-animal comparison.
+-    Image-to-role mappings are still independently counterbalanced per mouse.
+-    """
+-    available_image_files = sorted(Path(path) for path in available_image_files)
+-    assignment_dir = Path(assignment_dir)
++def create_or_load_global_panel(available_image_files, assignment_dir, panel_seed=DEFAULT_GLOBAL_PANEL_SEED):
+     with assignment_directory_lock(assignment_dir):
+-        return _create_or_load_global_panel_unlocked(
+-            available_image_files,
+-            assignment_dir,
+-            panel_seed=panel_seed,
+-        )
++        return _create_or_load_global_panel_unlocked(available_image_files, assignment_dir, panel_seed)
++
++
++def validate_assignment_rows(rows):
++    if len(rows) != 14:
++        raise RuntimeError("Assignment must contain exactly 14 images.")
++    roles = [row.get("image_role") for row in rows]
++    filenames = [row.get("image_filename") for row in rows]
++    if sorted(roles) != sorted(ALL_ROLES):
++        raise RuntimeError("Assignment roles are incomplete or duplicated.")
++    if len(set(filenames)) != 14:
++        raise RuntimeError("Assignment contains duplicated image filenames.")
++    for row in rows:
++        if row.get("protocol_version", PROTOCOL_VERSION) != PROTOCOL_VERSION:
++            raise RuntimeError("Assignment row belongs to another protocol version.")
++        expected = _role_metadata(row["image_role"])
++        for field in ("exposure_level", "reward_trajectory", "presentation_probability", "presentations_per_block"):
++            if row.get(field) != expected[field]:
++                raise RuntimeError("Assignment metadata does not match role %s." % row["image_role"])
+ 
+ 
+ def _resolve_assignment_images(payload, available_image_files):
+-    """Resolve saved filenames against the currently available image directory."""
+     available_by_name = {Path(path).name: Path(path) for path in available_image_files}
+-    resolved_rows = []
+-    missing = []
+-    saved_rows = payload.get("images", [])
+-    if not isinstance(saved_rows, list):
+-        raise RuntimeError("Saved assignment images must be a JSON list.")
+-    for saved_row in saved_rows:
++    rows, missing = [], []
++    for saved_row in payload.get("images", []):
+         if not isinstance(saved_row, dict) or "image_filename" not in saved_row:
+             raise RuntimeError("Saved assignment contains an invalid image row.")
+-        filename = saved_row["image_filename"]
+-        if filename not in available_by_name:
+-            missing.append(filename)
++        if saved_row["image_filename"] not in available_by_name:
++            missing.append(saved_row["image_filename"])
+             continue
+         row = dict(saved_row)
+-        row["image_path"] = str(available_by_name[filename])
+-        resolved_rows.append(row)
++        row["image_path"] = str(available_by_name[row["image_filename"]])
++        rows.append(row)
+     if missing:
+-        raise RuntimeError(
+-            "The saved assignment refers to missing image files: %s" % ", ".join(sorted(missing))
+-        )
+-    return resolved_rows
+-
+-
+-def _validate_assignment_payload(
+-    payload,
+-    expected_mouse_id,
+-    available_image_files,
+-    assignment_path,
+-    panel_filenames=None,
+-    panel_path=None,
+-    panel_seed=None,
+-):
+-    if not isinstance(payload, dict):
+-        raise RuntimeError("Assignment %s must contain a JSON object." % assignment_path)
+-    if payload.get("schema_version") != ASSIGNMENT_SCHEMA_VERSION:
+-        raise RuntimeError(
+-            "Unsupported assignment schema in %s: %r"
+-            % (assignment_path, payload.get("schema_version"))
+-        )
++        raise RuntimeError("The saved assignment refers to missing image files: %s" % ", ".join(sorted(missing)))
++    return rows
++
++
++def _validate_assignment_payload(payload, expected_mouse_id, available_image_files, assignment_path, panel_filenames, panel_path, panel_seed):
++    if not isinstance(payload, dict) or payload.get("schema_version") != ASSIGNMENT_SCHEMA_VERSION:
++        raise RuntimeError("Unsupported assignment schema in %s" % assignment_path)
++    if payload.get("protocol_version") != PROTOCOL_VERSION:
++        raise RuntimeError("Assignment protocol version mismatch in %s" % assignment_path)
+     if payload.get("mouse_id") != expected_mouse_id:
+-        raise RuntimeError(
+-            "Assignment mouse mismatch: expected %s, found %s"
+-            % (expected_mouse_id, payload.get("mouse_id"))
+-        )
++        raise RuntimeError("Assignment mouse mismatch: expected %s, found %s" % (expected_mouse_id, payload.get("mouse_id")))
+     rows = _resolve_assignment_images(payload, available_image_files)
+     validate_assignment_rows(rows)
+-    if panel_filenames is not None:
+-        assignment_filenames = {row["image_filename"] for row in rows}
+-        if assignment_filenames != set(panel_filenames):
+-            raise RuntimeError(
+-                "Assignment filenames do not match the authoritative global panel."
+-            )
+-    if panel_path is not None:
+-        saved_panel_path = payload.get("global_panel_path")
+-        if not isinstance(saved_panel_path, str) or Path(saved_panel_path).name != Path(
+-            panel_path
+-        ).name:
+-            raise RuntimeError(
+-                "Assignment %s refers to an inconsistent global panel path: %r"
+-                % (assignment_path, saved_panel_path)
+-            )
+-    if panel_seed is not None:
+-        saved_panel_seed = _validated_integer_metadata(
+-            payload,
+-            "global_panel_seed",
+-            "Assignment",
+-            assignment_path,
+-        )
+-        if saved_panel_seed != int(panel_seed):
+-            raise RuntimeError(
+-                "Assignment %s global panel seed %r does not match the "
+-                "authoritative global panel seed %r."
+-                % (assignment_path, saved_panel_seed, panel_seed)
+-            )
++    if {row["image_filename"] for row in rows} != set(panel_filenames):
++        raise RuntimeError("Assignment filenames do not match the authoritative global panel.")
++    saved_panel_path = payload.get("global_panel_path")
++    if not isinstance(saved_panel_path, str) or Path(saved_panel_path).name != Path(panel_path).name:
++        raise RuntimeError("Assignment refers to an inconsistent global panel path.")
++    try:
++        saved_seed = int(payload["global_panel_seed"])
++    except (KeyError, TypeError, ValueError):
++        raise RuntimeError("Assignment has invalid global panel seed metadata.")
++    if saved_seed != int(panel_seed):
++        raise RuntimeError("Assignment global panel seed does not match the authoritative global panel seed.")
+     return rows
+ 
+ 
+-def create_or_load_assignment(
+-    mouse_id,
+-    available_image_files,
+-    assignment_dir,
+-    master_seed=DEFAULT_ASSIGNMENT_MASTER_SEED,
+-    panel_seed=DEFAULT_GLOBAL_PANEL_SEED,
+-    force_new=False,
+-):
+-    """Create or load a fixed 14-image assignment for one mouse.
+-
+-    Existing assignments are always reused unless ``force_new`` is explicitly
+-    requested.  The saved filenames, not newly sampled images, are treated as
+-    authoritative for longitudinal experiments.
+-    """
++def create_or_load_assignment(mouse_id, available_image_files, assignment_dir, master_seed=DEFAULT_ASSIGNMENT_MASTER_SEED, panel_seed=DEFAULT_GLOBAL_PANEL_SEED, force_new=False):
+     mouse_id = str(mouse_id)
+     available_image_files = sorted(Path(path) for path in available_image_files)
+-    if len(available_image_files) < len(ALL_ROLES):
+-        raise RuntimeError(
+-            "Need at least %d PNG files, but found %d."
+-            % (len(ALL_ROLES), len(available_image_files))
+-        )
+-
+-    assignment_dir = Path(assignment_dir)
++    if len(available_image_files) < 14:
++        raise RuntimeError("Need at least 14 PNG files, but found %d." % len(available_image_files))
+     with assignment_directory_lock(assignment_dir):
++        panel_files, panel_path, panel_created = _create_or_load_global_panel_unlocked(available_image_files, assignment_dir, panel_seed)
++        panel_payload = _load_json(panel_path, "global panel")
++        available_by_name = {path.name: path for path in available_image_files}
++        panel_filenames = _validate_global_panel_payload(panel_payload, available_by_name, panel_path)
++        authoritative_seed = int(panel_payload["panel_seed"])
+         assignment_path = assignment_path_for_mouse(assignment_dir, mouse_id)
+-        panel_files, panel_path, panel_created = (
+-            _create_or_load_global_panel_unlocked(
+-                available_image_files,
+-                assignment_dir,
+-                panel_seed=panel_seed,
+-            )
+-        )
+-        panel_payload = _load_authoritative_json(panel_path, "global panel")
+-        available_by_name = {
+-            path.name: path for path in available_image_files
+-        }
+-        panel_filenames = _validate_global_panel_payload(
+-            panel_payload, available_by_name, panel_path
+-        )
+-        authoritative_panel_seed = _validated_integer_metadata(
+-            panel_payload, "panel_seed", "Global panel", panel_path
+-        )
+-
+         if assignment_path.exists() and not force_new:
+-            payload = _load_authoritative_json(assignment_path, "mouse assignment")
+-            rows = _validate_assignment_payload(
+-                payload,
+-                mouse_id,
+-                available_image_files,
+-                assignment_path,
+-                panel_filenames=panel_filenames,
+-                panel_path=panel_path,
+-                panel_seed=authoritative_panel_seed,
+-            )
++            payload = _load_json(assignment_path, "mouse assignment")
++            rows = _validate_assignment_payload(payload, mouse_id, available_image_files, assignment_path, panel_filenames, panel_path, authoritative_seed)
+             return rows, assignment_path, False, payload.get("resolved_assignment_seed")
+-
+-        resolved_seed = stable_seed(
+-            "reward-conditioning-role-assignment", master_seed, mouse_id
+-        )
+-        rng = random.Random(resolved_seed)
+-        role_ordered_files = list(panel_files)
+-        rng.shuffle(role_ordered_files)
+-
++        resolved_seed = stable_seed("exposure-reward-role-assignment", master_seed, mouse_id)
++        shuffled = list(panel_files)
++        random.Random(resolved_seed).shuffle(shuffled)
+         rows = []
+-        for role, path in zip(ALL_ROLES, role_ordered_files):
++        for role, path in zip(ALL_ROLES, shuffled):
+             row = _role_metadata(role)
+-            row.update(
+-                {
+-                    "image_filename": path.name,
+-                    "image_path": str(path),
+-                    "image_id": _parse_image_id(path),
+-                }
+-            )
++            row.update({"image_filename": path.name, "image_path": str(path), "image_id": _parse_image_id(path)})
+             rows.append(row)
+-
+         validate_assignment_rows(rows)
+         payload = {
+             "schema_version": ASSIGNMENT_SCHEMA_VERSION,
++            "protocol_version": PROTOCOL_VERSION,
+             "mouse_id": mouse_id,
+             "assignment_master_seed": int(master_seed),
+             "resolved_assignment_seed": int(resolved_seed),
+-            "global_panel_seed": authoritative_panel_seed,
++            "global_panel_seed": authoritative_seed,
+             "global_panel_path": str(panel_path),
+             "global_panel_created_with_this_assignment": bool(panel_created),
+             "images": rows,
+-            "notes": (
+-                "This file fixes image identities and roles for longitudinal use. "
+-                "Do not delete or regenerate it after training begins."
+-            ),
+         }
+-        _validate_assignment_payload(
+-            payload,
+-            mouse_id,
+-            available_image_files,
+-            assignment_path,
+-            panel_filenames=panel_filenames,
+-            panel_path=panel_path,
+-            panel_seed=authoritative_panel_seed,
+-        )
+         atomic_write_json(assignment_path, payload)
+         return rows, assignment_path, True, resolved_seed
+ 
+ 
+-def validate_assignment_rows(rows):
+-    if len(rows) != len(ALL_ROLES):
+-        raise RuntimeError("Assignment must contain exactly 14 images.")
+-    roles = [row["image_role"] for row in rows]
+-    filenames = [row["image_filename"] for row in rows]
+-    if sorted(roles) != sorted(ALL_ROLES):
+-        raise RuntimeError("Assignment roles are incomplete or duplicated.")
+-    if len(set(filenames)) != len(filenames):
+-        raise RuntimeError("Assignment contains duplicated image filenames.")
+-
+-
+ def _constrained_shuffle(rows, rng, previous_filename=None, max_attempts=1000):
+-    """Randomized greedy shuffle with no adjacent identical image.
+-
+-    A pure rejection shuffle is inefficient here because four images each occupy
+-    20% of a block.  This builder chooses among candidates that preserve the
+-    standard no-adjacent feasibility condition, then retries only if a rare
+-    greedy dead end is reached.
+-    """
++    """Shuffle a multiset without equal neighbors, including block boundaries."""
+     rows = [dict(row) for row in rows]
+     for _ in range(max_attempts):
+         buckets = {}
+         for row in rows:
+-            buckets.setdefault(row["image_filename"], []).append(dict(row))
++            buckets.setdefault(row["image_filename"], []).append(row)
+         for bucket in buckets.values():
+             rng.shuffle(bucket)
+-
+-        sequence = []
+-        previous = previous_filename
++        sequence, previous = [], previous_filename
+         while buckets:
+-            total_remaining = sum(len(bucket) for bucket in buckets.values())
++            remaining = sum(len(bucket) for bucket in buckets.values())
+             candidates = []
+             for filename, bucket in buckets.items():
+                 if filename == previous:
+                     continue
+-                # Test the remaining multiset after choosing this filename.
+-                remaining_after = total_remaining - 1
+-                max_after = 0
+-                for other_filename, other_bucket in buckets.items():
+-                    count_after = len(other_bucket) - (1 if other_filename == filename else 0)
+-                    max_after = max(max_after, count_after)
+-                if max_after <= int(math.ceil(remaining_after / 2.0)):
++                after = remaining - 1
++                largest = max(len(other) - (filename == other_name) for other_name, other in buckets.items())
++                if largest <= int(math.ceil(after / 2.0)):
+                     candidates.append(filename)
+-
+             if not candidates:
+                 break
+-
+-            # Weighted choice retains randomness while favoring abundant images.
+-            weighted = []
+-            for filename in candidates:
+-                weighted.extend([filename] * len(buckets[filename]))
+-            chosen = rng.choice(weighted)
++            chosen = rng.choice([name for name in candidates for _ in buckets[name]])
+             sequence.append(buckets[chosen].pop())
+             if not buckets[chosen]:
+                 del buckets[chosen]
+             previous = chosen
+-
+         if len(sequence) == len(rows):
+             return sequence
+-
+     raise RuntimeError("Could not construct a block without adjacent repeated images.")
+ 
+ 
+ def _stratified_omission_indices(n_presentations, n_omissions, rng):
+-    """Place an exact number of omissions approximately evenly through a cue's trials."""
+     if n_omissions <= 0:
+         return set()
+     if n_omissions >= n_presentations:
+         return set(range(n_presentations))
+-
+-    # Each omission is sampled from a separate temporal stratum.  Retry if two
+-    # choices become adjacent; high reward probabilities make this easy.
+     for _ in range(10000):
+         chosen = []
+         for stratum in range(n_omissions):
+             start = int(math.floor(stratum * n_presentations / float(n_omissions)))
+-            stop_exclusive = int(
+-                math.floor((stratum + 1) * n_presentations / float(n_omissions))
+-            )
+-            stop_exclusive = max(start + 1, stop_exclusive)
+-            chosen.append(rng.randrange(start, min(n_presentations, stop_exclusive)))
++            stop = max(start + 1, int(math.floor((stratum + 1) * n_presentations / float(n_omissions))))
++            chosen.append(rng.randrange(start, min(n_presentations, stop)))
+         chosen = sorted(set(chosen))
+-        if len(chosen) != n_omissions:
+-            continue
+-        if all(chosen[index] - chosen[index - 1] > 1 for index in range(1, len(chosen))):
++        if len(chosen) == n_omissions and all(b - a > 1 for a, b in zip(chosen, chosen[1:])):
+             return set(chosen)
+-
+-    # Exact count is more important than the no-adjacent-omission preference.
+     return set(rng.sample(range(n_presentations), n_omissions))
+ 
+ 
+-def _assign_exact_rewards(trials, rng):
+-    for role in REWARDED_HIGH_ROLES:
+-        matching_indices = [
+-            index for index, trial in enumerate(trials) if trial["image_role"] == role
+-        ]
+-        n_presentations = len(matching_indices)
+-        if n_presentations % 10 != 0:
+-            raise RuntimeError(
+-                "%s has %d presentations; fixed 90%% scheduling requires a "
+-                "multiple of 10." % (role, n_presentations)
+-            )
+-        groups_of_ten = n_presentations // 10
+-        n_rewards = groups_of_ten * REWARDS_PER_TEN_PRESENTATIONS
+-        n_omissions = groups_of_ten * OMISSIONS_PER_TEN_PRESENTATIONS
+-        omission_ordinals = _stratified_omission_indices(
+-            n_presentations, n_omissions, rng
+-        )
+-        for ordinal, trial_index in enumerate(matching_indices):
+-            scheduled = ordinal not in omission_ordinals
+-            trials[trial_index]["reward_scheduled"] = bool(scheduled)
+-            trials[trial_index]["reward_omission_scheduled"] = bool(not scheduled)
+-            trials[trial_index]["rewarded_cue_presentation_ordinal"] = ordinal + 1
++def _assign_exact_rewards(trials, contingency_phase, rng):
++    rewarded_roles = set(REWARDED_ROLES_BY_PHASE[contingency_phase])
++    for role in ALL_ROLES:
++        matching = [index for index, trial in enumerate(trials) if trial["image_role"] == role]
++        if role not in rewarded_roles:
++            for index in matching:
++                trials[index].update({"reward_scheduled": False, "reward_omission_scheduled": False, "rewarded_cue_presentation_ordinal": ""})
++            continue
++        if len(matching) % 10:
++            raise RuntimeError("%s has a presentation count not divisible by 10." % role)
++        omission_indices = _stratified_omission_indices(len(matching), len(matching) // 10, rng)
++        for ordinal, index in enumerate(matching):
++            omitted = ordinal in omission_indices
++            trials[index].update({"reward_scheduled": not omitted, "reward_omission_scheduled": omitted, "rewarded_cue_presentation_ordinal": ordinal + 1})
+ 
+-    for trial in trials:
+-        if not trial["reward_eligible"]:
+-            trial["reward_scheduled"] = False
+-            trial["reward_omission_scheduled"] = False
+-            trial["rewarded_cue_presentation_ordinal"] = ""
+-
+-
+-def make_trial_plan(
+-    assignment_rows,
+-    n_blocks,
+-    iti_min_sec=3.0,
+-    iti_max_sec=4.5,
+-    sequence_seed=None,
+-    mouse_id="mouse",
+-    sequence_master_seed=DEFAULT_SEQUENCE_MASTER_SEED,
+-    stim_duration_sec=1.5,
+-    reward_delay_sec=1.0,
+-    suction_delay_sec=3.5,
+-):
+-    """Build and validate the complete planned session before hardware starts."""
++
++def make_trial_plan(assignment_rows, n_blocks, iti_min_sec=3.0, iti_max_sec=4.5, sequence_seed=None, mouse_id="mouse", sequence_master_seed=DEFAULT_SEQUENCE_MASTER_SEED, stim_duration_sec=1.5, reward_delay_sec=1.0, suction_delay_sec=3.5, contingency_phase="acquisition"):
+     validate_assignment_rows(assignment_rows)
++    if contingency_phase not in CONTINGENCY_PHASES:
++        raise ValueError("contingency_phase must be acquisition or reversal")
+     if int(n_blocks) < 1:
+         raise ValueError("n_blocks must be at least 1")
++    if int(n_blocks) % 10:
++        raise ValueError("n_blocks must be a multiple of 10 for exact per-role 90% scheduling")
+     if float(iti_min_sec) <= 0 or float(iti_max_sec) < float(iti_min_sec):
+         raise ValueError("Require 0 < iti_min_sec <= iti_max_sec")
+     if not 0.0 < float(reward_delay_sec) < float(stim_duration_sec):
+         raise ValueError("reward_delay_sec must be inside the stimulus interval")
+     if not math.isfinite(float(suction_delay_sec)) or float(suction_delay_sec) < float(stim_duration_sec):
+         raise ValueError("suction_delay_sec must be finite and at least stim_duration_sec")
+-
+-    if sequence_seed is None:
+-        sequence_seed = stable_seed(
+-            "reward-conditioning-sequence",
+-            sequence_master_seed,
+-            mouse_id,
+-            random.SystemRandom().getrandbits(64),
+-        )
++    sequence_seed = sequence_seed if sequence_seed is not None else stable_seed("exposure-reward-sequence", sequence_master_seed, mouse_id, random.SystemRandom().getrandbits(64))
+     rng = random.Random(int(sequence_seed))
+-    assignment_by_role = {row["image_role"]: dict(row) for row in assignment_rows}
+-
+-    trials = []
+-    previous_filename = None
++    resolved_rows = apply_contingency(assignment_rows, contingency_phase)
++    by_role = {row["image_role"]: row for row in resolved_rows}
++    trials, previous_filename = [], None
+     for block_index in range(int(n_blocks)):
+         block_rows = []
+         for role in ALL_ROLES:
+-            for _ in range(ROLE_PRESENTATIONS_PER_BLOCK[role]):
+-                block_rows.append(dict(assignment_by_role[role]))
+-        block_rows = _constrained_shuffle(
+-            block_rows, rng, previous_filename=previous_filename
+-        )
++            block_rows.extend([dict(by_role[role]) for _ in range(ROLE_PRESENTATIONS_PER_BLOCK[role])])
++        block_rows = _constrained_shuffle(block_rows, rng, previous_filename)
+         previous_filename = block_rows[-1]["image_filename"]
+-
+-        for within_block_index, image_row in enumerate(block_rows):
++        for within, image_row in enumerate(block_rows):
+             trial = dict(image_row)
+-            trial.update(
+-                {
+-                    "trial_index": len(trials),
+-                    "trial_number": len(trials) + 1,
+-                    "block_index": block_index,
+-                    "block_number": block_index + 1,
+-                    "within_block_index": within_block_index,
+-                    "within_block_number": within_block_index + 1,
+-                    "planned_stim_duration_sec": float(stim_duration_sec),
+-                    "planned_reward_delay_sec": float(reward_delay_sec),
+-                    "planned_post_reward_stim_sec": float(stim_duration_sec)
+-                    - float(reward_delay_sec),
+-                    "planned_iti_duration_sec": round(
+-                        rng.uniform(float(iti_min_sec), float(iti_max_sec)), 6
+-                    ),
+-                    "suction_scheduled": bool(image_row["reward_eligible"]),
+-                    "planned_suction_delay_sec": float(suction_delay_sec),
+-                    "reward_scheduled": False,
+-                    "reward_omission_scheduled": False,
+-                }
+-            )
++            trial.update({
++                "trial_index": len(trials), "trial_number": len(trials) + 1,
++                "block_index": block_index, "block_number": block_index + 1,
++                "within_block_index": within, "within_block_number": within + 1,
++                "planned_stim_duration_sec": float(stim_duration_sec),
++                "planned_reward_delay_sec": float(reward_delay_sec),
++                "planned_post_reward_stim_sec": float(stim_duration_sec) - float(reward_delay_sec),
++                "planned_iti_duration_sec": round(rng.uniform(float(iti_min_sec), float(iti_max_sec)), 6),
++                "suction_scheduled": bool(image_row["reward_eligible"]),
++                "planned_suction_delay_sec": float(suction_delay_sec),
++                "reward_scheduled": False, "reward_omission_scheduled": False,
++            })
+             trials.append(trial)
+-
+-    reward_rng = random.Random(stable_seed("reward-schedule", sequence_seed))
+-    _assign_exact_rewards(trials, reward_rng)
+-    validate_trial_plan(trials, n_blocks=int(n_blocks))
++    _assign_exact_rewards(trials, contingency_phase, random.Random(stable_seed("reward-schedule", sequence_seed, contingency_phase)))
++    validate_trial_plan(trials, int(n_blocks), contingency_phase)
+     return trials, int(sequence_seed)
+ 
+ 
+-def validate_trial_plan(trials, n_blocks):
++def validate_trial_plan(trials, n_blocks, contingency_phase=None):
++    contingency_phase = contingency_phase or (trials[0].get("contingency_phase") if trials else "acquisition")
++    if contingency_phase not in CONTINGENCY_PHASES:
++        raise RuntimeError("Invalid contingency phase in trial plan.")
+     expected_total = int(n_blocks) * TRIALS_PER_BLOCK
+     if len(trials) != expected_total:
+-        raise RuntimeError(
+-            "Expected %d trials, but generated %d." % (expected_total, len(trials))
+-        )
+-
+-    for index in range(1, len(trials)):
+-        if trials[index]["image_filename"] == trials[index - 1]["image_filename"]:
+-            raise RuntimeError("Adjacent repeated image at trial index %d." % index)
+-
++        raise RuntimeError("Expected %d trials, but generated %d." % (expected_total, len(trials)))
++    if any(trial.get("contingency_phase") != contingency_phase for trial in trials):
++        raise RuntimeError("Trial plan contains mixed contingency phases.")
++    for previous, current in zip(trials, trials[1:]):
++        if previous["image_filename"] == current["image_filename"]:
++            raise RuntimeError("Adjacent repeated image at trial index %d." % current["trial_index"])
++    rewarded_roles = set(REWARDED_ROLES_BY_PHASE[contingency_phase])
+     for block_index in range(int(n_blocks)):
+         block = [trial for trial in trials if trial["block_index"] == block_index]
+         if len(block) != TRIALS_PER_BLOCK:
+             raise RuntimeError("Block %d does not contain 50 trials." % (block_index + 1))
+-        for role, expected_count in ROLE_PRESENTATIONS_PER_BLOCK.items():
+-            observed = sum(1 for trial in block if trial["image_role"] == role)
+-            if observed != expected_count:
+-                raise RuntimeError(
+-                    "Block %d role %s: expected %d, observed %d."
+-                    % (block_index + 1, role, expected_count, observed)
+-                )
+-
++        for role, expected in ROLE_PRESENTATIONS_PER_BLOCK.items():
++            observed = sum(trial["image_role"] == role for trial in block)
++            if observed != expected:
++                raise RuntimeError("Block %d role %s: expected %d, observed %d." % (block_index + 1, role, expected, observed))
+     for trial in trials:
+-        if not trial["reward_eligible"] and trial["reward_scheduled"]:
+-            raise RuntimeError("Reward scheduled on an ineligible trial.")
+-        if bool(trial.get("suction_scheduled")) != bool(trial["reward_eligible"]):
+-            raise RuntimeError("Suction must be scheduled exactly for reward-associated trials.")
+-
+-    for role in REWARDED_HIGH_ROLES:
++        eligible = trial["image_role"] in rewarded_roles
++        if bool(trial["reward_eligible"]) != eligible or bool(trial["suction_scheduled"]) != eligible:
++            raise RuntimeError("Phase-resolved reward metadata is inconsistent.")
++        if trial["reward_scheduled"] and trial["reward_omission_scheduled"]:
++            raise RuntimeError("Reward and omission are both scheduled on one trial.")
++        if eligible and bool(trial["reward_scheduled"]) == bool(trial["reward_omission_scheduled"]):
++            raise RuntimeError("Current R+ trial must schedule exactly one reward outcome.")
++        if not eligible and (trial["reward_scheduled"] or trial["reward_omission_scheduled"]):
++            raise RuntimeError("Reward or omission scheduled on a current R- trial.")
++    for role in rewarded_roles:
+         role_trials = [trial for trial in trials if trial["image_role"] == role]
+-        if len(role_trials) % 10 != 0:
+-            raise RuntimeError(
+-                "%s has %d presentations; expected a multiple of 10."
+-                % (role, len(role_trials))
+-            )
+-        groups_of_ten = len(role_trials) // 10
+-        expected_rewards = groups_of_ten * REWARDS_PER_TEN_PRESENTATIONS
+-        expected_omissions = (
+-            groups_of_ten * OMISSIONS_PER_TEN_PRESENTATIONS
+-        )
+-        observed_rewards = sum(1 for trial in role_trials if trial["reward_scheduled"])
+-        observed_omissions = sum(
+-            1 for trial in role_trials if trial["reward_omission_scheduled"]
+-        )
+-        if observed_rewards != expected_rewards:
+-            raise RuntimeError(
+-                "%s: expected %d rewards, observed %d."
+-                % (role, expected_rewards, observed_rewards)
+-            )
+-        if observed_omissions != expected_omissions:
+-            raise RuntimeError(
+-                "%s: expected %d omissions, observed %d."
+-                % (role, expected_omissions, observed_omissions)
+-            )
+-        if any(
+-            bool(trial["reward_scheduled"])
+-            == bool(trial["reward_omission_scheduled"])
+-            for trial in role_trials
+-        ):
+-            raise RuntimeError(
+-                "%s contains a rewarded-cue trial without exactly one of "
+-                "reward_scheduled or reward_omission_scheduled." % role
+-            )
++        if sum(trial["reward_scheduled"] for trial in role_trials) != len(role_trials) * 9 // 10 or sum(trial["reward_omission_scheduled"] for trial in role_trials) != len(role_trials) // 10:
++            raise RuntimeError("%s has an invalid exact reward schedule." % role)
++    if sum(trial["reward_scheduled"] for trial in trials) != int(n_blocks) * 198 // 10:
++        raise RuntimeError("Trial plan has an invalid total reward schedule.")
+ 
+ 
+ def summarize_trial_plan(trials):
+@@ -743,40 +470,24 @@ def summarize_trial_plan(trials):
+         role_trials = [trial for trial in trials if trial["image_role"] == role]
+         if not role_trials:
+             continue
+-        rewards = sum(1 for trial in role_trials if trial["reward_scheduled"])
+-        omissions = sum(1 for trial in role_trials if trial["reward_omission_scheduled"])
+-        rows.append(
+-            {
+-                "image_role": role,
+-                "image_filename": role_trials[0]["image_filename"],
+-                "n_presentations": len(role_trials),
+-                "n_rewards": rewards,
+-                "n_omissions": omissions,
+-                "realized_reward_probability": (
+-                    rewards / float(len(role_trials)) if role_trials[0]["reward_eligible"] else 0.0
+-                ),
+-            }
+-        )
++        rows.append({
++            "image_role": role,
++            "image_filename": role_trials[0]["image_filename"],
++            "exposure_level": role_trials[0]["exposure_level"],
++            "reward_trajectory": role_trials[0]["reward_trajectory"],
++            "n_presentations": len(role_trials),
++            "n_rewards": sum(trial["reward_scheduled"] for trial in role_trials),
++            "n_omissions": sum(trial["reward_omission_scheduled"] for trial in role_trials),
++            "realized_reward_probability": sum(trial["reward_scheduled"] for trial in role_trials) / float(len(role_trials)) if role_trials[0]["reward_eligible"] else 0.0,
++        })
+     return rows
+ 
+ 
+ if __name__ == "__main__":
+-    # Hardware-free smoke test.
+-    fake_files = [Path("natural_image_%04d.png" % index) for index in range(100)]
+-    temp_dir = Path("/tmp/reward_conditioning_protocol_test")
+-    rows, path, created, assignment_seed = create_or_load_assignment(
+-        "TEST_MOUSE", fake_files, temp_dir, force_new=True
+-    )
+-    trials, sequence_seed = make_trial_plan(
+-        rows,
+-        n_blocks=10,
+-        iti_min_sec=2.5,
+-        iti_max_sec=4.5,
+-        mouse_id="TEST_MOUSE",
+-        sequence_seed=12345,
+-    )
+-    print("Assignment:", path, "created=", created, "seed=", assignment_seed)
+-    print("Sequence seed:", sequence_seed)
+-    print("Trials:", len(trials))
+-    for summary in summarize_trial_plan(trials):
+-        print(summary)
++    files = [Path("natural_image_%04d.png" % index) for index in range(100)]
++    directory = Path(tempfile.mkdtemp(prefix="reward_conditioning_protocol_"))
++    rows, _, _, _ = create_or_load_assignment("TEST_MOUSE", files, directory)
++    trials, _ = make_trial_plan(rows, 10, sequence_seed=12345)
++    assert len(trials) == 500
++    assert sum(trial["reward_scheduled"] for trial in trials) == 198
++    print("protocol smoke test: 14 roles, 500 trials, 198 rewards")
+diff --git a/run_stringer_reward_conditioning.py b/run_stringer_reward_conditioning.py
+index cb6fa2c..72758de 100644
+--- a/run_stringer_reward_conditioning.py
++++ b/run_stringer_reward_conditioning.py
+@@ -7,9 +7,8 @@ modify the existing working natural-image runners.
+ Protocol
+ --------
+ * 14 fixed natural images per mouse.
+-* 10 low-probability images at 2% each.
+-* 2 high-probability unrewarded images at 20% each.
+-* 2 high-probability rewarded images at 20% each.
++* 4 high-, 4 medium-, and 6 low-exposure images with exact 8:3:1 blocks.
++* Permanent reward trajectories with manually selected acquisition/reversal phase.
+ * 1.5 s image duration.
+ * Open-loop reward at the 1.0 s image boundary on exactly 90% of
+   rewarded-cue trials, independent of licking.
+@@ -34,6 +33,7 @@ import subprocess
+ import sys
+ import time
+ import select
++from datetime import datetime
+ from pathlib import Path
+ 
+ import run_stringer_vstim as base
+@@ -47,12 +47,16 @@ from rig_telemetry import (
+ )
+ from reward_conditioning_protocol import (
+     ALL_ROLES,
++    CONTINGENCY_PHASES,
++    HIGH_ROLES,
+     LOW_ROLES,
+-    REWARDED_HIGH_ROLES,
++    MEDIUM_ROLES,
++    PROTOCOL_VERSION,
++    REWARDED_ROLES_BY_PHASE,
+     REWARD_PROBABILITY,
+     TRIALS_PER_BLOCK,
+-    UNREWARDED_HIGH_ROLES,
+     create_or_load_assignment,
++    assignment_directory_lock,
+     global_panel_path,
+     make_trial_plan,
+     summarize_trial_plan,
+@@ -69,6 +73,12 @@ STIM_DURATION_SEC = 1.5
+ REWARD_DELAY_SEC = 1.0
+ POST_REWARD_STIM_SEC = STIM_DURATION_SEC - REWARD_DELAY_SEC
+ DEFAULT_N_BLOCKS = 10
++RECENT_MOUSE_DISPLAY_LIMIT = 5
++STATE_SCHEMA_VERSION = 1
++REVERSAL_READINESS_THRESHOLD = 0.80
++HIGH_UNREWARDED_LICK_WARNING_THRESHOLD = 0.50
++WEAK_DISCRIMINATION_WARNING_THRESHOLD = 0.20
++STATE_PROTOCOL_VERSION = PROTOCOL_VERSION
+ DEFAULT_ITI_MIN_SEC = 3.0
+ DEFAULT_ITI_MAX_SEC = 4.5
+ MINIMUM_CLEAN_POST_SUCTION_SEC = 0.75
+@@ -110,9 +120,15 @@ PLANNED_SEQUENCE_FIELDS = [
+     "block_number",
+     "within_block_index",
+     "within_block_number",
++    "protocol_version",
++    "contingency_phase",
+     "image_role",
+     "image_category",
++    "exposure_level",
++    "reward_trajectory",
++    "current_reward_state",
+     "presentation_probability",
++    "presentations_per_block",
+     "image_id",
+     "image_filename",
+     "image_path",
+@@ -141,8 +157,13 @@ EVENT_FIELDS = [
+     "block_number",
+     "within_block_index",
+     "within_block_number",
++    "protocol_version",
++    "contingency_phase",
+     "image_role",
+     "image_category",
++    "exposure_level",
++    "reward_trajectory",
++    "current_reward_state",
+     "presentation_probability",
+     "image_id",
+     "image_filename",
+@@ -182,8 +203,15 @@ TRIAL_SUMMARY_FIELDS = [
+     "trial_index",
+     "trial_number",
+     "block_number",
++    "protocol_version",
++    "contingency_phase",
+     "image_role",
+     "image_category",
++    "exposure_level",
++    "reward_trajectory",
++    "current_reward_state",
++    "presentation_probability",
++    "presentations_per_block",
+     "image_id",
+     "image_filename",
+     "reward_eligible",
+@@ -224,6 +252,8 @@ TRIAL_SUMMARY_FIELDS = [
+     "lick_count_2p0_to_3p0_sec",
+     "lick_count_3p0_to_3p5_sec",
+     "lick_count_3p5_to_4p0_sec",
++    "anticipatory_lick_0_to_1p0",
++    "anticipatory_lick_0p5_to_1p0",
+     "notes",
+ ]
+ 
+@@ -251,6 +281,13 @@ def parse_args(argv=None):
+         help="Inject deterministic synthetic anticipatory licks for behavior-metric validation. Requires --simulate-gpio. Never use for experimental sessions.",
+     )
+     parser.add_argument("--mouse-id")
++    parser.add_argument("--contingency-phase", choices=CONTINGENCY_PHASES)
++    parser.add_argument("--allow-phase-rollback", action="store_true",
++                        help="Exceptional recovery/testing override for reversal to acquisition.")
++    parser.add_argument("--no-recent-mice", action="store_true",
++                        help="Suppress the recent-mouse reminder table.")
++    parser.add_argument("--list-recent-mice", action="store_true",
++                        help="Print recent protocol mice and exit without touching hardware.")
+     parser.add_argument("--session-notes")
+     parser.add_argument("--blocks", type=int)
+     parser.add_argument("--iti-min-sec", type=float)
+@@ -285,12 +322,12 @@ def parse_args(argv=None):
+ 
+ 
+ def simulated_behavior_category(image_role):
+-    if image_role in REWARDED_HIGH_ROLES:
+-        return "rewarded_high"
+-    if image_role in UNREWARDED_HIGH_ROLES:
+-        return "unrewarded_high"
++    if image_role in HIGH_ROLES:
++        return "high_exposure"
++    if image_role in MEDIUM_ROLES:
++        return "medium_exposure"
+     if image_role in LOW_ROLES:
+-        return "low_probability"
++        return "low_exposure"
+     raise ValueError(
+         "Unknown trial image role for behavior simulation: %r" % image_role
+     )
+@@ -302,9 +339,9 @@ def should_schedule_simulated_behavior_lick(image_role, category_ordinal):
+     if ordinal < 1:
+         raise ValueError("Behavior simulation category ordinal must be positive.")
+     targets = {
+-        "rewarded_high": 15,
+-        "unrewarded_high": 4,
+-        "low_probability": 1,
++        "high_exposure": 15,
++        "medium_exposure": 6,
++        "low_exposure": 1,
+     }
+     return ordinal <= targets[simulated_behavior_category(image_role)]
+ 
+@@ -764,6 +801,8 @@ def append_event(event_log_path, row):
+ def trial_context(trial, phase):
+     return {
+         "phase": phase,
++        "protocol_version": trial.get("protocol_version", PROTOCOL_VERSION),
++        "contingency_phase": trial.get("contingency_phase", ""),
+         "trial_index": trial.get("trial_index", ""),
+         "trial_number": trial.get("trial_number", ""),
+         "block_index": trial.get("block_index", ""),
+@@ -772,7 +811,11 @@ def trial_context(trial, phase):
+         "within_block_number": trial.get("within_block_number", ""),
+         "image_role": trial.get("image_role", ""),
+         "image_category": trial.get("image_category", ""),
++        "exposure_level": trial.get("exposure_level", ""),
++        "reward_trajectory": trial.get("reward_trajectory", ""),
++        "current_reward_state": trial.get("current_reward_state", ""),
+         "presentation_probability": trial.get("presentation_probability", ""),
++        "presentations_per_block": trial.get("presentations_per_block", ""),
+         "image_id": trial.get("image_id", ""),
+         "image_filename": trial.get("image_filename", ""),
+         "reward_eligible": trial.get("reward_eligible", ""),
+@@ -788,6 +831,8 @@ def trial_context(trial, phase):
+ def background_context(phase):
+     return {
+         "phase": phase,
++        "protocol_version": PROTOCOL_VERSION,
++        "contingency_phase": "",
+         "trial_index": "",
+         "trial_number": "",
+         "block_index": "",
+@@ -796,6 +841,9 @@ def background_context(phase):
+         "within_block_number": "",
+         "image_role": "",
+         "image_category": "",
++        "exposure_level": "",
++        "reward_trajectory": "",
++        "current_reward_state": "",
+         "presentation_probability": "",
+         "image_id": "",
+         "image_filename": "",
+@@ -933,6 +981,8 @@ class TaskWaterTelemetryAccounting(object):
+         self.unrewarded_high_cue_anticipatory_lick_trials = set()
+         self.low_probability_cue_trials_completed = set()
+         self.low_probability_cue_anticipatory_lick_trials = set()
++        self.medium_exposure_cue_trials_completed = set()
++        self.medium_exposure_cue_anticipatory_lick_trials = set()
+ 
+     def record_trial(self, trial_index, reward_delivered, reward_contacted):
+         if reward_delivered:
+@@ -946,13 +996,16 @@ class TaskWaterTelemetryAccounting(object):
+         if trial_index in self.behavior_recorded_trial_indices:
+             return
+         role = trial.get("image_role")
+-        if role in REWARDED_HIGH_ROLES:
++        if trial.get("exposure_level") == "high" and trial.get("reward_eligible"):
+             completed = self.rewarded_high_cue_trials_completed
+             anticipatory = self.rewarded_high_cue_anticipatory_lick_trials
+-        elif role in UNREWARDED_HIGH_ROLES:
++        elif trial.get("exposure_level") == "high":
+             completed = self.unrewarded_high_cue_trials_completed
+             anticipatory = self.unrewarded_high_cue_anticipatory_lick_trials
+-        elif role in LOW_ROLES:
++        elif trial.get("exposure_level") == "medium":
++            completed = self.medium_exposure_cue_trials_completed
++            anticipatory = self.medium_exposure_cue_anticipatory_lick_trials
++        elif trial.get("exposure_level") == "low":
+             completed = self.low_probability_cue_trials_completed
+             anticipatory = self.low_probability_cue_anticipatory_lick_trials
+         else:
+@@ -980,6 +1033,8 @@ class TaskWaterTelemetryAccounting(object):
+             "task_unrewarded_high_cue_anticipatory_lick_trials_session": len(self.unrewarded_high_cue_anticipatory_lick_trials),
+             "task_low_probability_cue_trials_completed_session": len(self.low_probability_cue_trials_completed),
+             "task_low_probability_cue_anticipatory_lick_trials_session": len(self.low_probability_cue_anticipatory_lick_trials),
++            "task_medium_exposure_cue_trials_completed_session": len(self.medium_exposure_cue_trials_completed),
++            "task_medium_exposure_cue_anticipatory_lick_trials_session": len(self.medium_exposure_cue_anticipatory_lick_trials),
+         }
+ 
+ 
+@@ -997,6 +1052,8 @@ def _telemetry_water_fields(water_accounting):
+             "task_unrewarded_high_cue_anticipatory_lick_trials_session": 0,
+             "task_low_probability_cue_trials_completed_session": 0,
+             "task_low_probability_cue_anticipatory_lick_trials_session": 0,
++            "task_medium_exposure_cue_trials_completed_session": 0,
++            "task_medium_exposure_cue_anticipatory_lick_trials_session": 0,
+         }
+     return water_accounting.summary()
+ 
+@@ -1726,9 +1783,9 @@ def run_trials(
+     total_trials = len(trials)
+     simulated_reward_ordinal = 0
+     simulated_behavior_ordinals = {
+-        "rewarded_high": 0,
+-        "unrewarded_high": 0,
+-        "low_probability": 0,
++        "high_exposure": 0,
++        "medium_exposure": 0,
++        "low_exposure": 0,
+     }
+ 
+     for completed_count, trial in enumerate(trials, start=1):
+@@ -2145,8 +2202,15 @@ def _blank_trial_summary(trial):
+         "trial_index": trial["trial_index"],
+         "trial_number": trial["trial_number"],
+         "block_number": trial["block_number"],
++        "protocol_version": trial.get("protocol_version", PROTOCOL_VERSION),
++        "contingency_phase": trial.get("contingency_phase", "acquisition"),
+         "image_role": trial["image_role"],
+         "image_category": trial["image_category"],
++        "exposure_level": trial.get("exposure_level", ""),
++        "reward_trajectory": trial.get("reward_trajectory", ""),
++        "current_reward_state": trial.get("current_reward_state", ""),
++        "presentation_probability": trial.get("presentation_probability", ""),
++        "presentations_per_block": trial.get("presentations_per_block", ""),
+         "image_id": trial["image_id"],
+         "image_filename": trial["image_filename"],
+         "reward_eligible": trial["reward_eligible"],
+@@ -2187,6 +2251,8 @@ def _blank_trial_summary(trial):
+         "lick_count_2p0_to_3p0_sec": "",
+         "lick_count_3p0_to_3p5_sec": "",
+         "lick_count_3p5_to_4p0_sec": "",
++        "anticipatory_lick_0_to_1p0": "",
++        "anticipatory_lick_0p5_to_1p0": "",
+         "notes": "",
+     }
+ 
+@@ -2287,6 +2353,9 @@ def build_trial_summary(
+         row["lick_count_2p0_to_3p0_sec"] = counts["consumption"]
+         row["lick_count_3p0_to_3p5_sec"] = counts["pre_suction"]
+         row["lick_count_3p5_to_4p0_sec"] = counts["post_suction"]
++        if row["lick_count_0_to_1p0_sec"] != "":
++            row["anticipatory_lick_0_to_1p0"] = int(row["lick_count_0_to_1p0_sec"] >= 1)
++            row["anticipatory_lick_0p5_to_1p0"] = int(row["lick_count_0p5_to_1p0_sec"] >= 1)
+         row["notes"] = (
+             "Software-aligned summary; use photodiode/DAQ timing for final neural analysis."
+         )
+@@ -2294,6 +2363,96 @@ def build_trial_summary(
+     return rows
+ 
+ 
++def _behavior_group_stats(name, rows):
++    valid = []
++    for row in rows:
++        if not row.get("trial_completed"):
++            continue
++        if "stim_request_monotonic_ns" in row and row.get("stim_request_monotonic_ns") in ("", None):
++            continue
++        if row.get("lick_count_0_to_1p0_sec") in ("", None) or row.get("lick_count_0p5_to_1p0_sec") in ("", None):
++            continue
++        valid.append(row)
++    full = [int(float(row["lick_count_0_to_1p0_sec"]) >= 1) for row in valid]
++    late = [int(float(row["lick_count_0p5_to_1p0_sec"]) >= 1) for row in valid]
++    return {
++        "group": name,
++        "n_trials": len(valid),
++        "n_trials_with_anticipatory_lick_0_to_1s": sum(full),
++        "anticipatory_response_fraction_0_to_1s": sum(full) / float(len(valid)) if valid else None,
++        "n_trials_with_anticipatory_lick_0p5_to_1s": sum(late),
++        "anticipatory_response_fraction_0p5_to_1s": sum(late) / float(len(valid)) if valid else None,
++        "mean_lick_count_0_to_1s": sum(float(row["lick_count_0_to_1p0_sec"]) for row in valid) / float(len(valid)) if valid else None,
++        "mean_lick_count_0p5_to_1s": sum(float(row["lick_count_0p5_to_1p0_sec"]) for row in valid) / float(len(valid)) if valid else None,
++    }
++
++
++def build_behavior_summary(trial_summary_rows, contingency_phase, session_complete=None):
++    """Summarize valid completed trials; this never controls phase changes."""
++    if contingency_phase not in CONTINGENCY_PHASES:
++        raise ValueError("contingency_phase must be acquisition or reversal")
++    current_r_plus = [row for row in trial_summary_rows if row.get("reward_eligible")]
++    current_r_minus = [row for row in trial_summary_rows if not row.get("reward_eligible")]
++    groups = [
++        ("all current R+", current_r_plus),
++        ("all current R-", current_r_minus),
++        ("high current R+", [row for row in current_r_plus if row.get("exposure_level") == "high"]),
++        ("high current R-", [row for row in current_r_minus if row.get("exposure_level") == "high"]),
++        ("medium current R+", [row for row in current_r_plus if row.get("exposure_level") == "medium"]),
++        ("medium current R-", [row for row in current_r_minus if row.get("exposure_level") == "medium"]),
++        ("low current R-", [row for row in current_r_minus if row.get("exposure_level") == "low"]),
++        ("R+ omission trials", [row for row in current_r_plus if row.get("reward_omission_scheduled")]),
++    ]
++    group_stats = [_behavior_group_stats(name, rows) for name, rows in groups]
++    # Preserve first-seen role order while avoiding duplicate role rows.
++    role_stats = []
++    seen_roles = set()
++    for row in trial_summary_rows:
++        role = row.get("image_role")
++        if role and role not in seen_roles:
++            seen_roles.add(role)
++            role_stats.append(_behavior_group_stats(role, [trial for trial in trial_summary_rows if trial.get("image_role") == role]))
++    plus = group_stats[0]["anticipatory_response_fraction_0_to_1s"]
++    minus = group_stats[1]["anticipatory_response_fraction_0_to_1s"]
++    difference = plus - minus if plus is not None and minus is not None else None
++    warnings = []
++    if minus is not None and minus >= HIGH_UNREWARDED_LICK_WARNING_THRESHOLD:
++        warnings.append("high unrewarded-cue licking / possible indiscriminate licking")
++    if difference is not None and difference < WEAK_DISCRIMINATION_WARNING_THRESHOLD:
++        warnings.append("weak R+ vs R- lick discrimination")
++    return {
++        "schema_version": 1,
++        "contingency_phase": contingency_phase,
++        "partial": bool(session_complete is False) if session_complete is not None else any(not row.get("trial_completed") for row in trial_summary_rows),
++        "reversal_readiness_threshold": REVERSAL_READINESS_THRESHOLD,
++        "reversal_readiness_candidate": bool(plus is not None and plus >= REVERSAL_READINESS_THRESHOLD),
++        "r_plus_anticipatory_response_fraction_0_to_1s": plus,
++        "r_minus_anticipatory_response_fraction_0_to_1s": minus,
++        "r_plus_minus_r_minus_fraction_difference": difference,
++        "r_plus_omission_anticipatory_response_fraction_0_to_1s": group_stats[-1]["anticipatory_response_fraction_0_to_1s"],
++        "warnings": warnings,
++        "groups": group_stats,
++        "roles": role_stats,
++    }
++
++
++def print_behavior_summary(summary):
++    def percent(value):
++        return "n/a" if value is None else "%.1f%%" % (100.0 * value)
++    plus = summary["groups"][0]
++    minus = summary["groups"][1]
++    omission = summary["groups"][-1]
++    print("BEHAVIOR SUMMARY — %s%s" % (summary["contingency_phase"], " (partial)" if summary["partial"] else ""))
++    print("R+ anticipatory trials (0-1 s): %s/%s = %s" % (plus["n_trials_with_anticipatory_lick_0_to_1s"], plus["n_trials"], percent(plus["anticipatory_response_fraction_0_to_1s"])))
++    print("R- anticipatory trials (0-1 s): %s/%s = %s" % (minus["n_trials_with_anticipatory_lick_0_to_1s"], minus["n_trials"], percent(minus["anticipatory_response_fraction_0_to_1s"])))
++    print("R+ - R- discrimination: %s" % percent(summary["r_plus_minus_r_minus_fraction_difference"]))
++    print("R+ omission anticipatory trials: %s/%s = %s" % (omission["n_trials_with_anticipatory_lick_0_to_1s"], omission["n_trials"], percent(omission["anticipatory_response_fraction_0_to_1s"])))
++    print("80%% R+ reversal-readiness candidate: %s" % ("YES" if summary["reversal_readiness_candidate"] else "NO"))
++    for warning in summary["warnings"]:
++        print("WARNING: %s" % warning)
++    print("Decision: experimenter-controlled; no automatic reversal.")
++
++
+ def write_rows(path, rows, fields):
+     base.write_csv(path, rows, fields)
+ 
+@@ -2563,6 +2722,113 @@ def maybe_import_camera_support(no_camera):
+         return None
+ 
+ 
++def state_path_for_mouse(mouse_id):
++    return ASSIGNMENT_DIR / (str(mouse_id) + "_reward_conditioning_state.json")
++
++
++def load_mouse_state(mouse_id, required=False):
++    path = state_path_for_mouse(mouse_id)
++    if not path.exists():
++        return None
++    try:
++        state = json.loads(path.read_text(encoding="utf-8"))
++    except (OSError, ValueError) as exc:
++        if required:
++            raise RuntimeError("Could not load mouse state %s: %s" % (path, exc))
++        return None
++    if state.get("protocol_version") != STATE_PROTOCOL_VERSION or state.get("schema_version") != STATE_SCHEMA_VERSION:
++        if required:
++            raise RuntimeError("Mouse state belongs to another protocol version: %s" % path)
++        return None
++    return state
++
++
++def _local_iso_text(value):
++    if not value:
++        return "—"
++    try:
++        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
++        return parsed.astimezone().strftime("%Y-%m-%d %H:%M")
++    except ValueError:
++        return "—"
++
++
++def recent_mouse_states(assignment_dir=None):
++    assignment_dir = ASSIGNMENT_DIR if assignment_dir is None else assignment_dir
++    rows = []
++    for path in Path(assignment_dir).glob("*_reward_conditioning_state.json"):
++        try:
++            state = json.loads(path.read_text(encoding="utf-8"))
++            if state.get("protocol_version") != STATE_PROTOCOL_VERSION or state.get("schema_version") != STATE_SCHEMA_VERSION:
++                continue
++            rows.append(state)
++        except (OSError, ValueError):
++            continue
++    return sorted(rows, key=lambda state: state.get("last_completed_utc_iso") or "", reverse=True)
++
++
++def print_recent_mice(assignment_dir=None, limit=RECENT_MOUSE_DISPLAY_LIMIT):
++    print("Recent mice — %s" % PROTOCOL_VERSION)
++    print("\n  %-15s %-13s %-30s %s" % ("Mouse ID", "Phase", "Last completed session (local)", "Sessions"))
++    print("  " + "-" * 72)
++    for state in recent_mouse_states(assignment_dir)[:limit]:
++        print("  %-15s %-13s %-30s %s" % (
++            state.get("mouse_id", ""), state.get("current_phase", ""),
++            _local_iso_text(state.get("last_completed_utc_iso")),
++            state.get("completed_session_count", 0),
++        ))
++    print()
++
++
++def initial_mouse_state(mouse_id):
++    return {
++        "schema_version": STATE_SCHEMA_VERSION,
++        "mouse_id": mouse_id,
++        "protocol_version": STATE_PROTOCOL_VERSION,
++        "current_phase": "acquisition",
++        "reversal_has_started": False,
++        "first_reversal_session_id": None,
++        "first_reversal_utc_iso": None,
++        "last_completed_session_id": None,
++        "last_completed_utc_iso": None,
++        "last_completed_phase": None,
++        "completed_session_count": 0,
++    }
++
++
++def record_completed_session(mouse_id, phase, session_id, completed_utc_iso):
++    path = state_path_for_mouse(mouse_id)
++    with assignment_directory_lock(ASSIGNMENT_DIR):
++        state = load_mouse_state(mouse_id) or initial_mouse_state(mouse_id)
++        if phase == "reversal" and not state.get("reversal_has_started"):
++            state["reversal_has_started"] = True
++            state["first_reversal_session_id"] = session_id
++            state["first_reversal_utc_iso"] = completed_utc_iso
++        state["current_phase"] = phase
++        state["last_completed_session_id"] = session_id
++        state["last_completed_utc_iso"] = completed_utc_iso
++        state["last_completed_phase"] = phase
++        state["completed_session_count"] = int(state.get("completed_session_count", 0)) + 1
++        atomic_write_json(path, state)
++    return path
++
++
++def resolve_contingency_phase(args, state):
++    stored = (state or {}).get("current_phase", "acquisition")
++    requested = args.contingency_phase or (stored if state else None)
++    if requested is None:
++        requested = _strict_prompt("Contingency phase [acquisition/reversal]: ").lower()
++        while requested not in CONTINGENCY_PHASES:
++            print("Please enter acquisition or reversal.")
++            requested = _strict_prompt("Contingency phase [acquisition/reversal]: ").lower()
++    if stored == "reversal" and requested == "acquisition" and not args.allow_phase_rollback:
++        raise RuntimeError("Refusing reversal-to-acquisition rollback without --allow-phase-rollback.")
++    if stored == "reversal" and requested == "acquisition" and not prompt_yes_no_strict(
++            "EXCEPTIONAL PHASE ROLLBACK: return this mouse to acquisition", default_yes=False):
++        raise RuntimeError("Phase rollback cancelled.")
++    return requested
++
++
+ def format_setup_summary(mouse_id, session_notes, assignment_path,
+                          assignment_created, n_blocks, trials, iti_min_sec,
+                          iti_max_sec, pre_sec, post_sec, planned_task_sec,
+@@ -2570,7 +2836,8 @@ def format_setup_summary(mouse_id, session_notes, assignment_path,
+                          suction_delay_sec, reward_train_duration_sec,
+                          reward_timing=None,
+                          output_root=OUTPUT_ROOT,
+-                         display_timing=None):
++                         display_timing=None, contingency_phase="acquisition",
++                         state_path=None, first_reversal=False):
+     if reward_timing is None:
+         reward_extension_sec = max(
+             0.0, reward_train_duration_sec - POST_REWARD_STIM_SEC
+@@ -2593,14 +2860,20 @@ def format_setup_summary(mouse_id, session_notes, assignment_path,
+     lines = [
+         "Session setup summary:",
+         "  Mouse: %s" % mouse_id,
++        "  Protocol version: %s" % PROTOCOL_VERSION,
++        "  Contingency phase: %s" % contingency_phase,
++        "  First reversal session: %s" % first_reversal,
+         "  Session notes: %s" % (session_notes or "(none)"),
+         "  Shared 14-image panel: %s" % global_panel_path(ASSIGNMENT_DIR),
+         "  Fixed per-mouse role assignment: %s" % assignment_path,
++        "  Persistent state file: %s" % (state_path or state_path_for_mouse(mouse_id)),
+         "  Assignment newly created: %s" % assignment_created,
+         "  Blocks: %d x %d trials" % (n_blocks, TRIALS_PER_BLOCK),
+         "  Total trials: %d" % len(trials),
+         "  Scheduled rewards: %d" % sum(1 for trial in trials if trial["reward_scheduled"]),
+         "  Scheduled omissions: %d" % sum(1 for trial in trials if trial["reward_omission_scheduled"]),
++        "  Exposure counts per image/block: high=8, medium=3, low=1 (8:3:1)",
++        "  Fixed reward probability: 90%% (scheduled 198 rewards, 22 omissions per 500-trial session)" if n_blocks == 10 else "  Fixed reward probability: 90%%",
+         "  Scheduled suction events: %d" % sum(1 for trial in trials if trial.get("suction_scheduled")),
+         "  Stimulus: 1.5 s; open-loop reward boundary: 1.0 s",
+         "  Display timing calibration: %s" % calibration_label,
+@@ -2652,6 +2925,11 @@ def format_setup_summary(mouse_id, session_notes, assignment_path,
+ 
+ def main(argv=None):
+     args = parse_args(argv)
++    if args.list_recent_mice:
++        print_recent_mice()
++        return 0
++    if not args.no_recent_mice:
++        print_recent_mice()
+     base.print_environment()
+     hardware_config = load_hardware_config(
+         args.hardware_config, simulate_gpio=args.simulate_gpio
+@@ -2685,6 +2963,23 @@ def main(argv=None):
+             mouse_id = base.sanitize_text(mouse_id_raw)
+             if mouse_id: break
+             print("Mouse ID is required; try again.")
++    mouse_state_path = state_path_for_mouse(mouse_id)
++    mouse_state = load_mouse_state(mouse_id, required=True)
++    print("Selected mouse: %s" % mouse_id)
++    if mouse_state:
++        print("Stored contingency phase: %s" % mouse_state.get("current_phase", "acquisition").upper())
++        print("Last completed session: %s" % _local_iso_text(mouse_state.get("last_completed_utc_iso")))
++    else:
++        print("NEW MOUSE for %s" % PROTOCOL_VERSION)
++        if not prompt_yes_no_strict("Create a new protocol assignment for mouse %s" % mouse_id, default_yes=False):
++            print("Session aborted before assignment creation.")
++            return 0
++    contingency_phase = resolve_contingency_phase(args, mouse_state)
++    first_reversal = contingency_phase == "reversal" and not (mouse_state or {}).get("reversal_has_started", False)
++    if first_reversal and not prompt_yes_no_strict(
++            "FIRST REVERSAL FOR THIS MOUSE\nThis switches the R_to_U and U_to_R contingencies while preserving exposure frequencies.\nThe image assignment will NOT change.\nContinue?", default_yes=False):
++        print("Session aborted before hardware start.")
++        return 0
+     session_notes = args.session_notes if args.session_notes is not None else _strict_prompt("Session notes, optional: ")
+     n_blocks = args.blocks if args.blocks is not None else prompt_int_with_default("Number of 50-trial probability blocks", DEFAULT_N_BLOCKS, minimum=1)
+     if int(n_blocks) < 1: raise ValueError("blocks must be at least 1")
+@@ -2732,6 +3027,7 @@ def main(argv=None):
+         stim_duration_sec=STIM_DURATION_SEC,
+         reward_delay_sec=REWARD_DELAY_SEC,
+         suction_delay_sec=hardware_config["suction_delay_from_stim_onset_sec"],
++        contingency_phase=contingency_phase,
+     )
+     reward_volume_tracker = RewardVolumeTracker(
+         hardware_config.get("reward_volume_ul_per_train"),
+@@ -2758,7 +3054,9 @@ def main(argv=None):
+         pre_background_min * 60.0, post_background_min * 60.0,
+         planned_task_sec, planned_total_sec, hardware_config, use_camera,
+         suction_delay_sec, reward_train_duration_sec,
+-        reward_timing=reward_timing, display_timing=display_timing))
++        reward_timing=reward_timing, display_timing=display_timing,
++        contingency_phase=contingency_phase, state_path=mouse_state_path,
++        first_reversal=first_reversal))
+     print()
+     for row in plan_summary:
+         print(
+@@ -2785,6 +3083,8 @@ def main(argv=None):
+     selected_images_path = session_root / (session_id + "_image_assignment.csv")
+     plan_summary_path = session_root / (session_id + "_plan_summary.csv")
+     trial_summary_path = session_root / (session_id + "_trial_summary.csv")
++    behavior_summary_path = session_root / (session_id + "_behavior_summary.json")
++    behavior_summary_csv_path = session_root / (session_id + "_behavior_summary.csv")
+     lick_events_path = session_root / (session_id + "_lick_events.csv")
+     qc_path = session_root / (session_id + "_session_qc.json")
+     metadata_path = session_root / (session_id + "_metadata.json")
+@@ -2794,7 +3094,7 @@ def main(argv=None):
+         host=args.telemetry_host,
+         port=args.telemetry_port,
+         session_id=session_id,
+-        protocol="reward_conditioning",
++        protocol=PROTOCOL_VERSION,
+         enabled=not args.no_telemetry,
+     )
+     telemetry_started = telemetry_publisher.start()
+@@ -2816,10 +3116,13 @@ def main(argv=None):
+     })
+ 
+     write_rows(selected_images_path, assignment_rows, [
++        "protocol_version",
+         "image_role",
+         "image_category",
++        "exposure_level",
++        "reward_trajectory",
+         "presentation_probability",
+-        "reward_eligible",
++        "presentations_per_block",
+         "image_id",
+         "image_filename",
+         "image_path",
+@@ -2828,6 +3131,8 @@ def main(argv=None):
+     write_rows(plan_summary_path, plan_summary, [
+         "image_role",
+         "image_filename",
++        "exposure_level",
++        "reward_trajectory",
+         "n_presentations",
+         "n_rewards",
+         "n_omissions",
+@@ -2840,7 +3145,11 @@ def main(argv=None):
+         "mouse_id_input": mouse_id_raw,
+         "mouse_id": mouse_id,
+         "session_notes": session_notes,
+-        "protocol": "open_loop_natural_image_reward_conditioning",
++        "protocol": PROTOCOL_VERSION,
++        "protocol_version": PROTOCOL_VERSION,
++        "contingency_phase": contingency_phase,
++        "first_reversal_session": first_reversal,
++        "state_path": str(mouse_state_path),
+         "reward_is_lick_contingent": False,
+         "simulate_gpio": bool(hardware_config["simulate_gpio"]),
+         "simulate_water_test": bool(args.simulate_water_test),
+@@ -2852,6 +3161,8 @@ def main(argv=None):
+         "total_trials": len(trials),
+         "reward_probability": REWARD_PROBABILITY,
+         "reward_probability_fixed": True,
++        "scheduled_reward_count": sum(1 for trial in trials if trial["reward_scheduled"]),
++        "scheduled_omission_count": sum(1 for trial in trials if trial["reward_omission_scheduled"]),
+         "stim_duration_sec": STIM_DURATION_SEC,
+         "reward_delay_sec": REWARD_DELAY_SEC,
+         "post_reward_stim_sec": POST_REWARD_STIM_SEC,
+@@ -2917,6 +3228,8 @@ def main(argv=None):
+         "planned_sequence_csv": str(planned_sequence_path),
+         "event_log_csv": str(event_log_path),
+         "trial_summary_csv": str(trial_summary_path),
++        "behavior_summary_json": str(behavior_summary_path),
++        "behavior_summary_csv": str(behavior_summary_csv_path),
+         "camera_event_log_csv": str(camera_event_log_path) if use_camera else "",
+         "camera_recording_elapsed_local_sec": None,
+         "camera_startup_confirmation_latency_sec": None,
+@@ -2939,6 +3252,8 @@ def main(argv=None):
+                 "plan_summary": plan_summary_path,
+                 "event_log": event_log_path,
+                 "trial_summary": trial_summary_path,
++                "behavior_summary": behavior_summary_path,
++                "behavior_summary_csv": behavior_summary_csv_path,
+                 "lick_events": lick_events_path,
+                 "session_qc": qc_path,
+                 "camera_event_log": camera_event_log_path if use_camera else None,
+@@ -3454,7 +3769,25 @@ def main(argv=None):
+                 camera_data_secured=camera_data_secured,
+             )
+             atomic_write_json(qc_path, qc)
++            behavior_summary = build_behavior_summary(
++                trial_summary, contingency_phase,
++                session_complete=all(row.get("trial_completed") for row in trial_summary),
++            )
++            atomic_write_json(behavior_summary_path, behavior_summary)
++            behavior_csv_rows = [{"scope": "group", **row} for row in behavior_summary["groups"]]
++            behavior_csv_rows.extend({"scope": "role", **row} for row in behavior_summary["roles"])
++            write_rows(behavior_summary_csv_path, behavior_csv_rows, [
++                "scope", "group", "n_trials",
++                "n_trials_with_anticipatory_lick_0_to_1s",
++                "anticipatory_response_fraction_0_to_1s",
++                "n_trials_with_anticipatory_lick_0p5_to_1s",
++                "anticipatory_response_fraction_0p5_to_1s",
++                "mean_lick_count_0_to_1s", "mean_lick_count_0p5_to_1s",
++            ])
++            print_behavior_summary(behavior_summary)
+             metadata["session_qc_json"] = str(qc_path)
++            metadata["behavior_summary_json"] = str(behavior_summary_path)
++            metadata["behavior_summary_csv"] = str(behavior_summary_csv_path)
+         except Exception as exc:
+             finalization_errors.append("session_artifacts: %s: %s" % (type(exc).__name__, exc))
+ 
+@@ -3499,6 +3832,8 @@ def main(argv=None):
+                 "plan_summary": plan_summary_path,
+                 "event_log": event_log_path,
+                 "trial_summary": trial_summary_path,
++                "behavior_summary": behavior_summary_path,
++                "behavior_summary_csv": behavior_summary_csv_path,
+                 "lick_events": lick_events_path,
+                 "session_qc": qc_path,
+                 "camera_event_log": camera_event_log_path if use_camera else None,
+@@ -3516,6 +3851,11 @@ def main(argv=None):
+             }, cleanup_errors, finalization_errors)
+         camera_data_secured = completion_state["camera_data_secured"]
+         session_completed = completion_state["session_completed"]
++        if session_completed:
++            try:
++                record_completed_session(mouse_id, contingency_phase, session_id, metadata["utc_iso_end"])
++            except Exception as exc:
++                print("WARNING: completed session state was not saved: %s" % exc, file=sys.stderr)
+ 
+         if not session_completed:
+             safe_report_telemetry_state(
+diff --git a/test_reward_conditioning_protocol.py b/test_reward_conditioning_protocol.py
+index 7182275..86a0c23 100644
+--- a/test_reward_conditioning_protocol.py
++++ b/test_reward_conditioning_protocol.py
+@@ -1,647 +1,97 @@
+ #!/usr/bin/env python3
+-"""Hardware-free regression tests for the reward-conditioning planner."""
++"""Hardware-free checks for the exposure/reversal protocol."""
+ 
+ import json
+-import random
+ import shutil
+ import tempfile
+-import threading
+-import time
+ import unittest
+-from concurrent.futures import ThreadPoolExecutor
++from collections import Counter
+ from pathlib import Path
+-from unittest import mock
+ 
+ import reward_conditioning_protocol as protocol
+ 
+ 
+ class RewardConditioningProtocolTests(unittest.TestCase):
+     def setUp(self):
+-        self.temp_dir = Path(tempfile.mkdtemp(prefix="reward_conditioning_test_"))
++        self.temp_dir = Path(tempfile.mkdtemp(prefix="exposure_reward_test_"))
+         self.images = [Path("natural_image_%04d.png" % index) for index in range(100)]
+ 
+     def tearDown(self):
+         shutil.rmtree(self.temp_dir, ignore_errors=True)
+ 
+-    def assert_no_json_temps(self, directory=None):
+-        directory = self.temp_dir if directory is None else Path(directory)
+-        self.assertEqual(list(directory.glob(".*.tmp")), [])
+-
+-    @staticmethod
+-    def assignment_mapping(rows):
+-        return [(row["image_role"], row["image_filename"]) for row in rows]
+-
+-    def test_atomic_global_panel_creation_and_reuse(self):
+-        panel_1, panel_path, created_1 = protocol.create_or_load_global_panel(
+-            self.images, self.temp_dir
+-        )
+-        first_bytes = panel_path.read_bytes()
+-        payload = json.loads(first_bytes.decode("utf-8"))
+-
+-        self.assertTrue(created_1)
+-        self.assertEqual(payload["schema_version"], protocol.PANEL_SCHEMA_VERSION)
+-        self.assertEqual(len(payload["image_filenames"]), 14)
+-        self.assertEqual(len(set(payload["image_filenames"])), 14)
+-        self.assertEqual(
+-            [path.name for path in panel_1], payload["image_filenames"]
+-        )
+-        expected_panel = sorted(
+-            random.Random(protocol.DEFAULT_GLOBAL_PANEL_SEED).sample(
+-                sorted(self.images), len(protocol.ALL_ROLES)
+-            )
+-        )
+-        self.assertEqual(panel_1, expected_panel)
+-        self.assert_no_json_temps()
+-
+-        with mock.patch.object(protocol, "atomic_write_json") as atomic_write:
+-            panel_2, second_path, created_2 = protocol.create_or_load_global_panel(
+-                list(reversed(self.images)), self.temp_dir, panel_seed=123456
+-            )
+-
+-        self.assertFalse(created_2)
+-        self.assertEqual(second_path, panel_path)
+-        self.assertEqual(panel_2, panel_1)
+-        self.assertEqual(panel_path.read_bytes(), first_bytes)
+-        atomic_write.assert_not_called()
+-        self.assert_no_json_temps()
+-
+-    def test_atomic_write_failures_preserve_old_file_and_clean_temps(self):
+-        panel_path = protocol.global_panel_path(self.temp_dir)
+-        old_bytes = b'{"authoritative": true}\n'
+-        panel_path.write_bytes(old_bytes)
+-
+-        with mock.patch.object(
+-            protocol.os, "replace", side_effect=OSError("synthetic replace failure")
+-        ):
+-            with self.assertRaises(OSError):
+-                protocol.atomic_write_json(panel_path, {"replacement": True})
+-        self.assertEqual(panel_path.read_bytes(), old_bytes)
+-        self.assert_no_json_temps()
+-
+-        with mock.patch.object(
+-            protocol.os, "fsync", side_effect=OSError("synthetic fsync failure")
+-        ):
+-            with self.assertRaises(OSError):
+-                protocol.atomic_write_json(panel_path, {"replacement": True})
+-        self.assertEqual(panel_path.read_bytes(), old_bytes)
+-        self.assert_no_json_temps()
+-
+-    def test_concurrent_global_panel_creation_converges(self):
+-        barrier = threading.Barrier(2)
+-        original_atomic_write = protocol.atomic_write_json
+-
+-        def delayed_atomic_write(path, payload):
+-            time.sleep(0.05)
+-            return original_atomic_write(path, payload)
+-
+-        def create_panel():
+-            barrier.wait(timeout=5.0)
+-            return protocol.create_or_load_global_panel(self.images, self.temp_dir)
+-
+-        with mock.patch.object(
+-            protocol, "atomic_write_json", side_effect=delayed_atomic_write
+-        ):
+-            with ThreadPoolExecutor(max_workers=2) as executor:
+-                results = list(executor.map(lambda _: create_panel(), range(2)))
+-
+-        panels = [[path.name for path in result[0]] for result in results]
+-        self.assertEqual(panels[0], panels[1])
+-        self.assertEqual(sorted(result[2] for result in results), [False, True])
+-        payload = json.loads(protocol.global_panel_path(self.temp_dir).read_text())
+-        self.assertEqual(payload["image_filenames"], panels[0])
+-        self.assert_no_json_temps()
+-
+-    def test_concurrent_same_mouse_assignment_converges(self):
+-        protocol.create_or_load_global_panel(self.images, self.temp_dir)
+-        barrier = threading.Barrier(2)
+-        original_atomic_write = protocol.atomic_write_json
+-
+-        def delayed_atomic_write(path, payload):
+-            time.sleep(0.05)
+-            return original_atomic_write(path, payload)
+-
+-        def create_assignment():
+-            barrier.wait(timeout=5.0)
+-            return protocol.create_or_load_assignment(
+-                "MOUSE_RACE", self.images, self.temp_dir
+-            )
+-
+-        with mock.patch.object(
+-            protocol, "atomic_write_json", side_effect=delayed_atomic_write
+-        ):
+-            with ThreadPoolExecutor(max_workers=2) as executor:
+-                results = list(
+-                    executor.map(lambda _: create_assignment(), range(2))
+-                )
+-
+-        mappings = [self.assignment_mapping(result[0]) for result in results]
+-        self.assertEqual(mappings[0], mappings[1])
+-        self.assertEqual(sorted(result[2] for result in results), [False, True])
+-        saved_path = protocol.assignment_path_for_mouse(
+-            self.temp_dir, "MOUSE_RACE"
+-        )
+-        self.assertEqual(
+-            self.assignment_mapping(json.loads(saved_path.read_text())["images"]),
+-            mappings[0],
+-        )
+-        self.assert_no_json_temps()
+-
+-    def test_concurrent_different_mouse_assignments_are_safe(self):
+-        panel, _, _ = protocol.create_or_load_global_panel(
+-            self.images, self.temp_dir
+-        )
+-        barrier = threading.Barrier(2)
+-
+-        def create_assignment(mouse_id):
+-            barrier.wait(timeout=5.0)
+-            return protocol.create_or_load_assignment(
+-                mouse_id, self.images, self.temp_dir
+-            )
+-
+-        with ThreadPoolExecutor(max_workers=2) as executor:
+-            futures = [
+-                executor.submit(create_assignment, mouse_id)
+-                for mouse_id in ("MOUSE_A", "MOUSE_B")
+-            ]
+-            results = [future.result() for future in futures]
+-
+-        panel_names = {path.name for path in panel}
+-        for mouse_id, result in zip(("MOUSE_A", "MOUSE_B"), results):
+-            rows, assignment_path, created, _ = result
+-            self.assertTrue(created)
+-            self.assertEqual(
+-                assignment_path,
+-                protocol.assignment_path_for_mouse(self.temp_dir, mouse_id),
+-            )
+-            self.assertEqual({row["image_filename"] for row in rows}, panel_names)
+-            json.loads(assignment_path.read_text())
+-        self.assert_no_json_temps()
+-
+-    def test_existing_assignment_is_authoritative_under_changed_inputs(self):
+-        rows_1, assignment_path, created_1, seed_1 = (
+-            protocol.create_or_load_assignment(
+-                "MOUSE_FIXED",
+-                self.images,
+-                self.temp_dir,
+-                master_seed=111,
+-                panel_seed=222,
+-            )
+-        )
+-        first_bytes = assignment_path.read_bytes()
+-        panel_path = protocol.global_panel_path(self.temp_dir)
+-        panel_bytes = panel_path.read_bytes()
+-
+-        with mock.patch.object(protocol, "atomic_write_json") as atomic_write:
+-            rows_2, _, created_2, seed_2 = protocol.create_or_load_assignment(
+-                "MOUSE_FIXED",
+-                list(reversed(self.images)),
+-                self.temp_dir,
+-                master_seed=999,
+-                panel_seed=888,
+-            )
+-
+-        self.assertTrue(created_1)
+-        self.assertFalse(created_2)
+-        self.assertEqual(self.assignment_mapping(rows_1), self.assignment_mapping(rows_2))
+-        self.assertEqual(seed_1, seed_2)
+-        self.assertEqual(assignment_path.read_bytes(), first_bytes)
+-        self.assertEqual(panel_path.read_bytes(), panel_bytes)
+-        atomic_write.assert_not_called()
+-
+-    def test_saved_assignment_with_off_panel_image_is_rejected(self):
+-        _, assignment_path, _, _ = protocol.create_or_load_assignment(
+-            "MOUSE_OFF_PANEL", self.images, self.temp_dir
+-        )
+-        panel_path = protocol.global_panel_path(self.temp_dir)
+-        panel_payload = json.loads(panel_path.read_text(encoding="utf-8"))
+-        assignment_payload = json.loads(
+-            assignment_path.read_text(encoding="utf-8")
+-        )
+-        replacement = next(
+-            path
+-            for path in self.images
+-            if path.name not in set(panel_payload["image_filenames"])
+-        )
+-        assignment_payload["images"][0]["image_filename"] = replacement.name
+-        assignment_payload["images"][0]["image_path"] = str(replacement)
+-        protocol.atomic_write_json(assignment_path, assignment_payload)
+-        altered_assignment_bytes = assignment_path.read_bytes()
+-        panel_bytes = panel_path.read_bytes()
+-
+-        with self.assertRaisesRegex(RuntimeError, "do not match"):
+-            protocol.create_or_load_assignment(
+-                "MOUSE_OFF_PANEL", self.images, self.temp_dir
+-            )
+-
+-        self.assertEqual(assignment_path.read_bytes(), altered_assignment_bytes)
+-        self.assertEqual(panel_path.read_bytes(), panel_bytes)
+-
+-    def test_assignment_panel_provenance_is_checked_migration_safely(self):
+-        _, assignment_path, _, _ = protocol.create_or_load_assignment(
+-            "MOUSE_PROVENANCE", self.images, self.temp_dir
+-        )
+-        payload = json.loads(assignment_path.read_text(encoding="utf-8"))
+-        authoritative_seed = payload["global_panel_seed"]
+-        payload["global_panel_path"] = str(
+-            Path("/previous/assignment/location") / protocol.GLOBAL_PANEL_FILENAME
+-        )
+-        protocol.atomic_write_json(assignment_path, payload)
+-
+-        with mock.patch.object(protocol, "atomic_write_json") as atomic_write:
+-            _, _, created, _ = protocol.create_or_load_assignment(
+-                "MOUSE_PROVENANCE", self.images, self.temp_dir
+-            )
+-        self.assertFalse(created)
+-        atomic_write.assert_not_called()
+-
+-        payload["global_panel_seed"] = authoritative_seed + 1
+-        protocol.atomic_write_json(assignment_path, payload)
+-        mismatched_seed_bytes = assignment_path.read_bytes()
+-        with self.assertRaisesRegex(RuntimeError, "seed"):
+-            protocol.create_or_load_assignment(
+-                "MOUSE_PROVENANCE", self.images, self.temp_dir
+-            )
+-        self.assertEqual(assignment_path.read_bytes(), mismatched_seed_bytes)
+-
+-        payload["global_panel_seed"] = authoritative_seed
+-        payload["global_panel_path"] = "/previous/location/wrong_panel.json"
+-        protocol.atomic_write_json(assignment_path, payload)
+-        mismatched_path_bytes = assignment_path.read_bytes()
+-        with self.assertRaisesRegex(RuntimeError, "panel path"):
+-            protocol.create_or_load_assignment(
+-                "MOUSE_PROVENANCE", self.images, self.temp_dir
+-            )
+-        self.assertEqual(assignment_path.read_bytes(), mismatched_path_bytes)
+-
+-    def test_existing_assignment_with_missing_panel_fails_without_repair(self):
+-        _, assignment_path, _, _ = protocol.create_or_load_assignment(
+-            "MOUSE_ORPHAN", self.images, self.temp_dir
+-        )
+-        assignment_bytes = assignment_path.read_bytes()
+-        panel_path = protocol.global_panel_path(self.temp_dir)
+-        panel_path.unlink()
+-
+-        with self.assertRaisesRegex(RuntimeError, "global panel is missing"):
+-            protocol.create_or_load_assignment(
+-                "MOUSE_ORPHAN", self.images, self.temp_dir
+-            )
+-
+-        self.assertFalse(panel_path.exists())
+-        self.assertEqual(assignment_path.read_bytes(), assignment_bytes)
+-
+-    def test_orphaned_assignment_blocks_new_mouse_and_direct_panel_creation(self):
+-        _, assignment_path, _, _ = protocol.create_or_load_assignment(
+-            "MOUSE_A", self.images, self.temp_dir
+-        )
+-        assignment_bytes = assignment_path.read_bytes()
+-        panel_path = protocol.global_panel_path(self.temp_dir)
+-        panel_path.unlink()
+-
+-        with self.assertRaisesRegex(RuntimeError, "Refusing to regenerate"):
+-            protocol.create_or_load_global_panel(self.images, self.temp_dir)
+-        with self.assertRaisesRegex(RuntimeError, "Refusing to regenerate"):
+-            protocol.create_or_load_assignment(
+-                "MOUSE_B", self.images, self.temp_dir
+-            )
+-
+-        self.assertFalse(panel_path.exists())
+-        self.assertFalse(
+-            protocol.assignment_path_for_mouse(self.temp_dir, "MOUSE_B").exists()
+-        )
+-        self.assertEqual(assignment_path.read_bytes(), assignment_bytes)
+-
+-    def test_corrupt_or_incompatible_panel_fails_without_replacement(self):
+-        for case_name, bad_bytes in (
+-            ("corrupt", b"not-json\n"),
+-            ("wrong_schema", b'{"schema_version": 999, "image_filenames": []}\n'),
+-        ):
+-            case_dir = self.temp_dir / case_name
+-            case_dir.mkdir()
+-            panel_path = protocol.global_panel_path(case_dir)
+-            panel_path.write_bytes(bad_bytes)
+-            with self.subTest(case=case_name):
+-                with self.assertRaises(RuntimeError):
+-                    protocol.create_or_load_global_panel(self.images, case_dir)
+-                self.assertEqual(panel_path.read_bytes(), bad_bytes)
+-
+-    def test_global_panel_requires_integer_seed_metadata(self):
+-        for case_name, bad_seed in (
+-            ("missing_seed", None),
+-            ("string_seed", "not-an-integer"),
+-            ("float_seed", 7.5),
+-            ("boolean_seed", True),
+-        ):
+-            case_dir = self.temp_dir / case_name
+-            _, panel_path, _ = protocol.create_or_load_global_panel(
+-                self.images, case_dir
+-            )
+-            payload = json.loads(panel_path.read_text(encoding="utf-8"))
+-            if bad_seed is None:
+-                del payload["panel_seed"]
+-            else:
+-                payload["panel_seed"] = bad_seed
+-            protocol.atomic_write_json(panel_path, payload)
+-            bad_bytes = panel_path.read_bytes()
+-
+-            with self.subTest(case=case_name):
+-                with self.assertRaises(RuntimeError):
+-                    protocol.create_or_load_global_panel(self.images, case_dir)
+-                self.assertEqual(panel_path.read_bytes(), bad_bytes)
+-
+-    def test_corrupt_or_incompatible_assignment_fails_without_regeneration(self):
+-        bad_payloads = (
+-            b"not-json\n",
+-            b'{"schema_version": 999, "mouse_id": "MOUSE_BAD", "images": []}\n',
+-            (
+-                b'{"schema_version": 2, "mouse_id": "SOMEONE_ELSE", '
+-                b'"images": []}\n'
+-            ),
+-        )
+-        for index, bad_bytes in enumerate(bad_payloads):
+-            case_dir = self.temp_dir / ("bad_assignment_%d" % index)
+-            protocol.create_or_load_assignment("MOUSE_BAD", self.images, case_dir)
+-            assignment_path = protocol.assignment_path_for_mouse(
+-                case_dir, "MOUSE_BAD"
+-            )
+-            assignment_path.write_bytes(bad_bytes)
+-            with self.subTest(index=index):
+-                with self.assertRaises(RuntimeError):
+-                    protocol.create_or_load_assignment(
+-                        "MOUSE_BAD", self.images, case_dir
+-                    )
+-                self.assertEqual(assignment_path.read_bytes(), bad_bytes)
+-
+-    def test_missing_saved_images_fail_without_replacement(self):
+-        panel, panel_path, _ = protocol.create_or_load_global_panel(
+-            self.images, self.temp_dir
+-        )
+-        panel_bytes = panel_path.read_bytes()
+-        available_without_panel_image = [
+-            path for path in self.images if path.name != panel[0].name
+-        ]
+-        with self.assertRaises(RuntimeError):
+-            protocol.create_or_load_global_panel(
+-                available_without_panel_image, self.temp_dir
+-            )
+-        self.assertEqual(panel_path.read_bytes(), panel_bytes)
+-
+-        rows, assignment_path, _, _ = protocol.create_or_load_assignment(
+-            "MOUSE_MISSING", self.images, self.temp_dir
+-        )
+-        assignment_bytes = assignment_path.read_bytes()
+-        available_without_assignment_image = [
+-            path for path in self.images if path.name != rows[0]["image_filename"]
+-        ]
+-        with self.assertRaises(RuntimeError):
+-            protocol.create_or_load_assignment(
+-                "MOUSE_MISSING", available_without_assignment_image, self.temp_dir
+-            )
+-        self.assertEqual(assignment_path.read_bytes(), assignment_bytes)
+-
+-    def test_force_new_is_only_assignment_replacement_path(self):
+-        _, assignment_path, _, _ = protocol.create_or_load_assignment(
+-            "MOUSE_FORCE", self.images, self.temp_dir, master_seed=111
+-        )
+-        original_bytes = assignment_path.read_bytes()
+-        panel_path = protocol.global_panel_path(self.temp_dir)
+-        panel_bytes = panel_path.read_bytes()
+-        panel_payload = json.loads(panel_bytes.decode("utf-8"))
+-        original_atomic_write = protocol.atomic_write_json
+-
+-        with mock.patch.object(
+-            protocol, "atomic_write_json", wraps=original_atomic_write
+-        ) as atomic_write:
+-            _, _, created, _ = protocol.create_or_load_assignment(
+-                "MOUSE_FORCE", self.images, self.temp_dir, master_seed=222
+-            )
+-            self.assertFalse(created)
+-            atomic_write.assert_not_called()
+-
+-            _, _, created, _ = protocol.create_or_load_assignment(
+-                "MOUSE_FORCE",
+-                self.images,
+-                self.temp_dir,
+-                master_seed=222,
+-                panel_seed=987654,
+-                force_new=True,
+-            )
+-            self.assertTrue(created)
+-            self.assertEqual(atomic_write.call_count, 1)
+-            self.assertEqual(Path(atomic_write.call_args[0][0]), assignment_path)
+-
+-        self.assertNotEqual(assignment_path.read_bytes(), original_bytes)
+-        self.assertEqual(panel_path.read_bytes(), panel_bytes)
+-        replacement_payload = json.loads(
+-            assignment_path.read_text(encoding="utf-8")
+-        )
+-        self.assertEqual(
+-            {row["image_filename"] for row in replacement_payload["images"]},
+-            set(panel_payload["image_filenames"]),
+-        )
+-        self.assertEqual(
+-            replacement_payload["global_panel_seed"], panel_payload["panel_seed"]
+-        )
+-
+-    def test_failed_force_new_preserves_previous_assignment(self):
+-        rows, assignment_path, _, old_seed = protocol.create_or_load_assignment(
+-            "MOUSE_FORCE_FAIL", self.images, self.temp_dir, master_seed=111
+-        )
+-        old_bytes = assignment_path.read_bytes()
+-
+-        with mock.patch.object(
+-            protocol.os, "replace", side_effect=OSError("synthetic replace failure")
+-        ):
+-            with self.assertRaises(OSError):
+-                protocol.create_or_load_assignment(
+-                    "MOUSE_FORCE_FAIL",
+-                    self.images,
+-                    self.temp_dir,
+-                    master_seed=222,
+-                    force_new=True,
+-                )
+-
+-        self.assertEqual(assignment_path.read_bytes(), old_bytes)
+-        loaded_rows, _, created, loaded_seed = protocol.create_or_load_assignment(
+-            "MOUSE_FORCE_FAIL", self.images, self.temp_dir
+-        )
+-        self.assertFalse(created)
+-        self.assertEqual(self.assignment_mapping(loaded_rows), self.assignment_mapping(rows))
+-        self.assertEqual(loaded_seed, old_seed)
+-        self.assert_no_json_temps()
+-
+-    def test_missing_or_corrupt_panel_blocks_force_new_assignment(self):
+-        for case_name in ("missing", "corrupt"):
+-            case_dir = self.temp_dir / ("force_new_" + case_name)
+-            _, assignment_path, _, _ = protocol.create_or_load_assignment(
+-                "MOUSE_FORCE_BLOCKED", self.images, case_dir
+-            )
+-            assignment_bytes = assignment_path.read_bytes()
+-            panel_path = protocol.global_panel_path(case_dir)
+-            if case_name == "missing":
+-                panel_path.unlink()
+-                expected_panel_bytes = None
+-            else:
+-                panel_path.write_bytes(b"not-json\n")
+-                expected_panel_bytes = panel_path.read_bytes()
+-
+-            with self.subTest(case=case_name):
+-                with mock.patch.object(protocol, "atomic_write_json") as atomic_write:
+-                    with self.assertRaises(RuntimeError):
+-                        protocol.create_or_load_assignment(
+-                            "MOUSE_FORCE_BLOCKED",
+-                            self.images,
+-                            case_dir,
+-                            master_seed=999,
+-                            force_new=True,
+-                        )
+-                    atomic_write.assert_not_called()
+-                self.assertEqual(assignment_path.read_bytes(), assignment_bytes)
+-                if expected_panel_bytes is None:
+-                    self.assertFalse(panel_path.exists())
+-                else:
+-                    self.assertEqual(panel_path.read_bytes(), expected_panel_bytes)
+-
+-    def test_assignment_directory_lock_releases_after_exception(self):
+-        with self.assertRaisesRegex(RuntimeError, "synthetic lock failure"):
+-            with protocol.assignment_directory_lock(self.temp_dir):
+-                raise RuntimeError("synthetic lock failure")
+-
+-        with protocol.assignment_directory_lock(self.temp_dir) as lock_path:
+-            self.assertEqual(
+-                lock_path,
+-                self.temp_dir / protocol.ASSIGNMENT_LOCK_FILENAME,
+-            )
+-
+-    def test_shared_panel_and_fixed_mouse_assignment(self):
+-        mouse_a_1, path_a, created_a_1, _ = protocol.create_or_load_assignment(
+-            "MOUSE_A", self.images, self.temp_dir
+-        )
+-        mouse_a_2, path_a_2, created_a_2, _ = protocol.create_or_load_assignment(
+-            "MOUSE_A", self.images, self.temp_dir
+-        )
+-        mouse_b, _, _, _ = protocol.create_or_load_assignment(
+-            "MOUSE_B", self.images, self.temp_dir
+-        )
+-
+-        self.assertTrue(created_a_1)
+-        self.assertFalse(created_a_2)
+-        self.assertEqual(path_a, path_a_2)
+-        self.assertEqual(
+-            [row["image_filename"] for row in mouse_a_1],
+-            [row["image_filename"] for row in mouse_a_2],
+-        )
+-        self.assertEqual(
+-            {row["image_filename"] for row in mouse_a_1},
+-            {row["image_filename"] for row in mouse_b},
+-        )
+-        self.assertNotEqual(
+-            [(row["image_role"], row["image_filename"]) for row in mouse_a_1],
+-            [(row["image_role"], row["image_filename"]) for row in mouse_b],
+-        )
+-        assignment_payload = json.loads(path_a.read_text(encoding="utf-8"))
+-        panel_payload = json.loads(
+-            protocol.global_panel_path(self.temp_dir).read_text(encoding="utf-8")
+-        )
+-        self.assertEqual(
+-            assignment_payload["schema_version"],
+-            protocol.ASSIGNMENT_SCHEMA_VERSION,
+-        )
+-        self.assertEqual(
+-            {row["image_role"] for row in assignment_payload["images"]},
+-            set(protocol.ALL_ROLES),
+-        )
+-        self.assertEqual(
+-            {row["image_filename"] for row in assignment_payload["images"]},
+-            set(panel_payload["image_filenames"]),
+-        )
+-        expected_role_order = [Path(name) for name in panel_payload["image_filenames"]]
+-        random.Random(
+-            protocol.stable_seed(
+-                "reward-conditioning-role-assignment",
+-                protocol.DEFAULT_ASSIGNMENT_MASTER_SEED,
+-                "MOUSE_A",
+-            )
+-        ).shuffle(expected_role_order)
+-        self.assertEqual(
+-            [row["image_filename"] for row in mouse_a_1],
+-            [path.name for path in expected_role_order],
+-        )
+-        self.assert_no_json_temps()
+-
+-    def test_exact_90_percent_500_trial_plan(self):
+-        assignment, _, _, _ = protocol.create_or_load_assignment(
+-            "MOUSE_A", self.images, self.temp_dir
+-        )
+-        trials, _ = protocol.make_trial_plan(
+-            assignment,
+-            n_blocks=10,
+-            iti_min_sec=2.5,
+-            iti_max_sec=4.5,
+-            sequence_seed=12345,
+-            mouse_id="MOUSE_A",
+-        )
++    def assignment(self, mouse="MOUSE"):
++        return protocol.create_or_load_assignment(mouse, self.images, self.temp_dir)[0]
++
++    def plan(self, phase="acquisition", seed=12345):
++        return protocol.make_trial_plan(
++            self.assignment(), 10, sequence_seed=seed,
++            mouse_id="MOUSE", contingency_phase=phase,
++        )[0]
++
++    def test_role_structure_and_namespaced_assignment(self):
++        rows, path, created, _ = protocol.create_or_load_assignment(
++            "MOUSE", self.images, self.temp_dir,
++        )
++        self.assertTrue(created)
++        self.assertEqual(path.name, "MOUSE_exposure_reward_v1_assignment.json")
++        self.assertEqual(len(protocol.ALL_ROLES), 14)
++        self.assertEqual([r["exposure_level"] for r in rows].count("high"), 4)
++        self.assertEqual([r["exposure_level"] for r in rows].count("medium"), 4)
++        self.assertEqual([r["exposure_level"] for r in rows].count("low"), 6)
++        self.assertNotIn("reward_eligible", rows[0])
++        self.assertEqual(len({r["image_filename"] for r in rows}), 14)
++        loaded, _, created_again, _ = protocol.create_or_load_assignment("MOUSE", list(reversed(self.images)), self.temp_dir)
++        self.assertFalse(created_again)
++        self.assertEqual([(r["image_role"], r["image_filename"]) for r in rows], [(r["image_role"], r["image_filename"]) for r in loaded])
++
++    def test_different_mice_are_counterbalanced_over_shared_panel(self):
++        a = self.assignment("A")
++        b = self.assignment("B")
++        self.assertEqual({r["image_filename"] for r in a}, {r["image_filename"] for r in b})
++        self.assertNotEqual([(r["image_role"], r["image_filename"]) for r in a], [(r["image_role"], r["image_filename"]) for r in b])
++
++    def test_exact_block_and_session_exposure_counts(self):
++        trials = self.plan()
+         self.assertEqual(len(trials), 500)
+-        self.assertTrue(
+-            all(
+-                trials[index]["image_filename"]
+-                != trials[index - 1]["image_filename"]
+-                for index in range(1, len(trials))
+-            )
+-        )
+-        for role in protocol.REWARDED_HIGH_ROLES:
+-            role_trials = [trial for trial in trials if trial["image_role"] == role]
+-            self.assertEqual(len(role_trials), 100)
+-            self.assertEqual(sum(t["reward_scheduled"] for t in role_trials), 90)
+-            self.assertEqual(sum(t["reward_omission_scheduled"] for t in role_trials), 10)
+-        for role in protocol.UNREWARDED_HIGH_ROLES:
+-            self.assertEqual(sum(t["image_role"] == role for t in trials), 100)
+-        for role in protocol.LOW_ROLES:
+-            self.assertEqual(sum(t["image_role"] == role for t in trials), 10)
+-
+-    def test_fixed_90_percent_one_block_plan(self):
+-        assignment, _, _, _ = protocol.create_or_load_assignment(
+-            "MOUSE_A", self.images, self.temp_dir
+-        )
+-        trials, _ = protocol.make_trial_plan(
+-            assignment,
+-            n_blocks=1,
+-            iti_min_sec=1.0,
+-            iti_max_sec=1.1,
+-            sequence_seed=67890,
+-            mouse_id="MOUSE_A",
+-        )
+-        self.assertEqual(protocol.REWARD_PROBABILITY, 0.90)
+-        for role in protocol.REWARDED_HIGH_ROLES:
+-            role_trials = [trial for trial in trials if trial["image_role"] == role]
+-            self.assertEqual(len(role_trials), 10)
+-            self.assertEqual(sum(t["reward_scheduled"] for t in role_trials), 9)
+-            self.assertEqual(sum(t["reward_omission_scheduled"] for t in role_trials), 1)
+-        conditioned_trials = [trial for trial in trials if trial["reward_eligible"]]
+-        self.assertEqual(len(conditioned_trials), 20)
+-        self.assertEqual(sum(trial["suction_scheduled"] for trial in conditioned_trials), 20)
+-        self.assertEqual(sum(trial["reward_scheduled"] for trial in conditioned_trials), 18)
+-        self.assertEqual(sum(trial["reward_omission_scheduled"] for trial in conditioned_trials), 2)
+-        self.assertTrue(all(not trial["suction_scheduled"] for trial in trials if not trial["reward_eligible"]))
+-        self.assertTrue(all(trial["planned_suction_delay_sec"] == 3.5 for trial in trials))
+-
+-    def test_no_reward_can_appear_on_ineligible_trial(self):
+-        assignment, _, _, _ = protocol.create_or_load_assignment(
+-            "MOUSE_A", self.images, self.temp_dir
+-        )
+-        trials, _ = protocol.make_trial_plan(
+-            assignment,
+-            n_blocks=2,
+-            iti_min_sec=1.0,
+-            iti_max_sec=1.1,
+-            sequence_seed=42,
+-            mouse_id="MOUSE_A",
+-        )
+-        self.assertTrue(
+-            all(
+-                trial["reward_eligible"] or not trial["reward_scheduled"]
+-                for trial in trials
+-            )
+-        )
++        self.assertEqual(sum(t["image_role"] == protocol.HIGH_ROLES[0] for t in trials), 80)
++        self.assertEqual(sum(t["image_role"] == protocol.MEDIUM_ROLES[0] for t in trials), 30)
++        self.assertEqual(sum(t["image_role"] == protocol.LOW_ROLES[0] for t in trials), 10)
++        for block in range(10):
++            rows = [t for t in trials if t["block_index"] == block]
++            self.assertEqual(len(rows), 50)
++            self.assertEqual({r: sum(t["image_role"] == r for t in rows) for r in protocol.HIGH_ROLES}, {r: 8 for r in protocol.HIGH_ROLES})
++            self.assertEqual({r: sum(t["image_role"] == r for t in rows) for r in protocol.MEDIUM_ROLES}, {r: 3 for r in protocol.MEDIUM_ROLES})
++            self.assertEqual({r: sum(t["image_role"] == r for t in rows) for r in protocol.LOW_ROLES}, {r: 1 for r in protocol.LOW_ROLES})
++        self.assertTrue(all(a["image_filename"] != b["image_filename"] for a, b in zip(trials, trials[1:])))
++
++    def test_acquisition_and_reversal_reward_mapping(self):
++        for phase in protocol.CONTINGENCY_PHASES:
++            trials = self.plan(phase)
++            self.assertEqual({t["image_role"] for t in trials if t["reward_eligible"]}, set(protocol.REWARDED_ROLES_BY_PHASE[phase]))
++            self.assertEqual(sum(t["reward_scheduled"] for t in trials), 198)
++            self.assertEqual(sum(t["reward_omission_scheduled"] for t in trials), 22)
++            for role in protocol.REWARDED_ROLES_BY_PHASE[phase]:
++                role_trials = [t for t in trials if t["image_role"] == role]
++                self.assertEqual(sum(t["reward_scheduled"] for t in role_trials), 72 if role.startswith("high_") else 27)
++                self.assertEqual(sum(t["reward_omission_scheduled"] for t in role_trials), 8 if role.startswith("high_") else 3)
++
++    def test_reversal_changes_contingency_only(self):
++        acquisition = self.plan("acquisition", seed=77)
++        reversal = self.plan("reversal", seed=77)
++        permanent = ("image_role", "exposure_level", "reward_trajectory", "presentation_probability")
++        self.assertEqual(Counter(tuple(t[field] for field in permanent) for t in acquisition), Counter(tuple(t[field] for field in permanent) for t in reversal))
++        self.assertEqual([t["image_filename"] for t in acquisition], [t["image_filename"] for t in reversal])
++        self.assertNotEqual([t["reward_eligible"] for t in acquisition], [t["reward_eligible"] for t in reversal])
++
++    def test_legacy_files_are_not_reused(self):
++        (self.temp_dir / "MOUSE_reward_conditioning_assignment.json").write_text(json.dumps({"schema_version": 2}))
++        rows, path, _, _ = protocol.create_or_load_assignment("MOUSE", self.images, self.temp_dir)
++        self.assertEqual(path.name, "MOUSE_exposure_reward_v1_assignment.json")
++        self.assertEqual(len(rows), 14)
++
++    def test_invalid_non_default_block_multiple_is_rejected(self):
++        with self.assertRaisesRegex(ValueError, "multiple of 10"):
++            protocol.make_trial_plan(self.assignment(), 1)
+ 
+ 
+ if __name__ == "__main__":
